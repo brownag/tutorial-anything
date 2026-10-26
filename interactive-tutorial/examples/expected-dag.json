@@ -1,0 +1,131 @@
+{
+  "schema_version": "1.0",
+  "title": "Build a tiny todo CLI",
+  "source_doc": "examples/sample-tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-01-31T09:00:00Z",
+  "updated_at": "2026-01-31T09:00:00Z",
+  "git": {
+    "branch": "tutorial/todo-cli",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "nodes": [
+    {
+      "id": "1-design",
+      "title": "Read the subparser dispatch design",
+      "summary": "Sections 1 of the tutorial: one parser, one function per verb. No files change. Done when you can name the file to edit to add a --done flag to `list`.",
+      "dependencies": [],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Say which file you would edit to add a --done flag to `list`, and why."
+      }
+    },
+    {
+      "id": "2-scaffold",
+      "title": "Scaffold src/todo with the dispatch table",
+      "summary": "Section 2: create the package and build_parser()/main(). Done when the CLI imports and exposes both subcommands.",
+      "dependencies": ["1-design"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["src/todo/__init__.py", "src/todo/cli.py"],
+      "commands": ["mkdir -p src/todo"],
+      "verification": {
+        "type": "file_exists",
+        "path": "src/todo/cli.py"
+      }
+    },
+    {
+      "id": "3-smoke",
+      "title": "Prove the scaffold runs",
+      "summary": "Section 3: run the CLI once so a broken parser is caught before features stack on it.",
+      "dependencies": ["2-scaffold"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["python3 src/todo/cli.py list"],
+      "verification": {
+        "type": "command",
+        "command": "python3 src/todo/cli.py list",
+        "pattern": "running: list",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "4-store",
+      "title": "Add JSON persistence (optional branch A)",
+      "summary": "Section 4: load()/save() against $TODO_DB. Optional, and independent of branch B - both unlock from 3-smoke as siblings.",
+      "dependencies": ["3-smoke"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["src/todo/store.py"],
+      "commands": [],
+      "verification": {
+        "type": "file_contains",
+        "path": "src/todo/store.py",
+        "pattern": "def save(",
+        "regex": false
+      }
+    },
+    {
+      "id": "5-render",
+      "title": "Add table output (optional branch B)",
+      "summary": "Section 5: render(tasks) with an empty-list case. Sibling of 4-store; neither waits for the other.",
+      "dependencies": ["3-smoke"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["src/todo/render.py"],
+      "commands": [],
+      "verification": {
+        "type": "file_contains",
+        "path": "src/todo/render.py",
+        "pattern": "def render(",
+        "regex": false
+      }
+    },
+    {
+      "id": "6-db-path",
+      "title": "Export TODO_DB in your own shell",
+      "summary": "Section 6: an external step the workspace cannot observe. Only reachable after persistence exists, because it is what the variable is for.",
+      "dependencies": ["4-store"],
+      "action_type": "instruct",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["export TODO_DB=\"$PWD/todos.json\""],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm TODO_DB is exported in the shell running the tutorial and echoes back a path."
+      }
+    },
+    {
+      "id": "7-converge",
+      "title": "Converge: confirm the features coexist",
+      "summary": "Section 7: the two optional branches must not have fought over the same file. Skipped branches count as deliberate only if they are marked skipped.",
+      "dependencies": ["5-render", "6-db-path"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["grep -c \"def \" src/todo/store.py src/todo/render.py"],
+      "verification": {
+        "type": "command",
+        "command": "grep -c \"def \" src/todo/store.py src/todo/render.py",
+        "pattern": "src/todo/render.py:[1-9]",
+        "expect_exit": 0
+      }
+    }
+  ]
+}

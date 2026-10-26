@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aghgenebrown/interactive-tutorial/references/dag-schema.json",
+  "title": "Interactive tutorial DAG state (.tutorial-dag.json)",
+  "description": "State document written and read by scripts/dag_manager.py. Root metadata plus a node list whose dependencies form a strict DAG.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "title",
+    "source_doc",
+    "mode",
+    "persistence",
+    "active_node_id",
+    "git",
+    "nodes"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "description": "Contract version understood by the CLI. Majors other than 1 are rejected."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "source_doc": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path or URL of the tutorial, README, or walkthrough being executed."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["guided", "assisted", "hands-off"],
+      "default": "assisted"
+    },
+    "persistence": {
+      "type": "string",
+      "enum": ["file", "in-context"],
+      "default": "file"
+    },
+    "active_node_id": {
+      "type": ["string", "null"],
+      "description": "Node the user is working on. Must name an entry in nodes, or be null.",
+      "if": {
+        "type": "string"
+      },
+      "then": {
+        "$ref": "#/$defs/nodeId"
+      }
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "updated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch", "initial_commit_sha", "initial_dirty", "exclude_configured"],
+      "properties": {
+        "branch": {
+          "type": ["string", "null"]
+        },
+        "initial_commit_sha": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40})?$",
+          "description": "HEAD at init. Empty string when the repository has no commits yet."
+        },
+        "initial_dirty": {
+          "type": "boolean"
+        },
+        "exclude_configured": {
+          "type": "boolean"
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/node"
+      },
+      "description": "An empty array is legal only between `init` and decomposition; validate warns about it."
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+    },
+    "nodeId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "maxLength": 64
+    },
+    "shortCommit": {
+      "type": ["string", "null"],
+      "pattern": "^([0-9a-f]{7,40})?$"
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "summary",
+        "dependencies",
+        "action_type",
+        "status",
+        "commit_sha",
+        "artifacts",
+        "commands",
+        "verification"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nodeId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nodeId"
+          },
+          "description": "Predecessor ids. Existence of each id is checked by dag_manager validate."
+        },
+        "action_type": {
+          "type": "string",
+          "enum": ["read-only", "instruct", "mutate", "execute"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "completed", "skipped"]
+        },
+        "commit_sha": {
+          "$ref": "#/$defs/shortCommit",
+          "description": "Checkpoint created by complete --commit."
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["command", "file_exists", "file_contains", "confirm"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "command"
+              }
+            }
+          },
+          "then": {
+            "required": ["command"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "command"
+              },
+              "command": {
+                "type": "string",
+                "minLength": 1
+              },
+              "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Python regex matched against combined stdout+stderr."
+              },
+              "expect_exit": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "file_exists"
+              }
+            }
+          },
+          "then": {
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "file_exists"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "file_contains"
+              }
+            }
+          },
+          "then": {
+            "required": ["path", "pattern"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "file_contains"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "pattern": {
+                "type": "string",
+                "minLength": 1
+              },
+              "regex": {
+                "type": "boolean",
+                "default": false,
+                "description": "false compares the pattern as a literal substring."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "confirm"
+              }
+            }
+          },
+          "then": {
+            "required": ["prompt"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "confirm"
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

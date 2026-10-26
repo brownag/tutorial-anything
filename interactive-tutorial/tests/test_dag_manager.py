@@ -1,0 +1,638 @@
+"""Tests for scripts/dag_manager.py.
+
+Every test runs in its own temporary Git repository with an isolated Git
+configuration, so the suite never reads or writes the developer's identity,
+hooks, or ``~/.gitconfig``. Standard library only; run with::
+
+    python3 -m unittest discover -s tests -v
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+CLI = SKILL_DIR / "scripts" / "dag_manager.py"
+EXAMPLE_DAG = SKILL_DIR / "examples" / "expected-dag.json"
+STATE_NAME = ".tutorial-dag.json"
+
+# Minimal CLI so example nodes 2-scaffold and 3-smoke can actually verify.
+CLI_SOURCE = '''"""Command dispatch for the todo CLI."""
+
+import argparse
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="todo", description="Tiny todo list.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("add", help="Add a task")
+    sub.add_parser("list", help="List tasks")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    print("running:", args.command)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+STORE_SOURCE = '''"""JSON file persistence."""
+
+import json
+import os
+
+
+def load():
+    path = os.environ.get("TODO_DB", "todos.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save(tasks):
+    path = os.environ.get("TODO_DB", "todos.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(tasks, handle, indent=2)
+'''
+
+RENDER_SOURCE = '''"""Fixed-width table rendering."""
+
+
+def render(tasks):
+    rows = ["{:<3} {}".format(i + 1, task) for i, task in enumerate(tasks)]
+    return "\n".join(rows) if rows else "(no tasks)"
+'''
+
+# What each example node writes, keyed by node id.
+ARTIFACTS = {
+    "2-scaffold": {
+        "src/todo/__init__.py": '"""Tiny todo CLI."""\n',
+        "src/todo/cli.py": CLI_SOURCE,
+    },
+    "4-store": {"src/todo/store.py": STORE_SOURCE},
+    "5-render": {"src/todo/render.py": RENDER_SOURCE},
+}
+
+
+class DagManagerTest(unittest.TestCase):
+    """Shared fixture: temp repo + CLI runner + state readers."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="dag-manager-test-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update(
+            {
+                "HOME": str(self.workspace),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_AUTHOR_NAME": "Tutorial Test",
+                "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                "GIT_COMMITTER_NAME": "Tutorial Test",
+                "GIT_COMMITTER_EMAIL": "tutorial@example.invalid",
+                "GIT_ADVICE_ENABLED": "false",
+                "TODO_DB": "",
+            }
+        )
+        self.env.pop("GIT_DIR", None)
+        self.env.pop("GIT_WORK_TREE", None)
+        self.git("init", "-q", "-b", "main")
+
+    # -- plumbing ---------------------------------------------------------
+
+    def git(self, *args, check=True):
+        """Run git inside the temp workspace."""
+        proc = subprocess.run(
+            ["git"] + list(args),
+            cwd=str(self.workspace),
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+        if check and proc.returncode != 0:
+            self.fail("git {} failed: {}".format(" ".join(args), proc.stdout))
+        return proc.stdout.strip()
+
+    def cli(self, *args, check=None):
+        """Run dag_manager.py in the workspace; returns (code, stdout+stderr)."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args),
+            cwd=str(self.workspace),
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+        output = proc.stdout or ""
+        if check is not None:
+            self.assertEqual(
+                check,
+                proc.returncode,
+                "dag_manager {} exited {}:\n{}".format(
+                    " ".join(args), proc.returncode, output
+                ),
+            )
+        return proc.returncode, output
+
+    @property
+    def state_path(self) -> Path:
+        return self.workspace / STATE_NAME
+
+    def state(self) -> dict:
+        """Parse the live state document."""
+        self.assertTrue(self.state_path.is_file(), "no state file was written")
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def node(self, node_id: str, state=None) -> dict:
+        """Fetch one node from the live state document."""
+        state = self.state() if state is None else state
+        for node in state["nodes"]:
+            if node["id"] == node_id:
+                return node
+        self.fail("node {} missing from state".format(node_id))
+
+    def head(self) -> str:
+        return self.git("rev-parse", "HEAD")
+
+    def tracked(self) -> list:
+        return sorted(self.git("ls-files").split())
+
+    def porcelain(self) -> list:
+        return [line for line in self.git("status", "--porcelain").splitlines() if line]
+
+    def write(self, relative: str, text: str) -> Path:
+        """Create a workspace file, making parent directories."""
+        path = self.workspace / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def materialize(self, node_id: str) -> None:
+        """Write the artifacts the example DAG expects for ``node_id``."""
+        for relative, text in ARTIFACTS.get(node_id, {}).items():
+            self.write(relative, text)
+
+    def seed_repo(self, message: str = "seed") -> str:
+        """Give the repo one commit so rollback targets exist."""
+        self.write("README.md", "# Scratch workspace\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.head()
+
+    def seed_state(self, **overrides) -> dict:
+        """Load the reference DAG into the workspace as live state.
+
+        Follows the real workflow - `init` first (which records the git block and
+        hides the state file from Git), then fill the `nodes` array from
+        ``examples/expected-dag.json``. That example models a repository with no
+        commits yet, so its recorded sha is replaced with this repo's HEAD.
+        """
+        self.init_command(check=0)
+        state = copy.deepcopy(json.loads(EXAMPLE_DAG.read_text(encoding="utf-8")))
+        live = self.state()
+        state["git"] = dict(live["git"])
+        state["created_at"] = live["created_at"]
+        state["active_node_id"] = None
+        for key, value in overrides.items():
+            if key == "git":
+                state["git"].update(value)
+            else:
+                state[key] = value
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    def init_command(self, *extra, check=None):
+        """Run `init` with the standard arguments plus overrides."""
+        return self.cli(
+            "init",
+            "--title",
+            "Todo CLI",
+            "--source",
+            "examples/sample-tutorial.md",
+            *extra,
+            check=check,
+        )
+
+    def complete(self, node_id: str, *extra, check=None):
+        """Materialize a node's files, then complete it."""
+        self.materialize(node_id)
+        return self.cli("complete", node_id, "--yes", *extra, check=check)
+
+    def derived(self, node_id: str) -> str:
+        """The STATE column `status` shows for a node."""
+        _, output = self.cli("status", check=0)
+        for line in output.splitlines():
+            parts = line.split()
+            if parts and parts[0].lstrip("> ") == node_id and len(parts) > 2:
+                return parts[1]
+            if parts and parts[0] == node_id and len(parts) > 2:
+                return parts[1]
+        self.fail("node {} not found in status output:\n{}".format(node_id, output))
+
+
+    # -- init -------------------------------------------------------------
+
+    def test_init_writes_state_and_excludes_state_file_once(self):
+        anchor = self.seed_repo()
+        self.init_command("--git-branch", "tutorial/todo", check=0)
+
+        state = self.state()
+        self.assertEqual(state["mode"], "assisted")
+        self.assertEqual(state["persistence"], "file")
+        self.assertIsNone(state["active_node_id"])
+        self.assertEqual(state["nodes"], [])
+        self.assertEqual(state["git"]["initial_commit_sha"], anchor)
+        self.assertEqual(state["git"]["branch"], "tutorial/todo")
+        self.assertTrue(state["git"]["exclude_configured"])
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "tutorial/todo")
+
+        exclude = (
+            self.workspace / self.git("rev-parse", "--git-common-dir") / "info" / "exclude"
+        )
+        entries = [
+            line.strip()
+            for line in exclude.read_text(encoding="utf-8").splitlines()
+            if line.strip() == STATE_NAME
+        ]
+        self.assertEqual(len(entries), 1)
+
+        self.init_command("--force", check=0)
+        entries = [
+            line.strip()
+            for line in exclude.read_text(encoding="utf-8").splitlines()
+            if line.strip() == STATE_NAME
+        ]
+        self.assertEqual(len(entries), 1, "exclude entry must not duplicate")
+        self.assertEqual(self.porcelain(), [], "state file must stay invisible to git")
+
+    def test_init_refuses_overwrite_without_force(self):
+        self.init_command(check=0)
+        code, output = self.init_command()
+        self.assertEqual(code, 1)
+        self.assertIn("--force", output)
+
+    def test_init_needs_a_git_repository(self):
+        shutil.rmtree(self.workspace / ".git")
+        code, output = self.init_command()
+        self.assertEqual(code, 1)
+        self.assertIn("git init", output)
+
+    def test_init_reports_a_dirty_workspace(self):
+        self.write("loose.txt", "uncommitted\n")
+        self.seed_repo()
+        self.write("loose.txt", "modified\n")
+        self.init_command(check=0)
+        self.assertTrue(self.state()["git"]["initial_dirty"])
+        self.assertIn("dirty", self.init_command("--force")[1].lower())
+
+    # -- validate ---------------------------------------------------------
+
+    def test_validate_rejects_cycles_by_naming_them(self):
+        self.seed_repo()
+        state = self.seed_state()
+        by_id = {node["id"]: node for node in state["nodes"]}
+        by_id["4-store"]["dependencies"] = ["5-render"]
+        by_id["5-render"]["dependencies"] = ["4-store"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("cycle", output)
+        self.assertIn("4-store", output)
+        self.assertIn("5-render", output)
+
+    def test_validate_rejects_unknown_dependency_and_duplicate_id(self):
+        self.seed_repo()
+        state = self.seed_state()
+        state["nodes"][1]["dependencies"] = ["9-does-not-exist"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("9-does-not-exist", output)
+
+        state = json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+        state["git"]["initial_commit_sha"] = self.head()
+        state["nodes"].append(copy.deepcopy(state["nodes"][0]))
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate id", output)
+
+    def test_validate_rejects_bad_verification_shapes(self):
+        self.seed_repo()
+        state = self.seed_state()
+        state["nodes"][3]["verification"] = {"type": "file_contains", "path": "src/todo/store.py"}
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("pattern", output)
+
+    def test_validate_flags_an_empty_node_list_as_unfinished(self):
+        self.seed_repo()
+        self.init_command(check=0)
+        code, output = self.cli("validate", check=0)
+        self.assertIn("decompose", output)
+
+    # -- next / status ----------------------------------------------------
+
+    def test_next_walks_the_linear_core(self):
+        self.seed_repo()
+        self.seed_state()
+        self.cli("next", check=0)
+        self.assertEqual(self.state()["active_node_id"], "1-design")
+        self.cli("complete", "1-design", "--yes", check=0)
+        self.assertEqual(
+            self.state()["active_node_id"],
+            "2-scaffold",
+            "a single unambiguous ready node should auto-advance",
+        )
+
+    def test_next_refuses_an_in_progress_node(self):
+        self.seed_repo()
+        self.seed_state()
+        self.cli("next", check=0)
+        code, output = self.cli("next")
+        self.assertEqual(code, 1)
+        self.assertIn("1-design", output)
+
+    def test_next_refuses_a_branch_point_and_lists_both(self):
+        self.seed_repo()
+        self.seed_state()
+        for node_id in ("1-design", "2-scaffold", "3-smoke"):
+            self.complete(node_id, check=0)
+
+        code, output = self.cli("next")
+        self.assertEqual(code, 1)
+        self.assertIn("4-store", output)
+        self.assertIn("5-render", output)
+        self.assertIsNone(self.state()["active_node_id"])
+
+    def test_completing_the_parent_unlocks_both_optional_branches(self):
+        self.seed_repo()
+        self.seed_state()
+        self.assertEqual(self.derived("4-store"), "PENDING")
+        self.assertEqual(self.derived("5-render"), "PENDING")
+        for node_id in ("1-design", "2-scaffold", "3-smoke"):
+            self.complete(node_id, check=0)
+        self.assertEqual(self.derived("4-store"), "READY")
+        self.assertEqual(self.derived("5-render"), "READY")
+        _, header = self.cli("status", check=0)
+        self.assertIn("4-store, 5-render", header.splitlines()[0])
+
+    # -- verify / complete ------------------------------------------------
+
+    def test_verify_gate_variants(self):
+        self.seed_repo()
+        self.seed_state()
+
+        self.cli("verify", "2-scaffold", check=1)  # file_exists, missing
+        self.materialize("2-scaffold")
+        self.cli("verify", "2-scaffold", check=0)
+
+        self.cli("verify", "4-store", check=1)  # file_contains, missing file
+        self.materialize("4-store")
+        self.cli("verify", "4-store", check=0)
+        self.write("src/todo/store.py", "def load():\n    return []\n")
+        self.cli("verify", "4-store", check=1)  # literal substring absent
+        self.write("src/todo/store.py", "def save(tasks):\n    pass\n")
+        self.cli("verify", "4-store", check=0)
+
+        state = self.state()
+        node = self.node("5-render", state)
+        node["verification"] = {"type": "command", "command": "exit 3", "expect_exit": 0}
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("verify", "5-render")
+        self.assertEqual(code, 1)
+        self.assertIn("exit code 3", output)
+
+    def test_confirm_gate_needs_a_human(self):
+        self.seed_repo()
+        self.seed_state()
+        code, output = self.cli("complete", "1-design")
+        self.assertEqual(code, 1)
+        self.assertIn("CONFIRMATION NEEDED", output)
+        self.assertEqual(self.node("1-design")["status"], "pending")
+        self.cli("complete", "1-design", "--yes", check=0)
+        self.assertEqual(self.node("1-design")["status"], "completed")
+
+    def test_no_verify_records_progress_but_verification_gates_work(self):
+        self.seed_repo()
+        self.seed_state()
+        self.cli("complete", "1-design", "--yes", check=0)
+        code, _ = self.cli("complete", "2-scaffold", "--no-verify")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.node("2-scaffold")["status"], "completed")
+        self.assertIsNone(self.node("2-scaffold")["commit_sha"])
+
+    def test_complete_refuses_unmet_dependencies(self):
+        self.seed_repo()
+        self.seed_state()
+        self.materialize("2-scaffold")
+        code, output = self.cli("complete", "2-scaffold", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("1-design", output)
+
+    # -- checkpoints ------------------------------------------------------
+
+    def cli_stdout(self, *args) -> str:
+        """Run the CLI with stderr discarded, for machine-readable output."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args),
+            cwd=str(self.workspace),
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        return proc.stdout
+
+    def run_to_store(self) -> dict:
+        """Walk the reference DAG through the persistence branch.
+
+        Leaves three commits: the seed, the scaffold checkpoint, and the store
+        checkpoint, with 3-smoke completed in between.
+        """
+        anchor = self.seed_repo()
+        self.seed_state()
+        self.cli("next", check=0)
+        self.complete("1-design", check=0)
+        self.complete("2-scaffold", "--commit", check=0)
+        scaffold_commit = self.node("2-scaffold")["commit_sha"]
+        self.complete("3-smoke", check=0)
+        self.complete("4-store", "--commit", check=0)
+        return {
+            "anchor": anchor,
+            "scaffold": scaffold_commit,
+            "store": self.head(),
+        }
+
+    def test_complete_commit_records_sha_and_keeps_state_untracked(self):
+        shas = self.run_to_store()
+        node = self.node("2-scaffold")
+
+        self.assertEqual(node["commit_sha"], shas["scaffold"])
+        self.assertRegex(node["commit_sha"], r"^[0-9a-f]{40}$")
+        subject = self.git("log", "-1", "--format=%s", node["commit_sha"])
+        self.assertEqual(subject, "tutorial(2-scaffold): Scaffold src/todo with the dispatch table")
+        self.assertEqual(node["status"], "completed")
+
+        self.assertNotIn(STATE_NAME, self.tracked())
+        self.assertEqual(self.porcelain(), [], "state file must never be committable")
+        listed = self.git("show", "--name-only", "--format=", shas["store"])
+        self.assertNotIn(STATE_NAME, listed)
+        self.assertIn("src/todo/store.py", listed)
+
+    def test_complete_commit_refuses_a_clean_workspace(self):
+        self.run_to_store()
+        code, output = self.cli("complete", "5-render", "--commit", "--no-verify")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to commit", output)
+        self.assertEqual(self.node("5-render")["status"], "pending")
+
+    def test_jump_refuses_unmet_ancestors_without_the_flag(self):
+        self.run_to_store()
+        code, output = self.cli("jump", "7-converge")
+        self.assertEqual(code, 1)
+        self.assertIn("5-render", output)
+        self.assertIn("--skip-ancestors", output)
+        self.assertNotEqual(self.state()["active_node_id"], "7-converge")
+
+    def test_jump_skip_ancestors_fast_forwards_without_touching_git(self):
+        shas = self.run_to_store()
+        code, output = self.cli("jump", "7-converge", "--skip-ancestors", check=0)
+        self.assertIn("marked skipped", output)
+
+        state = self.state()
+        self.assertEqual(state["active_node_id"], "7-converge")
+        self.assertEqual(self.node("5-render", state)["status"], "skipped")
+        self.assertEqual(self.node("6-db-path", state)["status"], "skipped")
+        self.assertEqual(self.node("4-store", state)["status"], "completed")
+        self.assertEqual(self.head(), shas["store"], "fast-forward must not commit")
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "3")
+
+    def test_soft_rewind_moves_only_the_pointer(self):
+        shas = self.run_to_store()
+        before = (self.head(), (self.workspace / "src/todo/store.py").read_text())
+
+        code, output = self.cli("jump", "3-smoke", check=0)
+        self.assertIn("downstream", output)
+
+        state = self.state()
+        self.assertEqual(state["active_node_id"], "3-smoke")
+        self.assertEqual(self.head(), before[0], "soft rewind must not move HEAD")
+        self.assertEqual(
+            (self.workspace / "src/todo/store.py").read_text(),
+            before[1],
+            "soft rewind must not touch files",
+        )
+        self.assertEqual(self.node("4-store", state)["status"], "completed")
+        self.assertEqual(self.node("4-store", state)["commit_sha"], shas["store"])
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "main")
+
+    def test_hard_rollback_reverts_files_and_resets_downstream(self):
+        shas = self.run_to_store()
+        code, output = self.cli(
+            "jump",
+            "3-smoke",
+            "--reset-descendants",
+            "--git-rollback",
+            "hard",
+            "--force",
+            check=0,
+        )
+        self.assertIn("reset --hard", output)
+
+        state = self.state()
+        self.assertEqual(self.head(), shas["scaffold"])
+        self.assertTrue((self.workspace / "src/todo/cli.py").is_file())
+        self.assertFalse(
+            (self.workspace / "src/todo/store.py").exists(),
+            "the store checkpoint's files should be reverted",
+        )
+
+        self.assertEqual(state["active_node_id"], "3-smoke")
+        self.assertEqual(self.node("3-smoke", state)["status"], "pending")
+        self.assertIsNone(self.node("3-smoke", state)["commit_sha"])
+        self.assertEqual(self.node("4-store", state)["status"], "pending")
+        self.assertIsNone(self.node("4-store", state)["commit_sha"])
+        self.assertEqual(
+            self.node("2-scaffold", state)["status"],
+            "completed",
+            "the target's own ancestor checkpoint must stay intact",
+        )
+
+        self.assertTrue(self.state_path.is_file(), ".tutorial-dag.json must survive")
+        self.assertNotIn(STATE_NAME, self.tracked())
+        self.assertEqual(self.porcelain(), [])
+
+    def test_hard_rollback_refuses_a_dirty_workspace_without_force(self):
+        self.run_to_store()
+        self.write("notes.md", "uncommitted scribble\n")
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", "--git-rollback", "hard")
+        self.assertEqual(code, 1)
+        self.assertIn("--force", output)
+        self.assertTrue((self.workspace / "src/todo/store.py").is_file())
+
+    def test_branch_rollback_reopens_the_target_on_a_new_branch(self):
+        shas = self.run_to_store()
+        code, output = self.cli(
+            "jump",
+            "4-store",
+            "--reset-descendants",
+            "--git-rollback",
+            "branch",
+            "--new-branch",
+            "tutorial/try-again",
+            check=0,
+        )
+        self.assertIn("tutorial/try-again", output)
+
+        state = self.state()
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "tutorial/try-again")
+        self.assertEqual(self.head(), shas["scaffold"])
+        self.assertFalse((self.workspace / "src/todo/store.py").exists())
+        self.assertEqual(state["git"]["branch"], "tutorial/try-again")
+        self.assertEqual(self.node("4-store", state)["status"], "pending")
+        self.assertEqual(
+            self.git("rev-parse", "--verify", "refs/heads/main"),
+            shas["store"],
+            "the original checkpoint history must still exist on main",
+        )
+
+    def test_rollback_requires_reset_descendants(self):
+        self.run_to_store()
+        code, output = self.cli("jump", "3-smoke", "--git-rollback", "hard", "--force")
+        self.assertEqual(code, 1)
+        self.assertIn("--reset-descendants", output)
+
+    def test_status_json_round_trips(self):
+        self.run_to_store()
+        rendered = self.cli_stdout("status", "--json")
+        document = json.loads(rendered)
+        self.assertEqual(document, self.state())
+
+        mirror = self.workspace / "in-context.json"
+        mirror.write_text(rendered, encoding="utf-8")
+        self.cli("--file", "in-context.json", "validate", check=0)
+        code, output = self.cli("--file", "in-context.json", "status")
+        self.assertEqual(code, 0)
+        self.assertIn("4-store", output)
+
+
+if __name__ == "__main__":
+    unittest.main()
