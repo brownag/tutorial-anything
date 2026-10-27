@@ -1,124 +1,106 @@
 # interactive-tutorial
 
-Run any coding tutorial as a graph you can step through, jump ahead in, and
-rewind out of. The skill teaches an agent to decompose a tutorial into verifiable
-nodes, gate each one behind its own check, and checkpoint every file-changing
-step as a Git commit.
+Run any coding tutorial as a step-by-step DAG. Break a tutorial into verifiable nodes, check each step, and commit each file change to Git.
 
-State lives in `.tutorial-dag.json` inside the workspace you are tutorialing, and
-is excluded from Git by that repository's own `.git/info/exclude` — so it can
-never be committed, and `git reset` can never rewind your progress record.
+State lives in `.tutorial-dag.json` in the target workspace. The tool adds this file to `.git/info/exclude`. Git will not track it, and `git reset` will not wipe your progress record.
 
 - Spec and workflow: [`SKILL.md`](SKILL.md)
-- State contract: [`references/dag-schema.md`](references/dag-schema.md)
-- Requirements: Python ≥ 3.9 (stdlib only) and Git ≥ 2.25. No installs, no venv.
+- Schema and transitions: [`references/dag-schema.md`](references/dag-schema.md)
+- Requirements: Python ≥ 3.9 and Git ≥ 2.25. No dependencies.
 
 ## Install
 
-The skill is a directory; drop it where your agent looks for skills.
-
 ```bash
-make install                      # symlink into ~/.agents/skills/interactive-tutorial
-make install LOCAL=1              # link into ./.agents/skills instead
-make install SKILLS_DIR=/tmp/x    # anywhere (also how CI and the tests target it)
-make uninstall                    # remove the symlink
+make install                      # symlink to ~/.agents/skills/interactive-tutorial
+make install LOCAL=1              # symlink to ./.agents/skills
+make install SKILLS_DIR=/tmp/x    # symlink to custom path
+make uninstall                    # remove symlink
 ```
 
-Working *inside* this repository, no install is needed: the real skill files live
-in `interactive-tutorial/` and `.agents/skills/interactive-tutorial/` contains
-symlinks to them, so `.agents/skills/` remains a standard discoverable Agent
-Skills location. For Claude Code or Codex, link or copy `interactive-tutorial/`
-into their skills path — the layout is the portable one (`SKILL.md` +
-`references/` + `scripts/`).
+Inside this repository, the skill is already available in `.agents/skills/interactive-tutorial/`. For Claude Code or Codex, copy or symlink `interactive-tutorial/` into their skill directory.
 
 ## Quick start
 
 ```bash
 mkdir -p /tmp/todo && cd /tmp/todo && git init -b main && git commit -q --allow-empty -m base
-SKILL_DIR=~/.agents/skills/interactive-tutorial     # or ./  when inside this repo
+SKILL_DIR=~/.agents/skills/interactive-tutorial
 
 python3 "$SKILL_DIR/scripts/dag_manager.py" init \
   --title "Todo CLI" --source "$SKILL_DIR/examples/sample-tutorial.md" \
   --mode assisted --git-branch tutorial/todo
 
-# Write your decomposition into the "nodes" array of .tutorial-dag.json, e.g.
-# by copying the "nodes" array from examples/expected-dag.json, then:
+# Add nodes to .tutorial-dag.json (see examples/expected-dag.json for sample structure)
 python3 "$SKILL_DIR/scripts/dag_manager.py" validate
 python3 "$SKILL_DIR/scripts/dag_manager.py" status
 python3 "$SKILL_DIR/scripts/dag_manager.py" next
 ```
 
-Then the loop: do the node, `verify`, `complete --commit`. Full worked example:
-[`examples/sample-tutorial.md`](examples/sample-tutorial.md) with its answer in
-[`examples/expected-dag.json`](examples/expected-dag.json).
+Run each step, test with `verify`, and save progress with `complete --commit`. See [`examples/sample-tutorial.md`](examples/sample-tutorial.md) and [`examples/expected-dag.json`](examples/expected-dag.json).
 
-## CLI
+## CLI reference
 
 ```bash
 python3 scripts/dag_manager.py [--file PATH] [--cwd DIR] <command> ...
 ```
 
-Global flags go **before** the command. `--file` selects the state document
-(default `./.tutorial-dag.json`); `--cwd` pins the workspace that verification
-paths and commands use (default: current directory).
+Place global flags before the command. `--file` specifies the state file (default: `./.tutorial-dag.json`). `--cwd` sets the workspace root for verification checks (default: current directory).
 
-| Command | What it does | Exit |
+| Command | Action | Exit code |
 |---|---|---|
-| `init --title T --source S [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state document, add the exclude entry, record the branch, HEAD sha, and dirty flag | 1 if a state file exists and `--force` is absent |
-| `validate` | Structure, enums, duplicate ids, unknown dependencies, cycle detection | 1 on any problem |
-| `status [--json]` | Turn header + topologically ordered node table; `--json` prints the document | 1 if the document is invalid |
-| `next [<id>]` | Activate the only ready node, or a chosen ready node | 1 at a branch point or on an unfinished active node |
-| `verify [<id>] [--yes]` | Run the node's gate without changing state | 1 on failure |
-| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Gate, optional checkpoint, mark completed, recompute readiness | 1 if the gate fails, deps are unmet, or `--commit` has nothing to commit |
-| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force]` | Move the pointer anywhere; fast-forward and workspace rollback | 1 if ancestors are unmet or a rollback is unsafe |
+| `init --title T --source S [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state file, add exclude entry, record branch, HEAD commit, and dirty status | 1 if file exists without `--force` |
+| `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
+| `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
+| `next [<id>]` | Activate the next ready node, or pick a specific ready node | 1 if multiple nodes are ready or current node is incomplete |
+| `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
+| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure, missing dependencies, or empty commit |
+| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force]` | Move active pointer, fast-forward, or rollback workspace | 1 if prerequisites are incomplete or rollback is unsafe |
 
-`verify`/`complete` act on the active node when no id is given. Exit codes: `0`
-success, `1` operation or verification failure, `2` usage error.
+`verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
 
-Derived states are computed, never stored: `READY` means pending with every
-dependency completed or skipped; `ACTIVE` is the pointer; anything else is
-`PENDING` (blocked), `COMPLETED`, or `SKIPPED`.
+Node states:
+- `ACTIVE`: current node.
+- `READY`: pending node with all dependencies completed or skipped.
+- `PENDING`: pending node with incomplete dependencies.
+- `COMPLETED`: step finished.
+- `SKIPPED`: step bypassed.
 
-## Modes
+## Autonomy modes
 
 | | `guided` | `assisted` (default) | `hands-off` |
 |---|---|---|---|
-| Who runs the node's commands | The user | Agent after approval | Agent |
-| Who passes a `confirm` gate | The user, explicitly | The user, explicitly | Agent only if pre-approved |
-| Who commits | Agent, when the step changed files | Agent | Agent |
-| Good for | Machine without a toolchain, teaching, high-stakes hosts | Typical local work | Long local tutorials you are watching |
+| Command runner | User | Agent after user approval | Agent |
+| `confirm` checks | User | User | Agent (if pre-approved) |
+| Git commit | Agent | Agent | Agent |
+| Best used for | Missing toolchains, learning | Standard local development | Long automated tutorials |
 
-Persistence: `file` (default) keeps `.tutorial-dag.json`; `in-context` keeps the
-same document in the conversation and passes it with `--file` per command,
-re-reading it with `status --json`. The graph, gates, and checkpoints are
-identical either way.
+Persistence modes:
+- `file` (default): stores state in `.tutorial-dag.json`.
+- `in-context`: keeps state in the conversation, passes it via `--file`, and reads it back via `status --json`.
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
+| Problem | Cause and fix |
 |---|---|
-| `no state file at ./.tutorial-dag.json` | Run from the tutorial workspace, or pass `--file`. |
-| `git add -A` picked up `.tutorial-dag.json` | The workspace was used before this skill existed; re-run `init` (it re-adds the exclude entry) or append `.tutorial-dag.json` to `.git/info/exclude` by hand. |
-| `branch point: 2 nodes are ready` | Working as designed — pick a branch with `next <id>`. |
-| `refusing to jump over unmet ancestors` | Fast-forward properly, or pass `--skip-ancestors` when the prerequisites genuinely exist already. |
-| `nothing to commit: the workspace is clean` | The node changed no files, or an earlier `--commit` already swept them. Complete one node per turn and write only that node's files; drop `--commit` for nodes that change nothing. |
-| `--git-rollback hard` refused | It needs `--reset-descendants` (so the DAG stops claiming reverted work is done) and `--force` if the tree is dirty. |
-| Rollback says no ancestor checkpoint exists | The repo had no commits at `init` and nothing was committed since. Commit the current state, or use `--git-rollback none`. |
-| Verification never passes | Re-read the gate: `file_contains` is a literal substring unless `"regex": true`. Run `verify` to see the captured output. |
-| A `confirm` gate fails with no output shown | Expected: it needs `--yes`, which means a human said yes this turn. |
+| `no state file at ./.tutorial-dag.json` | Run command from workspace root, or pass `--file`. |
+| Git tracks `.tutorial-dag.json` | Re-run `init` or append `.tutorial-dag.json` to `.git/info/exclude`. |
+| `branch point: 2 nodes are ready` | Multiple paths open. Select one with `next <id>`. |
+| `refusing to jump over unmet ancestors` | Complete earlier nodes, or pass `--skip-ancestors` if already satisfied. |
+| `nothing to commit: the workspace is clean` | The node made no file changes, or files were already committed. Remove `--commit` for nodes that do not touch files. |
+| `--git-rollback hard` refused | Add `--reset-descendants` and `--force` if the working tree has uncommitted changes. |
+| No ancestor checkpoint exists | Git repository had no commits at `init`. Commit current state first, or use `--git-rollback none`. |
+| Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
+| `confirm` check fails with no output | Needs `--yes` flag to confirm human approval. |
 
 ## Development
 
 ```bash
-make lint               # compile check, no third-party tools
-make validate-examples  # validate + render examples/expected-dag.json
-make test               # python3 -m unittest discover -s tests -v
+make lint               # compile checks
+make validate-examples  # test sample DAG
+make test               # run test suite
 ```
 
-Tests create their own temporary Git repository per case with `HOME` and
-`GIT_CONFIG_GLOBAL` pointed at it, so they never touch your identity or config.
+Tests run in temporary Git repositories. They isolate global Git configurations.
 
 ## License
 
-MIT — see the `LICENSE` file at the repository root. Copyright 2026 Andrew Gene
-Brown.
+MIT. See `LICENSE` in repository root. Copyright 2026 Andrew Gene Brown.

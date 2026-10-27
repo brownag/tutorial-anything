@@ -1,19 +1,16 @@
 # Build a Tiny `todo` CLI
 
-A short tutorial for practising non-linear tutorial execution. It has a linear
-core, two genuinely optional features, one external step, and one convergence
-check. Use it as the input to the `interactive-tutorial` skill: the expected
-decomposition is `examples/expected-dag.json`, and it is a diamond, not a line.
+Practice running tutorials as non-linear graphs. This tutorial has a core path, two optional features, an external step, and a convergence check. See `examples/expected-dag.json` for the reference DAG.
 
-Everything here is stdlib-only Python so any workspace can run it.
+Uses the Python standard library. No extra dependencies required.
 
 ---
 
-## 1. The design: one parser, one function per verb
+## 1. Design: subcommands and dispatch
 
-`argparse` subparsers beat positional "mode" strings because each verb gets its
-own flags and its own `--help`, and the dispatch table stays a dictionary of
-`name -> function`. The package layout used below:
+`argparse` subparsers give each verb its own flags and `--help` output. The dispatch table maps command names to functions.
+
+Package structure:
 
 ```text
 src/todo/
@@ -23,13 +20,11 @@ src/todo/
 └── render.py   # table formatting    (optional feature B)
 ```
 
-Nothing to write in this section. You are done when you can say, out loud, which
-file you would edit to add a `--done` flag to the `list` command
-(`cli.py` for the flag, `render.py` for the display).
+No code to write here. Identify which file requires edits to add a `--done` flag to `list` (`cli.py` for flags, `render.py` for rendering).
 
 ## 2. Scaffold the CLI
 
-Create the package and the dispatch table:
+Create the package files and argument parser:
 
 ```python
 # src/todo/__init__.py
@@ -61,23 +56,21 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-Done when `python3 src/todo/cli.py --help` prints both subcommands.
+Done when `python3 src/todo/cli.py --help` lists both subcommands.
 
-## 3. Prove the scaffold runs
+## 3. Verify scaffold execution
 
-Run the CLI and confirm argparse is wired correctly:
+Run the CLI:
 
 ```bash
 python3 src/todo/cli.py list
 ```
 
-Expected output: `running: list`. A usage error instead means the subparser
-block is outside `build_parser()`.
+Expected output: `running: list`.
 
 ## 4. Optional: JSON persistence
 
-You can skip this section and still finish the tutorial; the CLI stays
-in-memory. Add storage:
+You can skip this step. The CLI defaults to in-memory state. Add file storage:
 
 ```python
 # src/todo/store.py
@@ -105,7 +98,7 @@ Done when `store.py` defines `load()` and `save()`.
 
 ## 5. Optional: table output
 
-Also independent of section 4 — render a column table:
+Independent of step 4. Add formatted table output:
 
 ```python
 # src/todo/render.py
@@ -117,40 +110,32 @@ def render(tasks):
     return "\n".join(rows) if rows else "(no tasks)"
 ```
 
-Done when `render([])` returns `(no tasks)`.
+Done when `render([])` outputs `(no tasks)`.
 
-## 6. Point the CLI at a real database file
+## 6. Configure database path
 
-This happens outside the code. Export a database path in **your own shell** so
-the tutorial never writes into your home directory, and confirm your shell
-startup file still parses afterwards:
+Configure storage outside the codebase. Set a database path in your current shell:
 
 ```bash
-export TODO_DB="$PWD/todos.json"   # add to your shell profile only if you want it sticky
+export TODO_DB="$PWD/todos.json"
 ```
 
-There is no file in the workspace to check. Done when you have set the variable
-in the shell running the tutorial and can echo it back.
+No files change in this step. Confirm by printing the environment variable in your terminal.
 
-## 7. Converge: both features coexist
+## 7. Converge features
 
-The two optional sections must not fight over the same file. Check they landed
-together, or that you deliberately skipped one:
+Verify that both optional files exist without conflicts:
 
 ```bash
 grep -c "def " src/todo/store.py src/todo/render.py
 ```
 
-Done when every file that exists reports at least one function definition, and
-the ones you skipped are skipped on purpose rather than forgotten.
+Done when each existing file defines at least one function.
 
 ---
 
-## Where people go wrong
+## Common mistakes
 
-- Editing `cli.py` in both optional sections at once. They are siblings; touch
-  `store.py` or `render.py`, and only wire `cli.py` once both exist.
-- Treating section 6 as verifiable by a script. It is an external step: the
-  honest gate is a human confirmation.
-- Skipping section 4 silently. A skipped node and a completed node look the same
-  downstream and feel very different six nodes later.
+- Editing `cli.py` across both optional sections at once. Edit `store.py` or `render.py` first, then wire into `cli.py`.
+- Trying to automate step 6 with a script. This is an external configuration step that requires manual confirmation.
+- Skipping step 4 without marking it skipped in the DAG.

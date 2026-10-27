@@ -1,69 +1,57 @@
 # interactive-tutorial
 
-An [Agent Skills](https://agentskills.io) package that turns a static coding
-tutorial into an interactive graph: the agent decomposes the document into
-verifiable nodes, runs one node per turn, gates each node behind its own
-verification command, and checkpoints every file-changing node as a Git commit.
-The result is a tutorial you can leave, resume, jump ahead in, and rewind —
-where "rewind to before I added persistence" is a command instead of a manual
-archaeology dig.
+An [Agent Skills](https://agentskills.io) package that turns a coding
+tutorial into an interactive graph. The agent breaks the document into
+verifiable nodes, runs one node per turn, checks each step, and commits
+every file change to Git. You can pause, resume, jump ahead, or rewind
+to an earlier checkpoint.
 
-State lives in `.tutorial-dag.json` in the workspace being tutorialled, excluded
-from Git by that repository's own `.git/info/exclude`. Progress therefore cannot
-be committed by accident, and `git reset` cannot rewind it.
+State lives in `.tutorial-dag.json` in the target workspace. The tool
+adds this file to `.git/info/exclude`. Git will not track it, and
+`git reset` will not wipe your progress record.
 
-- **Autonomy modes**: `guided` (human runs the commands), `assisted` (default:
-  agent proposes, human approves), `hands-off` (agent runs unattended).
-- **Persistence**: `file` (the DAG document) or `in-context` (same document kept
-  in the conversation).
-- **Navigation**: fast-forward through unfinished ancestors, or mark them
-  `skipped`; rewind by moving the pointer, by branching at an ancestor
-  checkpoint, or by `git reset --hard` to it.
-- **Runtime**: Python ≥ 3.9 standard library and Git ≥ 2.25. Nothing to install.
+- **Autonomy**: `guided` (user runs commands), `assisted` (agent proposes, user approves), `hands-off` (agent runs unattended).
+- **Persistence**: `file` (writes `.tutorial-dag.json`) or `in-context` (keeps state in the conversation).
+- **Navigation**: jump ahead by completing prerequisites or skipping them; rewind by moving the active pointer, branching, or running a hard reset.
+- **Runtime**: Python ≥ 3.9 standard library and Git ≥ 2.25. No dependencies.
 
-## What is in this repository
+## Repository layout
 
-This repo is a *container*, not the skill's build output. The skill's real files
-live in `interactive-tutorial/` at the top level, and `.agents/skills/interactive-tutorial/`
-holds relative symlinks to them — `.agents/skills/` is a standard Agent Skills
-discovery path, so working inside this repository the skill is already live, with
-no install step. The root `Makefile` only forwards to the skill's own `Makefile`.
+This repository is a container for the skill. Source files live in `interactive-tutorial/`. The `.agents/skills/interactive-tutorial/` directory contains relative symlinks to them. The root `Makefile` forwards all commands to the skill directory.
 
 ```text
 .
 ├── Makefile                                  forwards to the skill
 ├── README.md                                 you are here
 ├── LICENSE                                   MIT, Andrew Gene Brown 2026
-├── TODO.md                                   the plan this repo was built from
-├── .github/workflows/ci.yml                  lint + examples + tests, py 3.9/3.12
+├── TODO.md                                   development plan
+├── .github/workflows/ci.yml                  CI workflow (lint, examples, tests)
 ├── planning/INITIAL_PROMPT.md                original specification
-├── interactive-tutorial/                     ← the skill source; copy this directory
-│   ├── SKILL.md                              5-step workflow the agent follows
-│   ├── README.md                             skill-level CLI reference + troubleshooting
-│   ├── Makefile                              lint / test / validate-examples / install
-│   ├── references/dag-schema.md              state contract, derived states, transitions
+├── interactive-tutorial/                     skill source directory
+│   ├── SKILL.md                              agent instructions
+│   ├── README.md                             CLI reference and troubleshooting
+│   ├── Makefile                              lint, test, validate-examples, install
+│   ├── references/dag-schema.md              schema and state transition rules
 │   ├── references/dag-schema.json            JSON Schema (Draft 2020-12)
-│   ├── scripts/dag_manager.py                the CLI (stdlib only, executable)
-│   ├── examples/sample-tutorial.md           a tutorial with two optional branches
-│   ├── examples/expected-dag.json            its decomposition: a diamond, not a line
-│   └── tests/test_dag_manager.py             26 unittest cases in throwaway git repos
-└── .agents/skills/interactive-tutorial/      symlinks to ../../../interactive-tutorial/*
+│   ├── scripts/dag_manager.py                CLI tool (Python stdlib)
+│   ├── examples/sample-tutorial.md           sample tutorial with two branches
+│   ├── examples/expected-dag.json            DAG decomposition of sample tutorial
+│   └── tests/test_dag_manager.py             CLI test suite
+└── .agents/skills/interactive-tutorial/      symlinks to interactive-tutorial/*
 ```
 
 ## Install
 
 ```bash
-make install                       # symlink into ~/.agents/skills/interactive-tutorial
-make install LOCAL=1               # this repo's ./.agents/skills (already there: no-op)
-make install SKILLS_DIR=/tmp/x     # anywhere else
-make uninstall                     # remove that symlink
+make install                       # symlink to ~/.agents/skills/interactive-tutorial
+make install LOCAL=1               # symlink to ./.agents/skills (already present)
+make install SKILLS_DIR=/tmp/x     # symlink to custom path
+make uninstall                     # remove symlink
 ```
 
-Nothing runs during install but a `ln -s`; the target must be a symlink this repo
-created, or `install` refuses. `LOCAL=1` recognizes the committed symlink tree in
-`.agents/skills/interactive-tutorial/` as already installed and is a no-op.
+The install target creates a symlink pointing to the skill directory. It refuses to overwrite regular files or directories.
 
-## Sixty-second tour
+## Quick start
 
 ```bash
 mkdir -p /tmp/todo && cd /tmp/todo && git init -b main && git commit -q --allow-empty -m base
@@ -73,60 +61,47 @@ python3 "$SKILL" init --title "Todo CLI" --source tutorial.md --git-branch tutor
 python3 "$SKILL" status
 [assisted | file | tutorial/todo | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render]
 
-python3 "$SKILL" next                      # refuses to guess at a branch point
-python3 "$SKILL" complete --commit         # gate, then: tutorial(2-scaffold): Scaffold ...
-python3 "$SKILL" jump 7-converge           # refuses, listing the unmet ancestors
+python3 "$SKILL" next                      # stops if multiple branches are ready
+python3 "$SKILL" complete --commit         # checks step and commits changes
+python3 "$SKILL" jump 7-converge           # stops if prerequisite nodes are incomplete
 python3 "$SKILL" jump 3-smoke --reset-descendants --git-rollback hard --force
 ```
 
-Run it for real on the bundled example:
-[`examples/sample-tutorial.md`](interactive-tutorial/examples/sample-tutorial.md)
-with the answer key in
+Test the tool on the bundled example:
+[`examples/sample-tutorial.md`](interactive-tutorial/examples/sample-tutorial.md).
+See the sample DAG in
 [`examples/expected-dag.json`](interactive-tutorial/examples/expected-dag.json).
-Full command reference:
+Read the full command reference in
 [the skill README](interactive-tutorial/README.md).
 
-## Using it as a template
+## Using as a template
 
-Fork this repo and copy the skill directory once:
+Copy the skill directory to build a tutorial-specific skill:
 
 ```bash
 cp -r interactive-tutorial .agents/skills/build-a-vector-store
 ```
 
-Then rewrite that copy's `SKILL.md` step 2 with your tutorial's node ids, files,
-and verification commands. The schema, CLI, tests, and Makefile carry over: the
-state format is tutorial-agnostic, so a tutorial-specific skill is data plus
-prose. Keep the original if you also want the generic runner available.
+Update step 2 in `SKILL.md` with your tutorial's nodes, files, and verification commands. The schema, CLI, tests, and Makefile work without modifications.
 
-## Checks
+## Testing
 
 ```bash
 make lint               # byte-compile scripts and tests
-make validate-examples  # validate + render the reference DAG
-make test               # 26 unittest cases, each in its own temp git repo
-make all                # all three, in that order
+make validate-examples  # validate and print sample DAG
+make test               # run test suite in temporary git repos
+make all                # run lint, validate-examples, and test
 ```
 
-CI runs the same three targets on Python 3.9 and 3.12. Tests set `HOME` and
-`GIT_CONFIG_GLOBAL` to a temporary directory, so they never read or write your
-Git identity.
+CI tests on Python 3.9 and 3.12. Tests isolate Git by pointing `HOME` and `GIT_CONFIG_GLOBAL` to a temporary directory.
 
-## Notes and limits
+## Constraints
 
-- The CLI never runs a node's own commands — only its verification gate. The
-  agent runs the work, which is what keeps `guided` mode honest.
-- Checkpoints use `git add -A`, so a node's commit contains whatever is in the
-  workspace. Finish and commit one node before writing the next node's files.
-- `jump --git-rollback hard` destroys uncommitted work and requires `--force`;
-  `--git-rollback branch` is the safe default when the user might want the
-  current state back.
-- Rewinding Git history and rewinding DAG state are deliberately separate
-  decisions: reverting files without lying about node status (or the reverse) is
-  always expressible.
-- Python 3.9 is declared and covered in CI but not exercised on the development
-  machine (3.12 only).
+- The CLI only runs verification checks. It does not run the commands within a node. The agent or user runs the commands directly.
+- The `--commit` flag uses `git add -A`. It commits all current workspace changes. Complete and commit each node before editing files for the next step.
+- `jump --git-rollback hard` resets the working tree and requires `--force`. Use `--git-rollback branch` to preserve uncommitted work.
+- Resetting Git history and resetting DAG node status are separate operations.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright 2026 Andrew Gene Brown.
+MIT. See [LICENSE](LICENSE). Copyright 2026 Andrew Gene Brown.
