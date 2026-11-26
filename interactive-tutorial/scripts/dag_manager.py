@@ -893,13 +893,16 @@ def header_line(state: dict, workspace: Path) -> str:
     unlocked_text = ", ".join(unlocked[:4]) if unlocked else "none"
     if len(unlocked) > 4:
         unlocked_text += ", +{}".format(len(unlocked) - 4)
-    return "[{} | {} | {} | {} | active: {} | next: {}]".format(
+    residue_count = len(state.get("residue") or [])
+    residue_text = " | residue: {}".format(residue_count) if residue_count else ""
+    return "[{} | {} | {} | {} | active: {} | next: {}{}]".format(
         state.get("mode"),
         state.get("persistence"),
         branch,
         progress,
         active,
         unlocked_text,
+        residue_text,
     )
 
 
@@ -1120,6 +1123,18 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     for line in render_graph(state):
         say(line)
     say("")
+    for entry in state.get("residue") or []:
+        undo = entry.get("undo") or []
+        say(
+            "residue  {} [{}] {}{}".format(
+                entry["node_id"],
+                ", ".join(entry.get("scopes") or []),
+                entry.get("reason"),
+                " undo: {}".format("; ".join(undo)) if undo else "",
+            )
+        )
+    if state.get("residue"):
+        say("")
     index = node_index(state)
     parents, _ = relation_maps(state)
     active = state.get("active_node_id")
@@ -1342,8 +1357,69 @@ def nearest_ancestor_sha(state: dict, ancestors: list, workspace: Path, target: 
     return resolve_sha(workspace, initial)
 
 
+def node_scopes(node: dict) -> list:
+    """Side-effect scopes for a node; an absent ``side_effects`` means repo-only (C-G2)."""
+    return list(node.get("side_effects") or ["repo"])
+
+
+def side_effect_line(node: dict) -> str:
+    """One listing line for a rewound node with non-repo side effects (C-G2)."""
+    undo = node.get("undo") or []
+    tail = "undo: {}".format("; ".join(undo)) if undo else "undo: (none) | irreversible"
+    return "side effects: {} [{}] {}".format(
+        node["id"], ", ".join(node_scopes(node)), tail
+    )
+
+
+def residue_entry(node: dict, reason: str) -> dict:
+    """A root ``residue`` record for one node (C-G2)."""
+    return {
+        "node_id": node["id"],
+        "scopes": node_scopes(node),
+        "undo": list(node.get("undo") or []),
+        "reason": reason,
+        "recorded_at": now_iso(),
+    }
+
+
+def record_residue(state: dict, entries: list) -> None:
+    """Store entries, replacing any earlier residue for the same nodes."""
+    replaced = {entry["node_id"] for entry in entries}
+    kept = [e for e in state.get("residue") or [] if e.get("node_id") not in replaced]
+    state["residue"] = kept + entries
+
+
+def run_undo(node: dict, workspace: Path) -> tuple:
+    """Run a node's undo commands in order. Returns (ok, message)."""
+    for command in node.get("undo") or []:
+        say("  undo {}: {}".format(node["id"], command))
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(workspace),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=COMMAND_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "timed out after {}s: {}".format(COMMAND_TIMEOUT, command)
+        if proc.returncode != 0:
+            return False, "exit {}: {}\n{}".format(
+                proc.returncode, command, tail(proc.stdout or "")
+            )
+    return True, ""
+
+
 def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     """Move the active pointer, optionally fast-forwarding and reverting work."""
+    if args.undo and not args.reset_descendants:
+        raise CliError(
+            "--undo runs the undo commands of rewound nodes, so it must be paired "
+            "with --reset-descendants",
+            EXIT_USAGE,
+        )
     state = load_state(state_path)
     problems, _ = validate_document(state)
     if problems:
@@ -1436,16 +1512,45 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     if args.git_rollback != "none" and args.reset_descendants:
         # The target's own artifacts were just reverted, so it is redoable too.
         reset_from = [target] + reset_from
+    rewound = []
     if args.reset_descendants:
         order, _ = topological_order(state)
         pos = {nid: i for i, nid in enumerate(order)}
         reset_from = sorted(set(reset_from), key=lambda nid: pos.get(nid, 0))
+        rewound = [nid for nid in reset_from if index[nid].get("status") == "completed"]
         for nid in reset_from:
             index[nid]["status"] = "pending"
             index[nid]["commit_sha"] = None
         say(
             "reset to pending: {}".format(", ".join(reset_from) if reset_from else "(none)")
         )
+
+    # Rewound nodes with non-repo side effects, newest first (C-G2).
+    listed = [nid for nid in reversed(rewound) if set(node_scopes(index[nid])) - {"repo"}]
+    for nid in listed:
+        say(side_effect_line(index[nid]))
+
+    undo_failed = False
+    if args.undo:
+        for nid in listed:
+            node = index[nid]
+            scopes = node_scopes(node)
+            if undo_failed:
+                record_residue(state, [residue_entry(node, "not-run")])
+            elif "remote" in scopes:
+                record_residue(state, [residue_entry(node, "remote")])
+            elif not node.get("undo"):
+                record_residue(state, [residue_entry(node, "irreversible")])
+            else:
+                ok, message = run_undo(node, workspace)
+                if ok:
+                    say("undone: {}".format(nid))
+                else:
+                    undo_failed = True
+                    err("undo failed for {}: {}".format(nid, message))
+                    record_residue(state, [residue_entry(node, "failed")])
+    elif listed:
+        record_residue(state, [residue_entry(index[nid], "not-run") for nid in listed])
 
     state["active_node_id"] = target
     save_state(state_path, state)
@@ -1455,6 +1560,30 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             "  ({} is {}; jump to its parent, or re-jump with --reset-descendants, "
             "to redo its work)".format(target, index[target]["status"])
         )
+    say(header_line(state, workspace))
+    return EXIT_FAIL if undo_failed else EXIT_OK
+
+
+def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
+    """Remove residue entries once the user has handled them (C-G2)."""
+    state = load_state(state_path)
+    if bool(args.node_id) == bool(args.all):
+        raise CliError(
+            "residue clear takes exactly one of <node_id> or --all", EXIT_USAGE
+        )
+    entries = state.get("residue") or []
+    if args.all:
+        removed = entries
+        kept = []
+    else:
+        removed = [e for e in entries if e.get("node_id") == args.node_id]
+        kept = [e for e in entries if e.get("node_id") != args.node_id]
+    if not removed:
+        say("no residue recorded for {}".format(args.node_id or "any node"))
+        return EXIT_OK
+    state["residue"] = kept
+    save_state(state_path, state)
+    say("cleared residue: {}".format(", ".join(e["node_id"] for e in removed)))
     say(header_line(state, workspace))
     return EXIT_OK
 
@@ -1575,7 +1704,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow --git-rollback hard to discard uncommitted changes",
     )
+    jump.add_argument(
+        "--undo",
+        action="store_true",
+        help="run undo commands of rewound user/system nodes (needs --reset-descendants)",
+    )
     jump.set_defaults(func=cmd_jump)
+
+    residue = sub.add_parser("residue", help="manage residue left by jump")
+    residue_sub = residue.add_subparsers(dest="residue_command", metavar="ACTION")
+    residue_sub.required = True
+    residue_clear = residue_sub.add_parser("clear", help="remove residue entries")
+    residue_clear.add_argument("node_id", nargs="?", default=None, help="node to clear")
+    residue_clear.add_argument("--all", action="store_true", help="clear every entry")
+    residue_clear.set_defaults(func=cmd_residue_clear)
 
     return parser
 

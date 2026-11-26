@@ -283,7 +283,6 @@ def stop_services(ws: Path) -> None:
 class GapTest(unittest.TestCase):
     """Expected-failure gap tests. Each fails today for the missing feature."""
 
-    @unittest.expectedFailure
     def test_g2_side_effects(self):
         """Gap G2: side-effect scopes, undo, jump --undo, and residue."""
         case, dag = load_case_from("shell-sysadmin", "future-g2.json")

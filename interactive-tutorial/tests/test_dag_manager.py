@@ -707,6 +707,78 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("--reset-descendants", output)
 
+    def _set_side_effects(self, node_id, scopes, undo):
+        """Declare side effects on a live node (run_to_store leaves 2-scaffold, 3-smoke, 4-store completed)."""
+        state = self.state()
+        node = self.node(node_id, state)
+        node["side_effects"] = scopes
+        node["undo"] = undo
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def test_jump_undo_runs_undo_and_leaves_no_residue(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", "--undo")
+        self.assertEqual(code, 0, output)
+        self.assertIn("side effects: 4-store [user] undo: touch undone.flag", output)
+        self.assertTrue((self.workspace / "undone.flag").exists())
+        self.assertFalse(self.state().get("residue"))
+
+    def test_jump_without_undo_records_not_run_residue(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", check=0)
+        self.assertFalse((self.workspace / "undone.flag").exists())
+        residue = self.state()["residue"]
+        self.assertEqual([(e["node_id"], e["reason"]) for e in residue], [("4-store", "not-run")])
+        _, status = self.cli("status", check=0)
+        self.assertIn("residue: 1", status)
+
+    def test_failed_undo_stops_and_marks_the_rest_not_run(self):
+        self.run_to_store()
+        self._set_side_effects("3-smoke", ["user"], ["touch older.flag"])
+        self._set_side_effects("4-store", ["user"], ["false"])
+        code, output = self.cli("jump", "2-scaffold", "--reset-descendants", "--undo")
+        self.assertEqual(code, 1, output)
+        self.assertFalse((self.workspace / "older.flag").exists())
+        reasons = {e["node_id"]: e["reason"] for e in self.state()["residue"]}
+        self.assertEqual(reasons, {"4-store": "failed", "3-smoke": "not-run"})
+
+    def test_remote_and_irreversible_nodes_are_never_undone(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["remote"], ["touch remote.flag"])
+        self._set_side_effects("3-smoke", ["user"], [])
+        code, output = self.cli("jump", "2-scaffold", "--reset-descendants", "--undo", check=0)
+        self.assertFalse((self.workspace / "remote.flag").exists())
+        reasons = {e["node_id"]: e["reason"] for e in self.state()["residue"]}
+        self.assertEqual(reasons, {"4-store": "remote", "3-smoke": "irreversible"})
+        self.assertIn("residue: 2", self.cli("status", check=0)[1])
+
+    def test_undo_requires_reset_descendants(self):
+        self.run_to_store()
+        code, output = self.cli("jump", "3-smoke", "--undo")
+        self.assertEqual(code, 2)
+        self.assertIn("--reset-descendants", output)
+
+    def test_residue_clear_removes_one_entry_or_all(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        self.cli("jump", "3-smoke", "--reset-descendants", check=0)
+        self.cli("residue", "clear", check=2)
+        self.cli("residue", "clear", "4-store", "--all", check=2)
+        self.cli("residue", "clear", "4-store", check=0)
+        self.assertEqual(self.state()["residue"], [])
+        state = self.state()
+        state["residue"] = [
+            {"node_id": "3-smoke", "scopes": ["user"], "undo": [], "reason": "irreversible",
+             "recorded_at": "2026-11-26T00:00:00Z"},
+            {"node_id": "4-store", "scopes": ["user"], "undo": ["true"], "reason": "not-run",
+             "recorded_at": "2026-11-26T00:00:00Z"},
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("residue", "clear", "--all", check=0)
+        self.assertEqual(self.state()["residue"], [])
+
     def test_status_json_round_trips(self):
         self.run_to_store()
         rendered = self.cli_stdout("status", "--json")
