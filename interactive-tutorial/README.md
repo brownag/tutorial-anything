@@ -53,7 +53,7 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `next [<id>] [--skip-doctor]` | Activate the next ready node, or pick a specific ready node. When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, the current node is incomplete, or the preflight failed |
 | `doctor [--json]` | Check the tools and OS declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
-| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure, missing dependencies, or empty commit |
+| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 | `approve <id>` | Record a person's approval of a node's current risk tier; clears the `hands-off` gate for that node while its tier does not rise | 1 if the state is invalid |
@@ -91,9 +91,9 @@ Persistence modes:
 | Git tracks `.tutorial-dag.json` | Re-run `init` or append `.tutorial-dag.json` to `.git/info/exclude`. |
 | `branch point: 2 nodes are ready` | Multiple paths open. Select one with `next <id>`. |
 | `refusing to jump over unmet ancestors` | Complete earlier nodes, or pass `--skip-ancestors` if already satisfied. |
-| `nothing to commit: the workspace is clean` | The node made no file changes, or files were already committed. Remove `--commit` for nodes that do not touch files. |
+| `nothing to commit; completed <id> without a checkpoint` | The workspace was clean, so `complete --commit` completed the node with `commit_sha` null (exit 0). Expected for nodes that change no files. |
 | `--git-rollback hard` refused | Add `--reset-descendants` and `--force` if the working tree has uncommitted changes. |
-| No ancestor checkpoint exists | Git repository had no commits at `init`. Commit current state first, or use `--git-rollback none`. |
+| No ancestor checkpoint exists | Git repository had no commits at `init`. Make a baseline commit of the existing files, then re-run `init` (or use `--git-rollback none`). |
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
 | `confirm` check fails with no output | Needs `--yes` flag to confirm human approval. |
 | A command check hangs or reads nothing | Command checks no longer inherit the CLI's stdin. Their stdin is `/dev/null` unless the check sets `"stdin"`, so prompts see EOF. Add `"stdin": "answer\n"` to feed input, and `"timeout"` (seconds) to bound the run. |

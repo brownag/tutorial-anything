@@ -23,13 +23,11 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
 ## Step 1 — Session initialization and mode selection
 
 1. Check for existing state. If `.tutorial-dag.json` exists, read it with `status` and resume. Do not overwrite it without explicit confirmation.
-2. Verify the workspace is a Git repository:
-
-   ```bash
-   git rev-parse --is-inside-work-tree || echo "not a repo"
-   ```
-
-   Run `git init` if no repository exists. Checkpoints and rewinds require Git. Initialize a branch for tutorial work:
+2. Set up Git. Checkpoints and rewinds require it.
+   - Run `git init` if the workspace is not a repository.
+   - Add a `.gitignore` for build output the tutorial creates (for example `__pycache__/`, `node_modules/`).
+   - Make a baseline commit of the existing files before `init`. If the workspace is dirty, commit the sources first.
+   - Run `init` with a tutorial branch:
 
    ```bash
    python3 "$SKILL_DIR/scripts/dag_manager.py" init \
@@ -37,8 +35,8 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
      --mode assisted --git-branch tutorial/<slug>
    ```
 
-   `init` appends `.tutorial-dag.json` to `.git/info/exclude`. Git will not track this file, protecting your progress records across checkouts and resets.
-3. If the DAG declares `requires`, run `doctor` before the first `next`. It checks the declared tools and OS. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
+   The baseline commit sets `initial_commit_sha`, so checkpoints hold only tutorial changes. `--git-branch` works in a repository with no commits, but rollback needs the baseline commit. `init` appends `.tutorial-dag.json` to `.git/info/exclude`, so Git does not track progress records.
+3. If the DAG declares `requires`, run `doctor` before the first `next`. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
 4. Select autonomy and persistence modes:
 
    | Mode | Command execution | `confirm` check handler |
@@ -52,9 +50,14 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
    | `file` (default) | `.tutorial-dag.json` | Standard environments |
    | `in-context` | Conversation memory | Ephemeral or read-only filesystems |
 
+   In `hands-off` mode:
+   - At a branch point, take the paths in document order unless the user said otherwise, and say which you picked.
+   - A blanket pre-approval covers every `confirm` check. Before passing `--yes`, state in your reply what you confirmed.
+   - Pre-approval never covers `approve`.
+
 ## Step 2 — DAG decomposition
 
-Read the tutorial before writing nodes. Add the `nodes` array to `.tutorial-dag.json` (see `references/dag-schema.md`) and validate:
+Read the tutorial before writing nodes. Write the `nodes` array into `.tutorial-dag.json` (an editor or a short script), then validate:
 
 ```bash
 python3 "$SKILL_DIR/scripts/dag_manager.py" validate
@@ -62,12 +65,29 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" validate
 
 Rules:
 - Keep nodes atomic. Ensure each node has a clear verification check.
-- Use explicit dependencies. Model optional steps and parallel paths as branches sharing a parent node.
+- Use explicit dependencies. Model optional steps as branches off their parent and title them "(optional)". Nothing downstream of a required step may depend on an optional one.
 - Set `action_type`: `read-only` (review), `instruct` (manual external task), `mutate` (file changes), or `execute` (build or test command).
-- Provide a `verification` check for every node: `command`, `file_exists`, `file_contains`, or `confirm`. Use `confirm` for external steps.
-- Populate `artifacts` for `mutate` nodes and `commands` for step instructions. The CLI does not run node commands directly.
+- Populate `artifacts` for `mutate` nodes and `commands` with the tutorial's own shell commands. The CLI does not run node commands. Never put `dag_manager.py` calls in `commands`; the agent runs `service` through the CLI.
 
-Keep node counts close to the document structure. See `examples/expected-dag.json` for a sample diamond graph.
+Verification types: `command`, `file_exists`, `file_contains`, `port_listening`, `http`, `confirm`. Prefer an automated check. Use `confirm` only when no command can check the outcome.
+
+- `file_exists`, `file_contains`, and `artifacts` are workspace-relative. For files outside the workspace, use a `command` check, declare `side_effects`, and leave `artifacts` empty.
+- `side_effects` + `undo`: writes outside the workspace. See `references/dag-schema.md`, "Side effects, undo, and residue".
+- `service` + `ready`: long-running processes. See "Background services and http/port checks".
+- `interactive`, and the command check `stdin`: steps that prompt for input. See "Interactive steps and command-check stdin".
+- Root `requires`: tools the tutorial needs. See "Preflight: requires and doctor".
+
+Compact node examples (other required fields omitted from the first; the schema requires `id`, `title`, `summary`, `dependencies`, `action_type`, `status`, `commit_sha`, `artifacts`, `commands`, `verification`):
+
+```json
+{"id": "3-user-bin", "title": "Install into ~/.local/bin", "summary": "Copy the binary to the user bin.", "dependencies": ["2-build"], "action_type": "mutate", "status": "pending", "commit_sha": null, "artifacts": [], "commands": ["cp dist/greet ~/.local/bin/greet"], "side_effects": ["user"], "undo": ["rm -f ~/.local/bin/greet"], "verification": {"type": "command", "command": "test -x ~/.local/bin/greet", "expect_exit": 0}}
+```
+
+```json
+{"id": "4-serve", "title": "Start the server", "summary": "Run the dev server in the background.", "dependencies": ["3-build"], "action_type": "execute", "status": "pending", "commit_sha": null, "artifacts": [], "commands": [], "service": {"command": "python3 -m http.server 8000", "ready": {"type": "port_listening", "port": 8000}}, "verification": {"type": "http", "url": "http://127.0.0.1:8000/", "expect_status": 200}}
+```
+
+After nodes exist, change progress fields (`status`, `commit_sha`, `approved`, `active_node_id`) only through the CLI.
 
 ## Step 3 — Status check
 
@@ -81,7 +101,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" status
 [assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1 | svc: 1]
 ```
 
-This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. `svc: N` appears only when N > 0 services are recorded. Use `--json` when you need full raw state.
+The line shows mode, persistence, branch, progress, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. `svc: N` appears only when N > 0 services are recorded. Use `--json` for full raw state.
 
 ## Step 4 — Execution loop
 
@@ -93,13 +113,14 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" verify
 python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 ```
 
-- Complete work for the node before running `complete`. The command runs verification and blocks updates on failure.
-- `--commit` stages workspace changes and commits as `tutorial(<node-id>): <title>`. Use this for `mutate` and stateful `execute` nodes. Write files only for the current node.
+- Finish the node's work before `complete`. `complete` runs verification and blocks the update on failure.
+- `complete` makes the next node active when exactly one is ready. Then skip `next`. When several are ready it prints `branch point, pick one: …`. Choose with `next <id>`.
+- Use `--commit` when the node changed workspace files. It commits as `tutorial(<node-id>): <title>`. On a clean workspace, `complete --commit` completes the node without a checkpoint: `nothing to commit; completed <id> without a checkpoint` (exit 0, `commit_sha` stays null). Rollback then targets the nearest completed ancestor checkpoint.
 - Complete `read-only` and `instruct` nodes without `--commit`.
-- Use `--yes` to pass `confirm` checks after user confirmation.
+- The `next:` header lists ready nodes other than the active one.
+- Use `--yes` to pass `confirm` checks only after the user confirms (see Step 1 for hands-off).
 - For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
-- If multiple paths are ready, `next` stops and lists them. Ask the user which path to take.
-- If a check fails, fix the code or update the test. Do not bypass checks by editing the state file directly.
+- If a check fails, fix the code or update the test. Do not bypass checks by editing the state file.
 
 ### Services
 
@@ -111,8 +132,8 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" service stop <id>
 python3 "$SKILL_DIR/scripts/dag_manager.py" teardown         # stop all services
 ```
 
-- `service start` runs the command detached, waits for the node's `ready` check, and writes the log to `.tutorial-logs/<id>.log`. If `ready` never passes, it prints the log tail and exits 1.
-- Complete the node after `service start`. Its `verification` (often `port_listening` or `http`) confirms the service works.
+- `service start` runs the command detached, waits for `ready`, and logs to `.tutorial-logs/<id>.log`. If `ready` never passes, it prints the log tail and exits 1.
+- Complete the node after `service start`. Its `verification` confirms the service works.
 - Run `teardown` when the session ends. `jump --reset-descendants` also stops the services it rewinds.
 - Services are POSIX only.
 
@@ -128,7 +149,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete <ancestor> --commit
 python3 "$SKILL_DIR/scripts/dag_manager.py" jump <target> --skip-ancestors
 ```
 
-Only use `--skip-ancestors` if prerequisite steps are already satisfied in the environment.
+Use `--skip-ancestors` only if the prerequisites are already satisfied in the environment.
 
 **Rewind.** Determine the intended action before running changes:
 
@@ -141,11 +162,10 @@ Only use `--skip-ancestors` if prerequisite steps are already satisfied in the e
 
 - Rollback targets the nearest completed parent commit.
 - `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
-- Confirm with the user before rolling back completed `mutate` or `execute` nodes.
-- `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed as `side effects: <id> [<scopes>] undo: <cmd> | irreversible` and recorded as `residue`.
-- Confirm with the user before `--undo` on `system` scope.
-- `residue clear [<node_id> | --all]` removes residue entries once they are handled.
-- `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until it is approved.
+- Confirm with the user before rolling back completed `mutate` or `execute` nodes, and before `--undo` on `system` scope.
+- `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed and recorded as `residue`.
+- `residue clear [<node_id> | --all]` removes residue entries once handled.
+- `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until approved.
 - Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
 
 ## In-context persistence
@@ -161,13 +181,13 @@ Use `file` mode if the workspace supports local file storage.
 
 ## Creating a custom tutorial skill
 
-Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2 in `SKILL.md` with your tutorial's nodes, files, and verification commands. The CLI, schema, and tests remain unchanged.
+Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2 with your tutorial's nodes, files, and checks. The CLI, schema, and tests remain unchanged.
 
 ## Safety rules
 
 - Do not execute node `commands` directly in `guided` mode.
 - The CLI never runs node `commands`. It runs only a declared `service` command (`service start`) and declared `undo` commands (`jump --undo`).
-- Run `teardown` before you end a session that started services.
+- Run `teardown` before ending a session that started services.
 - In `hands-off` mode, run `approve <node_id>` for a high-risk node only after a person says yes.
 - Do not complete a node without running its verification check.
 - Never run `git reset --hard` or `git clean` without user approval.
