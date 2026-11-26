@@ -1,0 +1,90 @@
+{
+  "schema_version": "1.0",
+  "title": "Install a greeting command for your user",
+  "source_doc": "tests/corpus/shell-sysadmin/tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-11-25T09:00:00Z",
+  "updated_at": "2026-11-25T09:00:00Z",
+  "git": {
+    "branch": "tutorial/shell-sysadmin",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "nodes": [
+    {
+      "id": "scaffold",
+      "title": "Write the config example",
+      "summary": "Create greet.conf.example in the repo.",
+      "dependencies": [],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["greet.conf.example"],
+      "commands": ["echo name=Ada > greet.conf.example"],
+      "verification": {"type": "file_exists", "path": "greet.conf.example"}
+    },
+    {
+      "id": "write-config",
+      "title": "Install the user config",
+      "summary": "Copy the example into $HOME/.config/greet/greet.conf.",
+      "dependencies": ["scaffold"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["mkdir -p \"$HOME/.config/greet\"\ncp greet.conf.example \"$HOME/.config/greet/greet.conf\""],
+      "verification": {"type": "command", "command": "test -f \"$HOME/.config/greet/greet.conf\"", "expect_exit": 0}
+    },
+    {
+      "id": "check-config",
+      "title": "Check the config contents",
+      "summary": "Confirm the installed config has name=Ada.",
+      "dependencies": ["write-config"],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {"type": "command", "command": "grep -q '^name=Ada$' \"$HOME/.config/greet/greet.conf\"", "expect_exit": 0}
+    },
+    {
+      "id": "install-bin",
+      "title": "Install the greet command",
+      "summary": "Write an executable script to $HOME/.local/bin/greet.",
+      "dependencies": [],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["mkdir -p \"$HOME/.local/bin\"\ncat > \"$HOME/.local/bin/greet\" <<'EOF'\n#!/bin/sh\nname=$(sed -n 's/^name=//p' \"$HOME/.config/greet/greet.conf\")\necho \"hello, $name\"\nEOF\nchmod +x \"$HOME/.local/bin/greet\""],
+      "verification": {"type": "command", "command": "test -x \"$HOME/.local/bin/greet\"", "expect_exit": 0}
+    },
+    {
+      "id": "run-greet",
+      "title": "Run the greet command",
+      "summary": "Run the installed command by absolute path.",
+      "dependencies": ["install-bin"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["\"$HOME/.local/bin/greet\""],
+      "verification": {"type": "command", "command": "\"$HOME/.local/bin/greet\"", "pattern": "hello, Ada", "expect_exit": 0}
+    },
+    {
+      "id": "verify-all",
+      "title": "Confirm the setup",
+      "summary": "Both the config check and the run succeeded.",
+      "dependencies": ["check-config", "run-greet"],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {"type": "confirm", "prompt": "Confirm greet prints hello, Ada."}
+    }
+  ]
+}

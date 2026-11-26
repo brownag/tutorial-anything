@@ -1,0 +1,7 @@
+{
+  "domain": "shell",
+  "runnable": true,
+  "reason": null,
+  "expect_fail_at": null,
+  "gaps": {"G2": "future-g2.json"}
+}
