@@ -58,7 +58,8 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 | `approve <id>` | Record a person's approval of a node's current risk tier and its deviations; clears the `hands-off` gate for that node while its tier does not rise and no new deviation is recorded | 1 if the state is invalid |
 | `deviate [<id>] (--command N \| --check) --to CMD --reason TEXT` | Replace a stale check or command (default: active node) and record the original, replacement, and reason. Use only when the tutorial is wrong | 0 on success; 1 if the node is completed (`jump <id> --reset-descendants` first); 2 on bad target, same or empty text, or a non-command check |
-| `export [--out DIR]` | Write `deviations.md` and, for a readable local `source_doc`, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
+| `export [--out DIR]` | Write `deviations.md` and, for a readable local `source_doc` with at least one deviation, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
+| `draft <path> [--write]` | Print a skeleton DAG (JSON `{"title", "nodes"}`) from a Markdown tutorial: one node per H2/H3 heading (or numbered item), linear chain, `DRAFT:` placeholder checks. `--write` fills an empty `nodes` array, then validates | 1 with `--write` if `nodes` is not empty (`nodes already present`) |
 | `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
 | `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
 | `teardown` | Stop every recorded service | 0 |
@@ -100,6 +101,7 @@ Persistence modes:
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
 | `confirm` check fails with no output | Needs `--yes` flag to confirm human approval. |
 | A command check hangs or reads nothing | Command checks no longer inherit the CLI's stdin. Their stdin is `/dev/null` unless the check sets `"stdin"`, so prompts see EOF. Add `"stdin": "answer\n"` to feed input, and `"timeout"` (seconds) to bound the run. |
+| `node '<id>' still has a draft check` warning | A `confirm` check still has a `DRAFT:` prompt from `draft`. Replace it with a real verification. |
 | `command looks interactive` warning | The command may wait for input. Add `"interactive": {"answers": [...]}`, or `"human": true` for a step a person must run, or use the non-interactive flag (for example `npm init -y`). |
 | `services require a POSIX system` | `service` commands are POSIX only. Run the service step on Linux or macOS. |
 | `has deviated and hands-off mode needs a person` | A hands-off node has deviations that `approve` does not cover. After a person says yes, run `approve <id>`. |

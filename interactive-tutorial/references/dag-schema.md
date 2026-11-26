@@ -40,6 +40,7 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 | `commands` | string[] | Shell commands for this step. The CLI does not execute these automatically. |
 | `verification` | object | Verification rule. Required on every node. |
 | `deviations` | object[] | Optional. Records written by `deviate` (schema 1.2). See "Deviations (C-G8)". |
+| `source_ref` | object | Optional. `{line, heading}`: `line` is a 1-based integer >= 1 (the source heading line), `heading` a string. Written by `draft`. See "Draft (C-G10)". |
 
 ### action_type taxonomy
 
@@ -155,7 +156,18 @@ Tiers are ordered `low < elevated < high`. The effective tier is the higher of t
 - `approve <id>` sets `approved.deviations` to the node's deviation count. A later deviation makes the count stale.
 - Hands-off gate: `complete` refuses a node whose deviations are not all covered by `approve` (exit 1, names `approve <id>`). A later deviation blocks again. `guided` and `assisted` are never blocked.
 - `status` shows `deviations: N` in the active block and a `deviations  <id>: N` line per node with deviations.
-- `export [--out DIR]` (default `<workspace>/.tutorial-export`, git-excluded) always writes `deviations.md`. It writes `tutorial.corrected.md` when `source_doc` is a readable local file: each `original` is replaced by its `replacement` (first occurrence, in recorded order). Originals not found are listed under `## Not applied`. Exit 0; prints the written paths.
+- `export [--out DIR]` (default `<workspace>/.tutorial-export`, git-excluded) always writes `deviations.md`. It writes `tutorial.corrected.md` when `source_doc` is a readable local file and at least one deviation is recorded: each `original` is replaced by its `replacement` (first occurrence, in recorded order). Originals not found are listed under `## Not applied`. Exit 0; prints the written paths.
+
+## Draft (C-G10)
+
+`draft <path> [--write]` builds a skeleton DAG from a Markdown tutorial. It is a starting point to check against the tutorial, not a finished DAG.
+
+- Each H2/H3 heading starts a node. If the file has no H2/H3, each top-level numbered item (`N. `) does. Text before the first section is ignored; the H1 is the title hint.
+- Nodes form a linear chain (`dependencies` = previous node). `id` is `<n>-<slug>`. Shell fences become `commands`; `action_type` is guessed (`execute` for shell fences, `mutate` for other fences, else `read-only`).
+- Each node gets a placeholder check: `{"type": "confirm", "prompt": "DRAFT: replace with a real check for <title>"}`, and `source_ref` = `{line, heading}`.
+- Output is always JSON (`{"title", "nodes"}`). There is no `--json` flag.
+- `--write` requires an existing state file with an empty `nodes` array (otherwise exit 1, `nodes already present`). It writes the nodes, validates, and prints the header line.
+- `validate` warns `node '<id>' still has a draft check` for any `confirm` prompt starting with `DRAFT:`. Replace these before completing the tutorial.
 
 ## Sample state file
 

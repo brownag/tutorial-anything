@@ -261,6 +261,16 @@
         "verification": {
           "$ref": "#/$defs/verification"
         },
+        "source_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["line", "heading"],
+          "description": "Optional. Written by draft: the 1-based line of the source heading.",
+          "properties": {
+            "line": {"type": "integer", "minimum": 1},
+            "heading": {"type": "string"}
+          }
+        },
         "deviations": {
           "type": "array",
           "items": {

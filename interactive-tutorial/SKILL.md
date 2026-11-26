@@ -57,7 +57,13 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
 
 ## Step 2 — DAG decomposition
 
-Read the tutorial before writing nodes. Write the `nodes` array into `.tutorial-dag.json` (an editor or a short script), then validate:
+Read the tutorial first. Then run `draft` after `init` to get a skeleton:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" draft <tutorial.md> --write
+```
+
+`draft` makes one node per H2/H3 heading (or numbered item) in a linear chain. It only knows fenced shell commands, so prose-only steps come out `read-only` with no `commands`. Treat the draft as a skeleton to check against the tutorial. Refine the `nodes` array in `.tutorial-dag.json` (an editor or a short script) with real dependencies and branches, real checks in place of the `DRAFT:` placeholders, and `side_effects`, `service`, `interactive`, and `requires` where they apply. Then run `validate` until no `still has a draft check` warnings remain:
 
 ```bash
 python3 "$SKILL_DIR/scripts/dag_manager.py" validate
@@ -122,7 +128,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
 - If a check fails, fix your work first. Do not bypass checks by editing the state file.
 - If the tutorial itself is wrong (it contradicts itself, or the tool changed), not your work, record the fix: `deviate [<id>] (--command N | --check) --to "<cmd>" --reason "<why the tutorial is wrong>"`, then `verify` again. Use `deviate` only for a stale tutorial. Never invent behavior to make a stale check pass.
-- Run `export` at the end of the session. It writes `.tutorial-export/deviations.md` and, for a local source, `tutorial.corrected.md`.
+- Run `export` at the end of the session. It writes `.tutorial-export/deviations.md` and, for a local source with at least one deviation, `tutorial.corrected.md`.
 
 ### Services
 
