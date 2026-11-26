@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILENAME = ".tutorial-dag.json"
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 MODES = ("guided", "assisted", "hands-off")
 PERSISTENCE_MODES = ("file", "in-context")
@@ -138,6 +138,9 @@ VERIFICATION_ALLOWED = {
     "http": ("type", "url", "expect_status", "pattern", "timeout"),
     "port_listening": ("type", "port", "host", "timeout"),
 }
+
+
+DEVIATION_TARGET_RE = re.compile(r"^(check|command:\d+)$")
 
 
 class CliError(Exception):
@@ -611,6 +614,8 @@ def validate_node(node, position: int, seen: dict) -> list:
                 label, list(RISK_TIERS), node.get("risk")
             )
         )
+    if "deviations" in node:
+        problems.extend(validate_deviations(node["deviations"], label))
     if "approved" in node:
         value = node.get("approved")
         if (
@@ -719,6 +724,30 @@ def validate_services(services) -> list:
             value = record.get(field)
             if not isinstance(value, str) or not value.strip():
                 problems.append("{} field {!r} must be a non-empty string".format(label, field))
+    return problems
+
+
+def validate_deviations(value, label) -> list:
+    """Validate a node's ``deviations`` records (C-G8)."""
+    if not isinstance(value, list):
+        return ["{} field 'deviations' must be an array".format(label)]
+    problems = []
+    for position, entry in enumerate(value):
+        item = "{} deviations[{}]".format(label, position)
+        if not isinstance(entry, dict):
+            problems.append("{} must be an object".format(item))
+            continue
+        target = entry.get("target")
+        if not isinstance(target, str) or not DEVIATION_TARGET_RE.match(target):
+            problems.append(
+                "{} field 'target' must match {}".format(item, DEVIATION_TARGET_RE.pattern)
+            )
+        for field in ("original", "replacement", "recorded_at"):
+            if not isinstance(entry.get(field), str):
+                problems.append("{} field {!r} must be a string".format(item, field))
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append("{} field 'reason' must be a non-empty string".format(item))
     return problems
 
 
@@ -1747,6 +1776,71 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
+    """Replace a node's check or one of its commands and record why (C-G8)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    nid = resolve_target(state, args.node_id, workspace)
+    node = get_node(state, nid)
+    if node.get("status") == "completed":
+        raise CliError(
+            "'{}' is already completed. Jump back with `jump {} --reset-descendants` "
+            "before deviating.".format(nid, nid)
+        )
+    if not args.to.strip():
+        raise CliError("--to must be a non-empty command", EXIT_USAGE)
+    if not args.reason.strip():
+        raise CliError("--reason must be non-empty", EXIT_USAGE)
+
+    if args.check:
+        verification = node.get("verification") or {}
+        if verification.get("type") != "command":
+            raise CliError(
+                "'{}' check is not a command check; --check needs a 'command' "
+                "verification".format(nid),
+                EXIT_USAGE,
+            )
+        target = "check"
+        original = verification.get("command")
+    else:
+        commands = node.get("commands") or []
+        if args.index < 0 or args.index >= len(commands):
+            raise CliError(
+                "'{}' has {} command(s); --command {} is out of range".format(
+                    nid, len(commands), args.index
+                ),
+                EXIT_USAGE,
+            )
+        target = "command:{}".format(args.index)
+        original = commands[args.index]
+    if original == args.to:
+        raise CliError("--to is the same as the current text of {}".format(target), EXIT_USAGE)
+
+    if args.check:
+        node["verification"]["command"] = args.to
+    else:
+        node["commands"][args.index] = args.to
+    node.setdefault("deviations", []).append(
+        {
+            "target": target,
+            "original": original,
+            "replacement": args.to,
+            "reason": args.reason,
+            "recorded_at": now_iso(),
+        }
+    )
+    save_state(state_path, state)
+    say("deviation recorded: {} {}".format(nid, target))
+    tier, labels = risk_tier(node)
+    if tier == "high":
+        say("risk: high ({})".format(", ".join(labels) or "declared risk high"))
+    return EXIT_OK
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
     state = load_state(state_path)
@@ -2531,6 +2625,17 @@ def build_parser() -> argparse.ArgumentParser:
     approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
     approve.add_argument("node_id", help="node whose current risk tier to approve")
     approve.set_defaults(func=cmd_approve)
+
+    deviate = sub.add_parser("deviate", help="replace a check or command and record why")
+    deviate.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    which = deviate.add_mutually_exclusive_group(required=True)
+    which.add_argument(
+        "--command", dest="index", type=int, metavar="N", help="replace commands[N] (0-based)"
+    )
+    which.add_argument("--check", action="store_true", help="replace the command check")
+    deviate.add_argument("--to", required=True, metavar="CMD", help="replacement text")
+    deviate.add_argument("--reason", required=True, metavar="TEXT", help="why the text is wrong")
+    deviate.set_defaults(func=cmd_deviate)
 
     residue = sub.add_parser("residue", help="manage residue left by jump")
     residue_sub = residue.add_subparsers(dest="residue_command", metavar="ACTION")

@@ -1022,6 +1022,89 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn("'risk'", output)
 
+    # -- deviate (C-G8) ---------------------------------------------------
+
+    def _node_with(self, **fields):
+        self.seed_repo()
+        state = self.seed_state()
+        node = state["nodes"][0]
+        node.update(fields)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return node["id"]
+
+    def test_deviate_check_replaces_verification_command_and_records(self):
+        nid = self._node_with(verification={"type": "command", "command": "./greet --name Ada"})
+        code, output = self.cli("deviate", nid, "--check", "--to", "./greet --who Ada",
+                                "--reason", "v2 renamed --name to --who")
+        self.assertEqual(code, 0, output)
+        self.assertIn("deviation recorded: {} check".format(nid), output)
+        node = self.node(nid)
+        self.assertEqual(node["verification"]["command"], "./greet --who Ada")
+        (record,) = node["deviations"]
+        self.assertEqual(record["target"], "check")
+        self.assertEqual(record["original"], "./greet --name Ada")
+        self.assertEqual(record["replacement"], "./greet --who Ada")
+        self.assertEqual(record["reason"], "v2 renamed --name to --who")
+        self.assertTrue(record["recorded_at"].endswith("Z"))
+
+    def test_deviate_command_n_replaces_that_command(self):
+        nid = self._node_with(commands=["echo a", "echo b"])
+        code, output = self.cli("deviate", nid, "--command", "1", "--to", "echo c",
+                                "--reason", "fix")
+        self.assertEqual(code, 0, output)
+        node = self.node(nid)
+        self.assertEqual(node["commands"], ["echo a", "echo c"])
+        self.assertEqual(node["deviations"][0]["target"], "command:1")
+
+    def test_deviate_out_of_range_command_exits_2(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "3", "--to", "echo c",
+                                "--reason", "fix")
+        self.assertEqual(code, 2, output)
+        self.assertNotIn("deviations", self.node(nid))
+
+    def test_deviate_same_text_exits_2(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "echo a",
+                                "--reason", "fix")
+        self.assertEqual(code, 2, output)
+
+    def test_deviate_check_on_non_command_check_exits_2(self):
+        nid = self._node_with(verification={"type": "confirm", "prompt": "ok?"})
+        code, output = self.cli("deviate", nid, "--check", "--to", "yes", "--reason", "fix")
+        self.assertEqual(code, 2, output)
+
+    def test_deviate_empty_or_blank_to_and_reason_exit_2(self):
+        nid = self._node_with(commands=["echo a"])
+        for args in (["--to", "  ", "--reason", "fix"], ["--to", "echo b", "--reason", "   "]):
+            code, output = self.cli("deviate", nid, "--command", "0", *args)
+            self.assertEqual(code, 2, output)
+        self.assertNotIn("deviations", self.node(nid))
+
+    def test_deviate_refuses_completed_node_with_reset_hint(self):
+        nid = self._node_with(commands=["echo a"], status="completed", commit_sha=None)
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "echo b",
+                                "--reason", "fix")
+        self.assertEqual(code, 1, output)
+        self.assertIn("--reset-descendants", output)
+        self.assertEqual(self.node(nid)["commands"], ["echo a"])
+
+    def test_deviate_sudo_makes_tier_high(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "sudo true",
+                                "--reason", "needs root")
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high", output)
+
+    def test_validate_rejects_bad_deviation_target(self):
+        self._node_with(commands=["echo a"], deviations=[{
+            "target": "check2", "original": "a", "replacement": "b",
+            "reason": "r", "recorded_at": "2026-11-26T00:00:00Z",
+        }])
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+        self.assertIn("deviations", output)
+
 
 def load_cli_module():
     """Import scripts/dag_manager.py so pure helpers can be tested directly."""
