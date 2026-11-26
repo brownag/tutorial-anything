@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "title": "Serve a tiny static site",
   "source_doc": "tests/corpus/web-service/tutorial.md",
   "mode": "assisted",
@@ -29,38 +29,44 @@
     {
       "id": "serve",
       "title": "Start the server",
-      "summary": "Run the static server on 127.0.0.1:8000 and leave it running.",
+      "summary": "Run the static server on a free port and leave it running.",
       "dependencies": ["scaffold"],
-      "action_type": "instruct",
+      "action_type": "execute",
       "status": "pending",
       "commit_sha": null,
       "artifacts": [],
-      "commands": ["python3 -m http.server 8000 --bind 127.0.0.1 --directory site"],
-      "verification": {"type": "confirm", "prompt": "Confirm the server is running on port 8000."}
+      "commands": [],
+      "service": {
+        "command": "python3 -m http.server {{PORT}} --bind 127.0.0.1 --directory site",
+        "ready": {"type": "port_listening", "port": "{{PORT}}"},
+        "ready_timeout": 30,
+        "stop_signal": "TERM"
+      },
+      "verification": {"type": "port_listening", "port": "{{PORT}}"}
     },
     {
       "id": "check",
-      "title": "Check the page in a browser",
-      "summary": "Open http://127.0.0.1:8000/ and see your line.",
+      "title": "Check the page over HTTP",
+      "summary": "Fetch the page from the running server.",
       "dependencies": ["serve"],
       "action_type": "read-only",
       "status": "pending",
       "commit_sha": null,
       "artifacts": [],
       "commands": [],
-      "verification": {"type": "confirm", "prompt": "Confirm the page shows your line."}
+      "verification": {"type": "http", "url": "http://127.0.0.1:{{PORT}}/", "expect_status": 200}
     },
     {
       "id": "stop",
       "title": "Stop the server",
       "summary": "Press Ctrl-C in the server terminal.",
       "dependencies": ["check"],
-      "action_type": "instruct",
+      "action_type": "execute",
       "status": "pending",
       "commit_sha": null,
       "artifacts": [],
       "commands": [],
-      "verification": {"type": "confirm", "prompt": "Confirm the server has stopped."}
+      "verification": {"type": "command", "command": "python3 -c \"import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1', {{PORT}})) else 1)\""}
     }
   ]
 }

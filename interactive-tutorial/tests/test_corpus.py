@@ -84,14 +84,6 @@ def load_case(slug: str) -> tuple:
     return case, dag
 
 
-def load_case_from(slug: str, future_name: str) -> tuple:
-    """Return (fixture metadata, future DAG) for a gap fixture under ``slug``."""
-    folder = CORPUS / slug
-    case = json.loads((folder / "fixture.json").read_text(encoding="utf-8"))
-    dag = json.loads((folder / future_name).read_text(encoding="utf-8"))
-    return case, dag
-
-
 def write_temp_dag(dag: dict) -> Path:
     """Write ``dag`` to a fresh temp file and return its path; caller removes the parent."""
     folder = Path(tempfile.mkdtemp(prefix="corpus-dag-"))
@@ -182,11 +174,19 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
         proc = run_cli(ws, "next", node["id"])
         if proc.returncode != 0:
             raise RuntimeError("next {} failed: {}".format(node["id"], proc.stderr))
+        if node.get("service"):
+            proc = run_cli(ws, "service", "start", node["id"])
+            if proc.returncode != 0:
+                raise RuntimeError("service start {} failed: {}".format(node["id"], proc.stdout + proc.stderr))
         for command in node["commands"]:
             subprocess.run(
                 command, shell=True, cwd=str(ws), env=env, stdin=subprocess.DEVNULL,
                 timeout=60, check=True,
             )
+        if node["id"] == "stop":
+            proc = run_cli(ws, "service", "stop", "serve")
+            if proc.returncode != 0:
+                raise RuntimeError("service stop serve failed: {}".format(proc.stdout + proc.stderr))
         complete_args = ["complete", node["id"]]
         dirty = subprocess.run(
             ["git", "status", "--porcelain"], cwd=str(ws), env=env,
@@ -239,12 +239,14 @@ class CorpusRunTest(unittest.TestCase):
 
     def test_runnable_fixtures_complete(self):
         for slug in CORPUS_SLUGS:
-            case, dag = load_case(slug)
+            case, raw = load_case(slug)
             if not case["runnable"] or case["expect_fail_at"] is not None:
                 continue
             with self.subTest(slug=slug):
+                dag = substitute(raw, free_port(), "")
                 ws = run_tutorial(case, dag)
                 self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+                self.addCleanup(stop_services, ws)
                 proc = subprocess.run(
                     [sys.executable, str(CLI), "status", "--json"], cwd=str(ws),
                     env=isolated_env(ws.parent / "home"), stdin=subprocess.DEVNULL,
@@ -259,13 +261,15 @@ class CorpusRunTest(unittest.TestCase):
 
     def test_stale_fixture_fails_at_declared_node(self):
         for slug in CORPUS_SLUGS:
-            case, dag = load_case(slug)
+            case, raw = load_case(slug)
             fail_at = case["expect_fail_at"]
             if not case["runnable"] or fail_at is None:
                 continue
             with self.subTest(slug=slug):
+                dag = substitute(raw, free_port(), "")
                 ws = run_tutorial(case, dag, stop_before=fail_at)
                 self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+                self.addCleanup(stop_services, ws)
                 proc = subprocess.run(
                     [sys.executable, str(CLI), "verify", fail_at], cwd=str(ws),
                     env=isolated_env(ws.parent / "home"), stdin=subprocess.DEVNULL,
@@ -358,7 +362,7 @@ class FeatureTest(unittest.TestCase):
 
     def test_services(self):
         """Background services, http and port_listening checks, teardown."""
-        case, raw = load_case_from("web-service", "future-g3.json")
+        case, raw = load_case("web-service")
 
         # Serve, check over HTTP, then teardown leaves nothing listening.
         port = free_port()

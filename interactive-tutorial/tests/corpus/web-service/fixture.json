@@ -1,6 +1,6 @@
 {
   "domain": "web",
-  "runnable": false,
-  "reason": "needs background service: G3",
+  "runnable": true,
+  "reason": null,
   "expect_fail_at": null
 }
