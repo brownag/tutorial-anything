@@ -793,5 +793,79 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn("4-store", output)
 
 
+def load_cli_module():
+    """Import scripts/dag_manager.py so pure helpers can be tested directly."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dag_manager", CLI)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RiskTierTest(unittest.TestCase):
+    """Computed and declared risk tiers (C-G6)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def tier(self, **node):
+        node.setdefault("id", "n")
+        return self.dm.risk_tier(node)
+
+    def test_each_high_pattern_matches_and_near_misses_stay_low(self):
+        cases = {
+            "sudo": ("sudo usermod -aG docker x", "pseudo-tool --x", "sudo"),
+            "pipe-to-shell": (
+                "curl -fsSL https://example.invalid/i.sh | bash",
+                "curl -fsSL https://example.invalid/i.sh -o i.sh",
+                "pipe-to-shell",
+            ),
+            "recursive-delete": ("rm -rf /", "rm -rf build/", "recursive-delete"),
+            "chmod-777": ("chmod -R 777 /srv", "chmod 755 bin/tool", "chmod-777"),
+            "system-path-write": (
+                "echo x > /etc/app.conf",
+                "echo x > ./etc/app.conf",
+                "system-path-write",
+            ),
+            "mkfs": ("mkfs.ext4 /dev/sdb1", "make fs-check", "mkfs"),
+            "dd": ("dd if=/dev/zero of=disk.img bs=1M count=1", "dd-notes.txt", "dd"),
+        }
+        for label, (hit, miss, expected) in cases.items():
+            tier, labels = self.tier(commands=[hit])
+            self.assertEqual(("high", [expected]), (tier, labels), label)
+            tier, labels = self.tier(commands=[miss])
+            self.assertEqual(("low", []), (tier, labels), label)
+
+    def test_high_pattern_is_read_from_undo_and_command_checks(self):
+        self.assertEqual("high", self.tier(undo=["sudo rm x"])[0])
+        verification = {"type": "command", "command": "sudo true"}
+        self.assertEqual("high", self.tier(verification=verification)[0])
+        other = {"type": "confirm", "prompt": "sudo said yes?"}
+        self.assertEqual("low", self.tier(verification=other)[0])
+
+    def test_scope_raises_to_elevated_and_declared_risk_never_lowers(self):
+        self.assertEqual("low", self.tier(commands=["ls"])[0])
+        self.assertEqual("elevated", self.tier(side_effects=["user"])[0])
+        self.assertEqual("elevated", self.tier(side_effects=["repo", "remote"])[0])
+        self.assertEqual("high", self.tier(commands=["sudo ls"], risk="low")[0])
+        self.assertEqual("high", self.tier(commands=["ls"], risk="high")[0])
+        self.assertEqual("elevated", self.tier(side_effects=["user"], risk="low")[0])
+
+    def test_validate_rejects_bad_risk_and_approved_shapes(self):
+        validate = self.dm.validate_node
+        for node in (
+            {"id": "a", "risk": "critical"},
+            {"id": "a", "approved": {"tier": "high"}},
+            {"id": "a", "approved": {"tier": "urgent", "at": "2026-11-26T00:00:00Z"}},
+        ):
+            problems = [p for p in validate(dict(node, title="t", summary="s",
+                        dependencies=[], action_type="instruct", status="pending",
+                        commit_sha=None, artifacts=[], commands=[],
+                        verification={"type": "confirm", "prompt": "ok"}), 0, {})]
+            self.assertTrue(any("'risk'" in p or "'approved'" in p for p in problems), node)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,17 @@ STATUSES = ("pending", "completed", "skipped")
 VERIFICATION_TYPES = ("command", "file_exists", "file_contains", "confirm")
 SIDE_EFFECT_SCOPES = ("repo", "user", "system", "remote")
 RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
+RISK_TIERS = ("low", "elevated", "high")
+RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
+HIGH_RISK_PATTERNS = (
+    (re.compile(r"\bsudo\b"), "sudo"),
+    (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "pipe-to-shell"),
+    (re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(/|~|\$HOME)"), "recursive-delete"),
+    (re.compile(r"\bchmod\s+(-R\s+)?777\b"), "chmod-777"),
+    (re.compile(r"(>|\btee\b\s+(-a\s+)?)\s*/(etc|usr|opt|boot|var)/"), "system-path-write"),
+    (re.compile(r"\bmkfs\b"), "mkfs"),
+    (re.compile(r"\bdd\s+if="), "dd"),
+)
 GIT_ROLLBACK_MODES = ("none", "branch", "hard")
 DERIVED_ORDER = ("ACTIVE", "READY", "PENDING", "COMPLETED", "SKIPPED")
 
@@ -526,7 +537,68 @@ def validate_node(node, position: int, seen: dict) -> list:
             problems.append(
                 "{} field 'undo' must be an array of non-empty command strings".format(label)
             )
+    if "risk" in node and node.get("risk") not in RISK_TIERS:
+        problems.append(
+            "{} field 'risk' must be one of {}, got {!r}".format(
+                label, list(RISK_TIERS), node.get("risk")
+            )
+        )
+    if "approved" in node:
+        value = node.get("approved")
+        if (
+            not isinstance(value, dict)
+            or value.get("tier") not in RISK_TIERS
+            or not isinstance(value.get("at"), str)
+        ):
+            problems.append(
+                "{} field 'approved' must be an object with 'tier' and 'at' (C-G6)".format(label)
+            )
     return problems
+
+
+def inspected_commands(node: dict) -> list:
+    """Commands the risk classifier reads: commands, undo, and a command check (C-G6)."""
+    commands = list(node.get("commands") or []) + list(node.get("undo") or [])
+    verification = node.get("verification") or {}
+    if verification.get("type") == "command" and isinstance(verification.get("command"), str):
+        commands.append(verification["command"])
+    return commands
+
+
+def risk_tier(node: dict) -> tuple:
+    """Effective (tier, labels) for a node: max(computed, declared) (C-G6)."""
+    labels = []
+    for command in inspected_commands(node):
+        for pattern, label in HIGH_RISK_PATTERNS:
+            if pattern.search(command) and label not in labels:
+                labels.append(label)
+    if labels:
+        computed = "high"
+    elif set(node_scopes(node)) - {"repo"}:
+        computed = "elevated"
+    else:
+        computed = "low"
+    declared = node.get("risk") if node.get("risk") in RISK_TIERS else "low"
+    tier = max(computed, declared, key=RISK_TIERS.index)
+    return tier, labels
+
+
+def approval_covers(node: dict, tier: str) -> bool:
+    """An approval covers a node while its effective tier is at or below the recorded one."""
+    approved = node.get("approved")
+    if not isinstance(approved, dict) or approved.get("tier") not in RISK_TIERS:
+        return False
+    return RISK_TIERS.index(tier) <= RISK_TIERS.index(approved["tier"])
+
+
+def risk_blocked(state: dict, node: dict) -> bool:
+    """True when hands-off mode forbids acting on a high-risk, unapproved node."""
+    tier, _ = risk_tier(node)
+    return (
+        state.get("mode") == "hands-off"
+        and tier == "high"
+        and not approval_covers(node, tier)
+    )
 
 
 def validate_residue(residue) -> list:
@@ -925,11 +997,13 @@ def render_graph(state: dict) -> list:
         node = index[nid]
         state_label = derived_state(state, nid, index, parents)
         deps = ", ".join(parents[nid]) if parents[nid] else "-"
+        tier, _ = risk_tier(node)
         rows.append(
             (
                 "> " if state.get("active_node_id") == nid else "  ",
                 nid,
                 state_label,
+                RISK_SHORT[tier],
                 node.get("action_type", "?"),
                 deps,
                 short(node.get("commit_sha")),
@@ -939,22 +1013,23 @@ def render_graph(state: dict) -> list:
     if not rows:
         return ["  (no nodes yet - decompose the tutorial, then re-run validate)"]
 
-    headers = ("  ", "ID", "STATE", "ACTION", "DEPS", "COMMIT", "TITLE")
+    headers = ("  ", "ID", "STATE", "RISK", "ACTION", "DEPS", "COMMIT", "TITLE")
+    last = len(headers) - 1
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            if i == 6:
+            if i == last:
                 continue
             widths[i] = max(widths[i], len(str(cell)))
     lines = []
     template = "  ".join("{{:{}}}".format(w) if i else "{{:{}s}}".format(w) for i, w in enumerate(widths))
     lines.append(template.format(*headers).rstrip())
-    lines.append(template.format(*["  ", "-" * widths[1], "-" * widths[2], "-" * widths[3], "-" * widths[4], "-" * widths[5], "-"]).rstrip())
+    lines.append(template.format(*["  "] + ["-" * w for w in widths[1:last]] + ["-"]).rstrip())
     for row in rows:
-        title = row[6]
+        title = row[last]
         if len(title) > 52:
             title = title[:49] + "..."
-        lines.append((template.format(*(list(row[:6]) + [title]))).rstrip())
+        lines.append((template.format(*(list(row[:last]) + [title]))).rstrip())
     return lines
 
 
