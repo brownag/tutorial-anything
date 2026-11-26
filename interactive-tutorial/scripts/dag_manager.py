@@ -18,6 +18,7 @@ Conventions:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import platform
@@ -1606,12 +1607,73 @@ def summary(state: dict, nid: str) -> str:
 # subcommands
 
 
+def strip_progress(doc: dict) -> dict:
+    """Return a copy of a DAG document with run progress removed.
+
+    Drops the runtime blocks (``services``, ``residue``, ``preflight``,
+    ``active_node_id``) and the ``git`` block, and resets every node to
+    ``pending`` with a null ``commit_sha``, removing ``approved`` and
+    ``deviations``. The input is never modified.
+    """
+    stripped = copy.deepcopy(doc)
+    for key in ("services", "residue", "preflight", "active_node_id", "git"):
+        stripped.pop(key, None)
+    for node in stripped.get("nodes", []) or []:
+        if isinstance(node, dict):
+            node["status"] = "pending"
+            node["commit_sha"] = None
+            node.pop("approved", None)
+            node.pop("deviations", None)
+    return stripped
+
+
+def load_init_source(path: Path) -> dict:
+    """Read the prebuilt DAG named by ``init --from``; problems exit 1."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CliError("cannot read --from file {}: {}".format(path, exc))
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError(
+            "--from file {} is not valid JSON (line {} column {}): {}".format(
+                path, exc.lineno, exc.colno, exc.msg
+            )
+        )
+    if not isinstance(doc, dict):
+        raise CliError("--from file {} must contain a JSON object".format(path))
+    return doc
+
+
 def cmd_init(args, state_path: Path, workspace: Path) -> int:
     """Create a fresh state document and hide it from Git."""
     if state_path.exists() and not args.force:
         raise CliError(
             "{} already exists. Resume it, or pass --force to start over "
             "(--force discards recorded progress).".format(state_path)
+        )
+    source_doc = None
+    if args.from_path:
+        source_path = Path(args.from_path)
+        if not source_path.is_absolute():
+            source_path = workspace / source_path
+        source_doc = load_init_source(source_path)
+    elif not args.title or not args.source:
+        missing = [flag for flag, value in (("--title", args.title), ("--source", args.source))
+                   if not value]
+        raise CliError(
+            "{} required unless --from is given".format(" and ".join(missing)), EXIT_USAGE
+        )
+
+    title = args.title or (source_doc or {}).get("title")
+    source = args.source or (source_doc or {}).get("source_doc")
+    if source_doc is not None and not (title and source):
+        raise CliError(
+            "--from file has no {}; pass {} to supply it".format(
+                "title" if not title else "source_doc",
+                "--title" if not title else "--source",
+            )
         )
     require_git(workspace)
 
@@ -1638,11 +1700,17 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "`jump --git-rollback` will refuse to run until a first commit exists"
         )
 
+    if source_doc is None:
+        seed = {"nodes": []}
+        mode = args.mode or "assisted"
+    else:
+        seed = strip_progress(source_doc)
+        mode = args.mode or source_doc.get("mode")
     state = {
         "schema_version": SCHEMA_VERSION,
-        "title": args.title,
-        "source_doc": args.source,
-        "mode": args.mode,
+        "title": title,
+        "source_doc": source,
+        "mode": mode,
         "persistence": args.persistence,
         "active_node_id": None,
         "created_at": now_iso(),
@@ -1653,14 +1721,26 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "initial_dirty": is_dirty(workspace),
             "exclude_configured": True,
         },
-        "nodes": [],
+        "nodes": seed["nodes"] if source_doc is not None else [],
     }
+    if source_doc is not None and "requires" in seed:
+        state["requires"] = seed["requires"]
+    if source_doc is not None:
+        problems, _ = validate_document(state)
+        if problems:
+            for problem in problems:
+                err(problem)
+            raise CliError(
+                "{} problem(s) in --from file {}; nothing written".format(
+                    len(problems), args.from_path
+                )
+            )
     save_state(state_path, state)
 
     say("initialised {}".format(state_path))
-    say("  title       {}".format(args.title))
-    say("  source      {}".format(args.source))
-    say("  mode        {}".format(args.mode))
+    say("  title       {}".format(title))
+    say("  source      {}".format(source))
+    say("  mode        {}".format(mode))
     say("  persistence {}".format(args.persistence))
     say("  branch      {}".format(state["git"]["branch"]))
     say("  HEAD        {}".format(short(sha, 12) if sha else "<no commits>"))
@@ -1675,7 +1755,7 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "checkpoint contains only tutorial changes"
         )
     say("")
-    say("next: decompose {} into nodes, write them into the 'nodes' array,".format(args.source))
+    say("next: decompose {} into nodes, write them into the 'nodes' array,".format(source))
     say("      then run `validate` and `next`.")
     return EXIT_OK
 
@@ -2848,9 +2928,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.required = True
 
     init = sub.add_parser("init", help="create a state document and hide it from git")
-    init.add_argument("--title", required=True)
-    init.add_argument("--source", required=True, help="tutorial file or URL being run")
-    init.add_argument("--mode", choices=MODES, default="assisted")
+    init.add_argument("--title", default=None,
+                      help="tutorial title (default: the --from file's title)")
+    init.add_argument("--source", default=None,
+                      help="tutorial file or URL being run (default: the --from file's source_doc)")
+    init.add_argument("--from", dest="from_path", metavar="DAG_JSON", default=None,
+                      help="start from a prebuilt DAG; progress is stripped")
+    init.add_argument("--mode", choices=MODES, default=None,
+                      help="default assisted, or the --from file's mode")
     init.add_argument("--persistence", choices=PERSISTENCE_MODES, default="file")
     init.add_argument(
         "--git-branch",

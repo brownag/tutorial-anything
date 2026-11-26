@@ -10,6 +10,7 @@ hooks, or ``~/.gitconfig``. Standard library only; run with::
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import shutil
@@ -1788,6 +1789,190 @@ def dm_id_re():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.ID_RE.pattern
+
+
+class InitFromTest(unittest.TestCase):
+    """`init --from <dag.json>` starts a session from a prebuilt DAG (C-G12)."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="init-from-test-"))
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.ws), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull,
+                         "GIT_AUTHOR_NAME": "Tutorial Test",
+                         "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                         "GIT_COMMITTER_NAME": "Tutorial Test",
+                         "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(self.ws), env=self.env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.state_path = self.ws / STATE_NAME
+        self.src_dir = Path(tempfile.mkdtemp(prefix="init-from-src-"))
+        self.addCleanup(shutil.rmtree, self.src_dir, ignore_errors=True)
+        self.source = self.src_dir / "prebuilt.json"
+
+    def cli(self, *args):
+        """Run the CLI in the workspace; returns (exit code, stdout+stderr)."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args), cwd=str(self.ws), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout
+
+    def example(self):
+        return json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+
+    def write_source(self, doc):
+        self.source.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        return str(self.source)
+
+    def dirty_source(self):
+        """The example DAG with progress, runtime fields and a foreign git block."""
+        doc = self.example()
+        for i, node in enumerate(doc["nodes"]):
+            node["status"] = "completed" if i == 0 else "deviated"
+            node["commit_sha"] = "a" * 40
+            node["approved"] = True
+            node["deviations"] = [{"reason": "old"}]
+        doc["services"] = {}
+        doc["residue"] = []
+        doc["preflight"] = {"ok": True}
+        doc["active_node_id"] = doc["nodes"][0]["id"]
+        doc["git"] = {"branch": "old-branch", "initial_commit_sha": "deadbeef" * 5,
+                      "initial_dirty": True, "exclude_configured": False}
+        return doc
+
+    def state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_from_without_title_takes_title_and_source_from_file(self):
+        path = self.write_source(self.example())
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        self.assertEqual(state["title"], "Build a tiny todo CLI")
+        self.assertEqual(state["source_doc"], "examples/sample-tutorial.md")
+        self.assertEqual(state["mode"], "assisted")
+        self.assertTrue(state["nodes"])
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
+
+    def test_from_strips_progress_runtime_fields_and_git_block(self):
+        source = self.dirty_source()
+        ids = [n["id"] for n in source["nodes"]]
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        for key in ("services", "residue", "preflight"):
+            self.assertNotIn(key, state)
+        self.assertIsNone(state["active_node_id"])
+        self.assertEqual([n["id"] for n in state["nodes"]], ids)
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
+        self.assertEqual(state["nodes"][0]["summary"], source["nodes"][0]["summary"])
+        self.assertEqual(state["nodes"][0]["commands"], source["nodes"][0]["commands"])
+        self.assertNotEqual(state["git"]["branch"], "old-branch")
+        self.assertNotEqual(state["git"]["initial_commit_sha"], "deadbeef" * 5)
+        self.assertFalse(state["git"]["initial_dirty"])
+
+    def test_from_keeps_source_ref_and_uses_current_schema_version(self):
+        source = self.example()
+        source["schema_version"] = "1.0"
+        source["persistence"] = "in-context"
+        source["nodes"][0]["source_ref"] = {"line": 3, "heading": "Install"}
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        text = CLI.read_text(encoding="utf-8")
+        current = text.split('SCHEMA_VERSION = "', 1)[1].split('"', 1)[0]
+        self.assertEqual(state["schema_version"], current)
+        self.assertEqual(state["persistence"], "file")
+        self.assertEqual(state["nodes"][0]["source_ref"], {"line": 3, "heading": "Install"})
+
+    def test_mode_flag_overrides_file_mode(self):
+        source = self.example()
+        source["mode"] = "hands-off"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.state()["mode"], "hands-off")
+        self.state_path.unlink()
+        code, out = self.cli("init", "--from", path, "--mode", "guided")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.state()["mode"], "guided")
+
+    def test_invalid_source_exits_1_and_writes_nothing(self):
+        source = self.dirty_source()
+        source["mode"] = "bogus"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_missing_title_in_file_exits_1_with_hint(self):
+        source = self.example()
+        del source["title"]
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("--title", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_no_from_and_no_title_is_usage_error(self):
+        code, out = self.cli("init", "--source", "tutorial.md")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--title", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_no_from_and_no_source_is_usage_error(self):
+        code, out = self.cli("init", "--title", "Hello")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--source", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_missing_from_file_exits_1(self):
+        code, out = self.cli("init", "--from", str(self.src_dir / "nope.json"))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_invalid_json_from_exits_1(self):
+        self.source.write_text("{not json", encoding="utf-8")
+        code, out = self.cli("init", "--from", str(self.source))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_from_with_existing_state_needs_force(self):
+        path = self.write_source(self.example())
+        self.assertEqual(self.cli("init", "--from", path)[0], 0)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.cli("init", "--from", path, "--force")[0], 0)
+
+    def test_strip_progress_returns_copy_and_leaves_input_alone(self):
+        spec = importlib.util.spec_from_file_location("dag_manager_under_test", str(CLI))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = self.dirty_source()
+        before = copy.deepcopy(source)
+        stripped = module.strip_progress(source)
+        self.assertEqual(source, before)
+        self.assertIsNot(stripped, source)
+        self.assertNotIn("git", stripped)
+        self.assertNotIn("services", stripped)
+        self.assertNotIn("active_node_id", stripped)
+        for node in stripped["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
 
 
 if __name__ == "__main__":
