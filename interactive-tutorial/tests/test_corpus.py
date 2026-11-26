@@ -383,7 +383,6 @@ class GapTest(unittest.TestCase):
         state = json.loads(run_cli(ws, "status", "--json").stdout)
         self.assertFalse(state.get("services"))
 
-    @unittest.expectedFailure
     def test_g11_interactive(self):
         """Gap G11: stdin and timeout on command checks, interactive warnings."""
         case, dag = load_case_from("python-package", "future-g11.json")

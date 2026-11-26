@@ -939,6 +939,37 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn("was not running", output)
         self.assertFalse(self.state().get("services"))
 
+    def test_interactive_hints_print_on_next(self):
+        node_id = self._root_with(
+            "assisted",
+            commands=["sh ask.sh"],
+            interactive={"answers": ["y", "my name"]},
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("next", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("feed answers: printf '%s\\n' y 'my name' | sh ask.sh", output)
+
+    def test_human_interactive_hint_prints_on_next(self):
+        node_id = self._root_with(
+            "assisted",
+            interactive={"human": True},
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("next", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("a person must run this step (interactive)", output)
+
+    def test_validate_warns_on_interactive_command_without_block(self):
+        node_id = self._root_with(
+            "assisted",
+            commands=["npm init"],
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("validate")
+        self.assertEqual(code, 0, output)
+        self.assertIn("node '{}' command looks interactive: npm init".format(node_id), output)
+
     def test_service_block_validation(self):
         node_id = self._service_root(
             "true", {"type": "port_listening", "port": self._free_port()}
@@ -1037,6 +1068,67 @@ class RiskTierTest(unittest.TestCase):
                         commit_sha=None, artifacts=[], commands=[],
                         verification={"type": "confirm", "prompt": "ok"}), 0, {})]
             self.assertTrue(any("'risk'" in p or "'approved'" in p for p in problems), node)
+
+
+class InteractiveStepsTest(unittest.TestCase):
+    """Interactive detection and command-check stdin/timeout (C-G11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def matches(self, command):
+        return any(pattern.search(command) for pattern in self.dm.INTERACTIVE_PATTERNS)
+
+    def test_each_interactive_pattern_has_a_positive_and_a_negative(self):
+        positives = [
+            "npm init",
+            "yarn init",
+            "npx create-react-app app",
+            "vim notes.md",
+            "python3",
+            "node",
+            "git rebase -i HEAD~2",
+            "git add -i",
+            "ssh-keygen -t ed25519",
+            "passwd",
+            "read name",
+        ]
+        negatives = [
+            "npm init -y",
+            "npx create-react-app app --yes",
+            "view notes.md",
+            "python3 -m http.server 8000",
+            "git rebase main",
+            "ssh-keygen -t ed25519 -N '' -f key",
+            "echo thread",
+            "cat notes.md",
+        ]
+        for command in positives:
+            self.assertTrue(self.matches(command), command)
+        for command in negatives:
+            self.assertFalse(self.matches(command), command)
+
+    def test_command_check_gets_declared_stdin_and_defaults_to_eof(self):
+        fed = {
+            "type": "command",
+            "command": "python3 -c \"import sys; assert sys.stdin.read().strip() == 'yes'\"",
+            "stdin": "yes\n",
+        }
+        passed, lines = self.dm.run_verification({"id": "n", "verification": fed}, Path("."), False)
+        self.assertTrue(passed, lines)
+        eof = {
+            "type": "command",
+            "command": "python3 -c \"import sys; sys.exit(0 if sys.stdin.read() == '' else 1)\"",
+        }
+        passed, lines = self.dm.run_verification({"id": "n", "verification": eof}, Path("."), False)
+        self.assertTrue(passed, lines)
+
+    def test_command_check_honours_its_own_timeout(self):
+        slow = {"type": "command", "command": "sleep 3", "timeout": 1}
+        passed, lines = self.dm.run_verification({"id": "n", "verification": slow}, Path("."), False)
+        self.assertFalse(passed)
+        self.assertIn("timed out after 1s", "\n".join(lines))
 
 
 class VerificationTypesTest(unittest.TestCase):

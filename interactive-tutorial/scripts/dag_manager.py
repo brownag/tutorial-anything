@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -59,6 +60,17 @@ SERVICE_STOP_GRACE = 5
 SERVICE_POLL = 0.5
 SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
 SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
+INTERACTIVE_FIELDS = ("answers", "human")
+INTERACTIVE_PATTERNS = (
+    re.compile(r"^\s*(npm|yarn|pnpm) init\b(?!.*(-y|--yes))"),
+    re.compile(r"\bnpx create-\S+(?!.*(--yes|-y))"),
+    re.compile(r"^\s*(vi|vim|nano|emacs)\b"),
+    re.compile(r"^\s*(python3?|node|irb|psql|sqlite3|mysql)\s*$"),
+    re.compile(r"\bgit (rebase|add) -i\b"),
+    re.compile(r"\bssh-keygen\b(?!.*-N)"),
+    re.compile(r"^\s*passwd\b"),
+    re.compile(r"\bread\s+(-r\s+)?\w+"),
+)
 HIGH_RISK_PATTERNS = (
     (re.compile(r"\bsudo\b"), "sudo"),
     (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "pipe-to-shell"),
@@ -112,7 +124,7 @@ VERIFICATION_REQUIRED = {
     "port_listening": ("port",),
 }
 VERIFICATION_ALLOWED = {
-    "command": ("type", "command", "pattern", "expect_exit"),
+    "command": ("type", "command", "pattern", "expect_exit", "stdin", "timeout"),
     "file_exists": ("type", "path"),
     "file_contains": ("type", "path", "pattern", "regex"),
     "confirm": ("type", "prompt"),
@@ -434,6 +446,19 @@ def collect_warnings(state: dict) -> list:
             warnings.append(
                 "node '{}' is a mutate node but lists no artifacts".format(nid)
             )
+        block = node.get("interactive")
+        if isinstance(block, dict) and block.get("human"):
+            if (node.get("verification") or {}).get("type") != "confirm":
+                warnings.append(
+                    "node '{}' is human: true but its verification is not confirm".format(nid)
+                )
+        if "interactive" not in node:
+            for command in node.get("commands") or []:
+                if any(pattern.search(command) for pattern in INTERACTIVE_PATTERNS):
+                    warnings.append(
+                        "node '{}' command looks interactive: {}".format(nid, command)
+                    )
+                    break
         scopes = [s for s in node.get("side_effects", []) if s != "repo"]
         if isinstance(node.get("side_effects"), list) and scopes and not node.get("undo"):
             warnings.append(
@@ -563,6 +588,8 @@ def validate_node(node, position: int, seen: dict) -> list:
             )
     if "service" in node:
         problems.extend(validate_service(node["service"], label))
+    if "interactive" in node:
+        problems.extend(validate_interactive(node["interactive"], label))
     if "risk" in node and node.get("risk") not in RISK_TIERS:
         problems.append(
             "{} field 'risk' must be one of {}, got {!r}".format(
@@ -731,6 +758,42 @@ def is_port(value) -> bool:
     return is_positive_int(value) and value <= 65535
 
 
+def validate_interactive(block, label: str) -> list:
+    """Validate a node's ``interactive`` block (C-G11)."""
+    if not isinstance(block, dict):
+        return ["{} field 'interactive' must be an object".format(label)]
+    problems = []
+    for field in block:
+        if field not in INTERACTIVE_FIELDS:
+            problems.append("{} interactive does not accept {!r}".format(label, field))
+    if "answers" in block:
+        answers = block["answers"]
+        if not isinstance(answers, list) or any(not isinstance(a, str) for a in answers):
+            problems.append("{} interactive.answers must be an array of strings".format(label))
+    if "human" in block and not isinstance(block["human"], bool):
+        problems.append("{} interactive.human must be a boolean".format(label))
+    return problems
+
+
+def interactive_hints(node: dict) -> list:
+    """Lines telling the agent how to run an interactive node (C-G11)."""
+    block = node.get("interactive")
+    if not isinstance(block, dict):
+        return []
+    lines = []
+    answers = block.get("answers") or []
+    if answers:
+        command = (node.get("commands") or ["<command>"])[0]
+        lines.append(
+            "feed answers: printf '%s\\n' {} | {}".format(
+                " ".join(shlex.quote(answer) for answer in answers), command
+            )
+        )
+    if block.get("human"):
+        lines.append("a person must run this step (interactive)")
+    return lines
+
+
 def validate_verification(verification, label: str) -> list:
     """Validate the per-node verification gate against its variant contract."""
     if not isinstance(verification, dict):
@@ -791,6 +854,12 @@ def validate_verification(verification, label: str) -> list:
     if kind == "file_contains" and "regex" in verification:
         if not isinstance(verification.get("regex"), bool):
             problems.append("{} verification.regex must be a boolean".format(label))
+    if kind == "command" and "stdin" in verification:
+        if not isinstance(verification["stdin"], str):
+            problems.append("{} verification.stdin must be a string".format(label))
+    if kind == "command" and "timeout" in verification:
+        if not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
     if kind == "command" and "pattern" in verification:
         problems.extend(bad_regex(verification["pattern"], label, "verification.pattern"))
     if kind == "file_contains" and verification.get("regex") and "pattern" in verification:
@@ -1010,6 +1079,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     if kind == "command":
         command = verification["command"]
         expect = verification.get("expect_exit", 0)
+        timeout = verification.get("timeout", COMMAND_TIMEOUT)
+        # C-G11: a declared stdin is fed as input; otherwise stdin is /dev/null (EOF).
+        stdin_kwargs = (
+            {"input": verification["stdin"]} if "stdin" in verification
+            else {"stdin": subprocess.DEVNULL}
+        )
         try:
             proc = subprocess.run(
                 command,
@@ -1018,11 +1093,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
-                timeout=COMMAND_TIMEOUT,
+                timeout=timeout,
+                **stdin_kwargs
             )
         except subprocess.TimeoutExpired:
             return False, [
-                "command timed out after {}s: {}".format(COMMAND_TIMEOUT, command)
+                "command timed out after {}s: {}".format(timeout, command)
             ]
         except OSError as exc:
             return False, ["could not run command {!r}: {}".format(command, exc)]
@@ -1399,6 +1475,8 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
             say("  $ {}".format(command))
         for artifact in node.get("artifacts") or []:
             say("  * {}".format(artifact))
+        for hint in interactive_hints(node):
+            say("  {}".format(hint))
         verification = node.get("verification") or {}
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
         unmet = [
@@ -1491,6 +1569,8 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
         say("active -> {}".format(summary(state, args.node_id)))
+        for hint in interactive_hints(index[args.node_id]):
+            say("  {}".format(hint))
         say(header_line(state, workspace))
         return EXIT_OK
 
@@ -1518,6 +1598,8 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
     say("active -> {}".format(summary(state, ready[0])))
+    for hint in interactive_hints(index[ready[0]]):
+        say("  {}".format(hint))
     say(header_line(state, workspace))
     return EXIT_OK
 
