@@ -935,5 +935,106 @@ class RiskTierTest(unittest.TestCase):
             self.assertTrue(any("'risk'" in p or "'approved'" in p for p in problems), node)
 
 
+class VerificationTypesTest(unittest.TestCase):
+    """http and port_listening checks against loopback services (C-G3)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        cls.dm = load_cli_module()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                code = 200 if self.path == "/" else 404
+                body = b"hello from the test server"
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        thread.start()
+        cls.addClassCleanup(cls.server.server_close)
+        cls.addClassCleanup(cls.server.shutdown)
+
+    def run_check(self, verification):
+        node = {"id": "n", "verification": verification}
+        return self.dm.run_verification(node, Path("."), False)
+
+    def closed_port(self):
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_http_passes_on_expected_status_and_pattern(self):
+        base = "http://127.0.0.1:{}".format(self.port)
+        passed, _ = self.run_check({"type": "http", "url": base + "/"})
+        self.assertTrue(passed)
+        passed, _ = self.run_check({"type": "http", "url": base + "/missing", "expect_status": 404})
+        self.assertTrue(passed)
+        passed, _ = self.run_check({"type": "http", "url": base + "/", "pattern": "hello"})
+        self.assertTrue(passed)
+
+    def test_http_fails_on_status_mismatch_pattern_miss_and_closed_port(self):
+        base = "http://127.0.0.1:{}".format(self.port)
+        passed, lines = self.run_check({"type": "http", "url": base + "/missing"})
+        self.assertFalse(passed)
+        self.assertIn("expected 200", "\n".join(lines))
+        passed, lines = self.run_check({"type": "http", "url": base + "/", "pattern": "absent"})
+        self.assertFalse(passed)
+        self.assertIn("did not match", "\n".join(lines))
+        passed, _ = self.run_check(
+            {"type": "http", "url": "http://127.0.0.1:{}/".format(self.closed_port()), "timeout": 2}
+        )
+        self.assertFalse(passed)
+
+    def test_port_listening_passes_on_open_port_and_fails_on_closed_one(self):
+        import socket
+
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            passed, _ = self.run_check({"type": "port_listening", "port": listener.getsockname()[1]})
+            self.assertTrue(passed)
+        passed, lines = self.run_check({"type": "port_listening", "port": self.closed_port()})
+        self.assertFalse(passed)
+        self.assertIn("nothing accepts connections", "\n".join(lines))
+
+    def test_validate_accepts_the_new_shapes(self):
+        ok = [
+            {"type": "http", "url": "http://127.0.0.1:8000/"},
+            {"type": "http", "url": "https://example.invalid/", "expect_status": 301, "pattern": "x", "timeout": 3},
+            {"type": "port_listening", "port": 8000},
+            {"type": "port_listening", "port": 65535, "host": "127.0.0.1", "timeout": 1},
+        ]
+        for verification in ok:
+            self.assertEqual([], self.dm.validate_verification(verification, "node 'n'"), verification)
+
+    def test_validate_rejects_bad_scheme_port_status_and_fields(self):
+        bad = [
+            {"type": "http", "url": "ftp://example.invalid/"},
+            {"type": "http", "url": "http://127.0.0.1/", "expect_status": 42},
+            {"type": "http", "url": "http://127.0.0.1/", "pattern": "("},
+            {"type": "http", "url": "http://127.0.0.1/", "host": "x"},
+            {"type": "port_listening"},
+            {"type": "port_listening", "port": "8000"},
+            {"type": "port_listening", "port": 0},
+            {"type": "port_listening", "port": 65536},
+            {"type": "port_listening", "port": True},
+            {"type": "port_listening", "port": 80, "timeout": 0},
+        ]
+        for verification in bad:
+            self.assertTrue(self.dm.validate_verification(verification, "node 'n'"), verification)
+
+
 if __name__ == "__main__":
     unittest.main()

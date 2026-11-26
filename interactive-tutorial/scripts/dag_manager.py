@@ -22,9 +22,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +39,14 @@ PERSISTENCE_MODES = ("file", "in-context")
 ACTION_TYPES = ("read-only", "instruct", "mutate", "execute")
 CHECKPOINTED_ACTIONS = ("mutate", "execute")
 STATUSES = ("pending", "completed", "skipped")
-VERIFICATION_TYPES = ("command", "file_exists", "file_contains", "confirm")
+VERIFICATION_TYPES = (
+    "command",
+    "file_exists",
+    "file_contains",
+    "confirm",
+    "http",
+    "port_listening",
+)
 SIDE_EFFECT_SCOPES = ("repo", "user", "system", "remote")
 RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
 RISK_TIERS = ("low", "elevated", "high")
@@ -90,12 +100,16 @@ VERIFICATION_REQUIRED = {
     "file_exists": ("path",),
     "file_contains": ("path", "pattern"),
     "confirm": ("prompt",),
+    "http": ("url",),
+    "port_listening": ("port",),
 }
 VERIFICATION_ALLOWED = {
     "command": ("type", "command", "pattern", "expect_exit"),
     "file_exists": ("type", "path"),
     "file_contains": ("type", "path", "pattern", "regex"),
     "confirm": ("type", "prompt"),
+    "http": ("type", "url", "expect_status", "pattern", "timeout"),
+    "port_listening": ("type", "port", "host", "timeout"),
 }
 
 
@@ -642,6 +656,16 @@ def validate_residue(residue) -> list:
     return problems
 
 
+def is_positive_int(value) -> bool:
+    """True for ints >= 1 (bools excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def is_port(value) -> bool:
+    """True for TCP port numbers 1-65535 (C-G3)."""
+    return is_positive_int(value) and value <= 65535
+
+
 def validate_verification(verification, label: str) -> list:
     """Validate the per-node verification gate against its variant contract."""
     if not isinstance(verification, dict):
@@ -655,6 +679,8 @@ def validate_verification(verification, label: str) -> list:
         ]
     problems = []
     for field in VERIFICATION_REQUIRED[kind]:
+        if field == "port":
+            continue  # integer, checked with the other port_listening fields below
         value = verification.get(field)
         if not isinstance(value, str) or not value.strip():
             problems.append(
@@ -669,6 +695,28 @@ def validate_verification(verification, label: str) -> list:
                     label, kind, field
                 )
             )
+    if kind == "port_listening":
+        if not is_port(verification.get("port")):
+            problems.append("{} verification.port must be an integer 1-65535".format(label))
+        if "host" in verification and (
+            not isinstance(verification["host"], str) or not verification["host"].strip()
+        ):
+            problems.append("{} verification.host must be a non-empty string".format(label))
+        if "timeout" in verification and not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
+    if kind == "http":
+        url = verification.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            problems.append("{} verification.url must start with http:// or https://".format(label))
+        if "expect_status" in verification and not (
+            is_positive_int(verification["expect_status"])
+            and 100 <= verification["expect_status"] <= 599
+        ):
+            problems.append("{} verification.expect_status must be an HTTP status code".format(label))
+        if "timeout" in verification and not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
+        if "pattern" in verification:
+            problems.extend(bad_regex(verification["pattern"], label, "verification.pattern"))
     if kind == "command" and "expect_exit" in verification:
         expect = verification.get("expect_exit")
         if not isinstance(expect, int) or isinstance(expect, bool) or expect < 0:
@@ -843,6 +891,51 @@ def workspace_relative(workspace: Path, raw: str, label: str) -> Path:
     return resolved
 
 
+def check_http(verification: dict) -> tuple:
+    """GET the URL and compare the status (and optional body pattern) (C-G3).
+
+    Any HTTP status is compared to ``expect_status``; only transport failures fail
+    before a status arrives. Proxies are ignored so local checks stay local.
+    """
+    url = verification["url"]
+    expect = verification.get("expect_status", 200)
+    timeout = verification.get("timeout", 5)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(65536).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status, body = exc.code, ""
+    except (OSError, ValueError) as exc:
+        return False, ["FAIL: cannot reach {}: {}".format(url, exc)]
+    lines = ["GET {} -> {} (expected {})".format(url, status, expect)]
+    if status != expect:
+        return False, lines + ["FAIL: status {} != {}".format(status, expect)]
+    pattern = verification.get("pattern")
+    if pattern:
+        try:
+            matched = re.search(pattern, body)
+        except re.error as exc:
+            return False, lines + ["FAIL: verification.pattern is not a valid regex: {}".format(exc)]
+        if not matched:
+            return False, lines + ["FAIL: body did not match pattern {!r}".format(pattern)]
+        lines.append("matched pattern {!r}".format(pattern))
+    return True, lines + ["PASS"]
+
+
+def check_port(verification: dict) -> tuple:
+    """Succeed when a TCP connection to host:port is accepted (C-G3)."""
+    host = verification.get("host", "127.0.0.1")
+    port = verification["port"]
+    timeout = verification.get("timeout", 2)
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+    except OSError as exc:
+        return False, ["FAIL: nothing accepts connections on {}:{} ({})".format(host, port, exc)]
+    return True, ["PASS: {}:{} accepts connections".format(host, port)]
+
+
 def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     """Execute a node's gate. Returns ``(passed, lines)``."""
     verification = node.get("verification") or {}
@@ -934,6 +1027,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
             "CONFIRMATION NEEDED: {}".format(prompt),
             "  re-run with --yes once the human has confirmed.",
         ]
+
+    if kind == "http":
+        return check_http(verification)
+
+    if kind == "port_listening":
+        return check_port(verification)
 
     raise CliError(
         "{} has unsupported verification type {!r}".format(label, kind), EXIT_USAGE
