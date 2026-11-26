@@ -1193,6 +1193,22 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn("tutorial.corrected.md", output)
         self.assertIn("deviations.md", output)
 
+    def test_export_removes_stale_corrected_file_when_source_unreadable(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run ./greet --name Ada\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["./greet --name Ada"])
+        self.cli("deviate", nid, "--command", "0", "--to", "./greet --who Ada",
+                 "--reason", "v2 renamed --name", check=0)
+        self.cli("export", check=0)
+        out = self.workspace / ".tutorial-export"
+        self.assertTrue((out / "tutorial.corrected.md").exists())
+        source.unlink()
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("v2 renamed --name", report)
+
     def test_export_without_deviations_reports_none_and_no_corrected_file(self):
         source = self.workspace / "tutorial.md"
         source.write_text("Run echo a\n", encoding="utf-8")

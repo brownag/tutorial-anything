@@ -2964,6 +2964,9 @@ def cmd_export(args, state_path: Path, workspace: Path) -> int:
 
     written = []
     try:
+        stale_path = out / "tutorial.corrected.md"
+        if corrected is None and stale_path.exists():
+            stale_path.unlink()
         report_path = out / "deviations.md"
         report_path.write_text("\n".join(lines), encoding="utf-8")
         written.append(report_path)
