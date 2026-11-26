@@ -29,12 +29,13 @@ Run from the repo root. The root `Makefile` forwards every target to `interactiv
 │   ├── Makefile                      lint, test, validate-examples, install
 │   ├── scripts/dag_manager.py        single-file CLI (subcommands in build_parser())
 │   ├── references/                   DAG schema: prose (.md) + JSON Schema (.json)
+│   ├── templates/                    SKILL.md template for scaffolded skills
 │   ├── examples/                     sample tutorial and its expected DAG
 │   └── tests/test_dag_manager.py     unittest suite, runs in temp git repos
 └── .agents/skills/interactive-tutorial/   relative symlinks into interactive-tutorial/
 ```
 
-CLI subcommands: `init`, `validate`, `status`, `next`, `verify`, `complete`, `jump`. Each maps to a `cmd_<name>` function in `scripts/dag_manager.py`.
+CLI subcommands: `init`, `draft`, `validate`, `status`, `next`, `doctor`, `verify`, `complete`, `jump`, `service` (`start`, `stop`), `teardown`, `export`, `approve`, `deviate`, `residue` (`clear`), `scaffold`. Each maps to a `cmd_<name>` function in `scripts/dag_manager.py`.
 
 ## Workflows
 

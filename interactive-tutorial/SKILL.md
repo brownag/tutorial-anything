@@ -3,7 +3,7 @@ name: interactive-tutorial
 description: Turn a static coding tutorial, README, workshop doc, or technical walkthrough into an interactive graph you step through one step at a time, jump ahead into, and rewind out of. Use when the user asks to follow, work through, run, or execute a tutorial or walkthrough, wants to resume a half-finished tutorial, asks to convert documentation into a checkable step-by-step plan, or mentions a tutorial DAG, nodes, fast-forward, jump ahead, or rewind. Decomposes the document into verifiable nodes with real dependencies, tracks progress in .tutorial-dag.json, gates every step behind its own verification command, and checkpoints each file-changing step as a git commit so steps can be replayed or reverted. Supports guided, assisted, and hands-off autonomy plus file and in-context state persistence.
 license: MIT
 author: Andrew Gene Brown
-version: 1.1.0
+version: 1.2.0
 compatibility: python>=3.9, git>=2.25
 ---
 
@@ -63,7 +63,7 @@ Read the tutorial first. Then run `draft` after `init` to get a skeleton:
 python3 "$SKILL_DIR/scripts/dag_manager.py" draft <tutorial.md> --write
 ```
 
-`draft` makes one node per H2/H3 heading (or numbered item) in a linear chain. It only knows fenced shell commands, so prose-only steps come out `read-only` with no `commands`. Treat the draft as a skeleton to check against the tutorial. Refine the `nodes` array in `.tutorial-dag.json` (an editor or a short script) with real dependencies and branches, real checks in place of the `DRAFT:` placeholders, and `side_effects`, `service`, `interactive`, and `requires` where they apply. Then run `validate` until no `still has a draft check` warnings remain:
+`draft` makes one node per H2/H3 heading (or numbered item) in a linear chain. It only knows fenced shell commands, so prose-only steps come out `read-only` with no `commands`. Treat the draft as a skeleton to check against the tutorial. Refine the `nodes` array in `.tutorial-dag.json` (an editor or a short script) with real dependencies and branches, real checks in place of the `DRAFT:` placeholders, and `side_effects`, `service`, and `interactive` on nodes, and the root `requires`, where they apply. Then run `validate` until no `still has a draft check` warnings remain:
 
 ```bash
 python3 "$SKILL_DIR/scripts/dag_manager.py" validate
@@ -188,9 +188,18 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" --file /tmp/<slug>.dag.json status -
 
 Use `file` mode if the workspace supports local file storage.
 
-## Creating a custom tutorial skill
+## Scaffolding a tutorial skill
 
-Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2 with your tutorial's nodes, files, and checks. The CLI, schema, and tests remain unchanged.
+Turn a finished DAG into its own skill:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" scaffold <name> --from <dag.json> [--dest DIR] [--force]
+```
+
+- Writes `<dest>/<name>/` (default `.agents/skills`) with `SKILL.md` (rendered from `templates/SKILL.md.tmpl`), `dag.json` (progress stripped), `scripts/`, and `references/`.
+- The generated skill starts with `init --from "$SKILL_DIR/dag.json"`. Run `scaffold` from this source skill; it needs `templates/`.
+- An existing target exits 1 unless `--force` replaces it. Exit 2 on a bad name.
+- Starting a session from a prebuilt DAG without scaffolding: `init --from <dag.json>` (`--title` and `--source` default from the file; nodes, `requires`, and `mode` are copied; progress is stripped).
 
 ## Safety rules
 

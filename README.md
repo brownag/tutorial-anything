@@ -32,6 +32,7 @@ This repository is a container for the skill. Source files live in `interactive-
 │   ├── README.md                             CLI reference and troubleshooting
 │   ├── Makefile                              lint, test, validate-examples, install
 │   ├── references/dag-schema.md              schema and state transition rules
+│   ├── templates/                            SKILL.md template for scaffolded skills
 │   ├── references/dag-schema.json            JSON Schema (Draft 2020-12)
 │   ├── scripts/dag_manager.py                CLI tool (Python stdlib)
 │   ├── examples/sample-tutorial.md           sample tutorial with two branches

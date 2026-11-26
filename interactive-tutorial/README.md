@@ -47,7 +47,8 @@ Place global flags before the command. `--file` specifies the state file (defaul
 
 | Command | Action | Exit code |
 |---|---|---|
-| `init --title T --source S [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state file, add exclude entry, record branch, HEAD commit, and dirty status | 1 if file exists without `--force` |
+| `init [--title T --source S] [--from DAG.JSON] [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state file, add exclude entry, record branch, HEAD commit, and dirty status. `--from` copies nodes, `requires`, and `mode` from a DAG file and strips progress; `--title`/`--source` default from the file | 1 if file exists without `--force`, or if the `--from` source is missing or invalid |
+| `scaffold <name> --from DAG.JSON [--dest DIR] [--force]` | Write a new skill to `<dest>/<name>/` (default `.agents/skills`): `SKILL.md` from `templates/SKILL.md.tmpl`, `dag.json` with progress stripped, `scripts/`, `references/`. The generated skill starts with `init --from` | 0 on success; 1 if the target exists without `--force`, the DAG is invalid, or the template is missing; 2 on a bad name |
 | `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
 | `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
 | `next [<id>] [--skip-doctor]` | Activate the next ready node, or pick a specific ready node. When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, the current node is incomplete, or the preflight failed |
