@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "title": "Build the greetpkg package",
   "source_doc": "tests/corpus/python-package/tutorial.md",
   "mode": "assisted",

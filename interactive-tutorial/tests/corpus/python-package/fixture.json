@@ -2,6 +2,5 @@
   "domain": "python-package",
   "runnable": true,
   "reason": null,
-  "expect_fail_at": null,
-  "gaps": {"G11": "future-g11.json"}
+  "expect_fail_at": null
 }

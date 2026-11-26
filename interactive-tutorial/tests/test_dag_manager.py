@@ -10,6 +10,7 @@ hooks, or ``~/.gitconfig``. Standard library only; run with::
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import shutil
@@ -249,6 +250,11 @@ class DagManagerTest(unittest.TestCase):
 
     # -- init -------------------------------------------------------------
 
+    def test_init_records_branch_in_unborn_repo(self):
+        self.init_command("--git-branch", "tutorial/x", check=0)
+
+        self.assertEqual(self.state()["git"]["branch"], "tutorial/x")
+
     def test_init_writes_state_and_excludes_state_file_once(self):
         anchor = self.seed_repo()
         self.init_command("--git-branch", "tutorial/todo", check=0)
@@ -426,6 +432,25 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("but no undo", output)
 
+    def test_validate_artifacts_warning_respects_side_effects(self):
+        def mutate(side_effects):
+            def edit(s):
+                node = s["nodes"][0]
+                node["action_type"] = "mutate"
+                node["artifacts"] = []
+                node.pop("side_effects", None)
+                if side_effects is not None:
+                    node["side_effects"] = side_effects
+            return edit
+
+        code, output = self._validate_edited(mutate(["user"]))
+        self.assertEqual(code, 0)
+        self.assertNotIn("lists no artifacts", output)
+
+        code, output = self._validate_edited(mutate(None))
+        self.assertEqual(code, 0)
+        self.assertIn("is a mutate node but lists no artifacts", output)
+
     def test_schema_1_0_document_still_validates(self):
         for version in ("1.0", "1.1"):
             code, _ = self._validate_edited(
@@ -587,12 +612,15 @@ class DagManagerTest(unittest.TestCase):
         self.assertNotIn(STATE_NAME, listed)
         self.assertIn("src/todo/store.py", listed)
 
-    def test_complete_commit_refuses_a_clean_workspace(self):
-        self.run_to_store()
+    def test_complete_commit_on_clean_tree_completes_without_checkpoint(self):
+        shas = self.run_to_store()
         code, output = self.cli("complete", "5-render", "--commit", "--no-verify")
-        self.assertEqual(code, 1)
-        self.assertIn("nothing to commit", output)
-        self.assertEqual(self.node("5-render")["status"], "pending")
+        self.assertEqual(code, 0, output)
+        self.assertIn("nothing to commit; completed 5-render without a checkpoint", output)
+        node = self.node("5-render")
+        self.assertEqual(node["status"], "completed")
+        self.assertIsNone(node["commit_sha"])
+        self.assertEqual(self.head(), shas["store"])
 
     def test_jump_refuses_unmet_ancestors_without_the_flag(self):
         self.run_to_store()
@@ -995,6 +1023,256 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn("'risk'", output)
 
+    # -- deviate (C-G8) ---------------------------------------------------
+
+    def _node_with(self, **fields):
+        self.seed_repo()
+        state = self.seed_state()
+        node = state["nodes"][0]
+        node.update(fields)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return node["id"]
+
+    def test_deviate_check_replaces_verification_command_and_records(self):
+        nid = self._node_with(verification={"type": "command", "command": "./greet --name Ada"})
+        code, output = self.cli("deviate", nid, "--check", "--to", "./greet --who Ada",
+                                "--reason", "v2 renamed --name to --who")
+        self.assertEqual(code, 0, output)
+        self.assertIn("deviation recorded: {} check".format(nid), output)
+        node = self.node(nid)
+        self.assertEqual(node["verification"]["command"], "./greet --who Ada")
+        (record,) = node["deviations"]
+        self.assertEqual(record["target"], "check")
+        self.assertEqual(record["original"], "./greet --name Ada")
+        self.assertEqual(record["replacement"], "./greet --who Ada")
+        self.assertEqual(record["reason"], "v2 renamed --name to --who")
+        self.assertTrue(record["recorded_at"].endswith("Z"))
+
+    def test_deviate_command_n_replaces_that_command(self):
+        nid = self._node_with(commands=["echo a", "echo b"])
+        code, output = self.cli("deviate", nid, "--command", "1", "--to", "echo c",
+                                "--reason", "fix")
+        self.assertEqual(code, 0, output)
+        node = self.node(nid)
+        self.assertEqual(node["commands"], ["echo a", "echo c"])
+        self.assertEqual(node["deviations"][0]["target"], "command:1")
+
+    def test_deviate_out_of_range_command_exits_2(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "3", "--to", "echo c",
+                                "--reason", "fix")
+        self.assertEqual(code, 2, output)
+        self.assertNotIn("deviations", self.node(nid))
+
+    def test_deviate_same_text_exits_2(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "echo a",
+                                "--reason", "fix")
+        self.assertEqual(code, 2, output)
+
+    def test_deviate_check_on_non_command_check_exits_2(self):
+        nid = self._node_with(verification={"type": "confirm", "prompt": "ok?"})
+        code, output = self.cli("deviate", nid, "--check", "--to", "yes", "--reason", "fix")
+        self.assertEqual(code, 2, output)
+
+    def test_deviate_empty_or_blank_to_and_reason_exit_2(self):
+        nid = self._node_with(commands=["echo a"])
+        for args in (["--to", "  ", "--reason", "fix"], ["--to", "echo b", "--reason", "   "]):
+            code, output = self.cli("deviate", nid, "--command", "0", *args)
+            self.assertEqual(code, 2, output)
+        self.assertNotIn("deviations", self.node(nid))
+
+    def test_deviate_refuses_completed_node_with_reset_hint(self):
+        nid = self._node_with(commands=["echo a"], status="completed", commit_sha=None)
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "echo b",
+                                "--reason", "fix")
+        self.assertEqual(code, 1, output)
+        self.assertIn("--reset-descendants", output)
+        self.assertEqual(self.node(nid)["commands"], ["echo a"])
+
+    def test_deviate_sudo_makes_tier_high(self):
+        nid = self._node_with(commands=["echo a"])
+        code, output = self.cli("deviate", nid, "--command", "0", "--to", "sudo true",
+                                "--reason", "needs root")
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high", output)
+
+    def test_hands_off_complete_blocks_deviated_node_until_approved(self):
+        root = self._root_with("hands-off", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        code, output = self.cli("complete", root, "--no-verify")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIn("deviated", output)
+        self.assertNotEqual(self.node(root)["status"], "completed")
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_second_deviation_reblocks_after_approval(self):
+        root = self._root_with("hands-off", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("approve", root, check=0)
+        self.cli("deviate", root, "--command", "0", "--to", "echo c", "--reason", "r2", check=0)
+        code, output = self.cli("complete", root, "--no-verify")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+
+    def test_guided_never_blocks_deviated_completion(self):
+        root = self._root_with("guided", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_assisted_never_blocks_deviated_completion(self):
+        root = self._root_with("assisted", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_status_shows_deviation_count(self):
+        root = self._root_with("guided", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("next", root, check=0)
+        code, output = self.cli("status", check=0)
+        self.assertIn("  deviations: 1", output)
+        self.assertIn("deviations  {}: 1".format(root), output)
+
+    def test_approved_deviations_must_be_non_negative_int(self):
+        root = self._root_with("guided")
+        for value, ok in ((-1, False), ("1", False), (0, True), (2, True)):
+            with self.subTest(value=value):
+                state = self.state()
+                self.node(root, state)["approved"] = {
+                    "tier": "low", "at": "2026-11-26T00:00:00Z", "deviations": value,
+                }
+                self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                code, output = self.cli("validate")
+                if ok:
+                    self.assertEqual(code, 0, output)
+                else:
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("approved.deviations", output)
+
+    def test_validate_rejects_target_with_trailing_newline(self):
+        self._node_with(commands=["echo a"], deviations=[{
+            "target": "check\n", "original": "a", "replacement": "b",
+            "reason": "r", "recorded_at": "2026-11-26T00:00:00Z",
+        }])
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+
+    # -- export (C-G8, 6.1) ----------------------------------------------
+
+    def _export_node(self, source_doc, commands=None):
+        nid = self._node_with(commands=commands or ["echo a"])
+        state = self.state()
+        state["source_doc"] = source_doc
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return nid
+
+    def test_export_writes_corrected_tutorial_and_report(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run ./greet --name Ada\nDone\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["./greet --name Ada"])
+        self.cli("deviate", nid, "--command", "0", "--to", "./greet --who Ada",
+                 "--reason", "v2 renamed --name", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        corrected = (out / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("./greet --who Ada", corrected)
+        self.assertNotIn("./greet --name Ada", corrected)
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("v2 renamed --name", report)
+        self.assertIn(nid, report)
+        self.assertIn("tutorial.corrected.md", output)
+        self.assertIn("deviations.md", output)
+
+    def test_export_without_deviations_reports_none_and_no_corrected_file(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run echo a\n", encoding="utf-8")
+        self._export_node(str(source))
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        self.assertIn("No deviations recorded.",
+                      (out / "deviations.md").read_text(encoding="utf-8"))
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+
+    def test_export_with_url_source_writes_report_only(self):
+        nid = self._export_node("https://example.invalid/tutorial.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        self.assertTrue((out / "deviations.md").exists())
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+
+    def test_export_lists_unmatched_originals_under_not_applied(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Step two runs echo c\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["echo a", "echo c"])
+        self.cli("deviate", nid, "--command", "0", "--to", "echo x", "--reason", "r1", check=0)
+        self.cli("deviate", nid, "--command", "1", "--to", "echo d", "--reason", "r2", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        corrected = (out / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("echo d", corrected)
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("## Not applied", report)
+        self.assertIn("echo a", report.split("## Not applied", 1)[1])
+
+    def test_export_honours_out_dir_relative_and_absolute(self):
+        nid = self._export_node("https://example.invalid/t.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        self.cli("export", "--out", "rel/dir", check=0)
+        self.assertTrue((self.workspace / "rel" / "dir" / "deviations.md").exists())
+        absolute = self.workspace / "abs-out"
+        self.cli("export", "--out", str(absolute), check=0)
+        self.assertTrue((absolute / "deviations.md").exists())
+        self.assertFalse((self.workspace / ".tutorial-export").exists())
+
+    def test_export_default_dir_is_git_excluded(self):
+        nid = self._export_node("https://example.invalid/t.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        self.cli("export", check=0)
+        exclude = (self.workspace / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        self.assertIn(".tutorial-export/", exclude.splitlines())
+        self.assertNotIn(".tutorial-export", self.git("status", "--porcelain"))
+
+    def test_hands_off_high_risk_active_node_needs_approval_to_complete(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        state = self.state()
+        state["active_node_id"] = root
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        before_state = self.state_path.read_text(encoding="utf-8")
+        before_head = self.git("rev-parse", "HEAD")
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIn("is high risk", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before_head)
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_validate_rejects_bad_deviation_target(self):
+        self._node_with(commands=["echo a"], deviations=[{
+            "target": "check2", "original": "a", "replacement": "b",
+            "reason": "r", "recorded_at": "2026-11-26T00:00:00Z",
+        }])
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+        self.assertIn("deviations", output)
+
 
 def load_cli_module():
     """Import scripts/dag_manager.py so pure helpers can be tested directly."""
@@ -1276,6 +1554,583 @@ class VerificationTypesTest(unittest.TestCase):
         ]
         for verification in bad:
             self.assertTrue(self.dm.validate_verification(verification, "node 'n'"), verification)
+
+
+class DraftTest(unittest.TestCase):
+    """`draft <path>` turns a Markdown tutorial into skeleton nodes (C-G10)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="draft-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull})
+
+    def draft(self, text, name="tutorial.md"):
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "draft", str(path)],
+            cwd=str(self.tmp), env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_headings_become_linear_nodes_with_source_ref(self):
+        doc = self.draft("# Hello Tutorial\n\nIntro text.\n\n## Install tool\n\nGet it.\n\n"
+                         "### Check it\n\nRun the check.\n")
+        self.assertEqual(doc["title"], "Hello Tutorial")
+        nodes = doc["nodes"]
+        self.assertEqual([n["id"] for n in nodes], ["1-install-tool", "2-check-it"])
+        self.assertEqual(nodes[0]["dependencies"], [])
+        self.assertEqual(nodes[1]["dependencies"], ["1-install-tool"])
+        self.assertEqual(nodes[0]["source_ref"], {"line": 5, "heading": "Install tool"})
+        self.assertEqual(nodes[1]["source_ref"], {"line": 9, "heading": "Check it"})
+        self.assertEqual(nodes[0]["summary"], "Get it.")
+        self.assertEqual(nodes[0]["artifacts"], [])
+        self.assertEqual(nodes[0]["status"], "pending")
+        self.assertIsNone(nodes[0]["commit_sha"])
+        self.assertEqual(nodes[0]["verification"]["type"], "confirm")
+        self.assertTrue(nodes[0]["verification"]["prompt"].startswith("DRAFT: replace with a real check for "))
+
+    def test_title_falls_back_to_file_stem(self):
+        self.assertEqual(self.draft("## Only\n", name="my-guide.md")["title"], "my-guide")
+
+    def test_text_before_first_section_is_ignored(self):
+        doc = self.draft("preamble line\n\n## A step\n")
+        self.assertEqual([n["title"] for n in doc["nodes"]], ["A step"])
+
+    def test_numbered_list_fallback(self):
+        doc = self.draft("# Title\n\nIntro.\n\n1. First thing\n2. Second thing\n")
+        self.assertEqual([n["title"] for n in doc["nodes"]], ["First thing", "Second thing"])
+        self.assertEqual(doc["nodes"][1]["source_ref"], {"line": 6, "heading": "Second thing"})
+        self.assertEqual(doc["nodes"][1]["dependencies"], ["1-first-thing"])
+
+    def test_indented_sh_fence_under_numbered_item(self):
+        text = ("1. Make a file\n\n   ```sh\n   $ echo one\n   echo two\n   ```\n\n"
+                "2. Done\n")
+        nodes = self.draft(text)["nodes"]
+        self.assertEqual(nodes[0]["action_type"], "execute")
+        self.assertEqual(nodes[0]["commands"], ["echo one\necho two"])
+        self.assertEqual(nodes[0]["title"], "Make a file")
+
+    def test_shell_fence_is_execute_with_prompts_stripped(self):
+        doc = self.draft("## Run\n\n```bash\n$ make all\nmake test\n```\n\n```sh\nls\n```\n")
+        node = doc["nodes"][0]
+        self.assertEqual(node["action_type"], "execute")
+        self.assertEqual(node["commands"], ["make all\nmake test", "ls"])
+
+    def test_python_fence_is_mutate_without_commands(self):
+        node = self.draft("## Code\n\n```python\nprint(1)\n```\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "mutate")
+        self.assertEqual(node["commands"], [])
+
+    def test_empty_info_fence_without_prompts_is_mutate(self):
+        node = self.draft("## Blob\n\n```\nraw text\n```\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "mutate")
+        self.assertEqual(node["commands"], [])
+
+    def test_no_fences_is_read_only(self):
+        node = self.draft("## Read\n\nJust prose.\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "read-only")
+        self.assertEqual(node["commands"], [])
+
+    def test_headings_inside_fences_are_not_headings(self):
+        text = "## Real\n\n```md\n## Fake\n```\n\n~~~\n# Also fake\n~~~\n"
+        self.assertEqual([n["title"] for n in self.draft(text)["nodes"]], ["Real"])
+
+    def test_unclosed_fence_runs_to_eof(self):
+        text = "## Real\n\n```sh\necho hi\n## Hidden\nstill code\n"
+        nodes = self.draft(text)["nodes"]
+        self.assertEqual([n["title"] for n in nodes], ["Real"])
+        self.assertEqual(nodes[0]["commands"], ["echo hi\n## Hidden\nstill code"])
+
+    def test_symbol_only_heading_gets_step_slug(self):
+        self.assertEqual(self.draft("## !!! ???\n")["nodes"][0]["id"], "1-step")
+
+    def test_long_slug_is_truncated_without_trailing_dash(self):
+        heading = "## " + "abcdefghij " * 5  # slug would be 54 chars
+        node = self.draft(heading + "\n")["nodes"][0]
+        self.assertLessEqual(len(node["id"].split("-", 1)[1]), 40)
+        self.assertFalse(node["id"].endswith("-"))
+        self.assertRegex(node["id"], dm_id_re())
+
+    def test_duplicate_headings_get_distinct_ids(self):
+        ids = [n["id"] for n in self.draft("## Same\n\n## Same\n")["nodes"]]
+        self.assertEqual(ids, ["1-same", "2-same"])
+
+    def test_every_id_matches_id_re(self):
+        text = "## Ünïcode & Symbols!\n\n## Step: two (2)\n\n## 3. Three\n"
+        for node in self.draft(text)["nodes"]:
+            self.assertRegex(node["id"], dm_id_re())
+
+    def test_missing_file_exits_1(self):
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "draft", str(self.tmp / "nope.md")],
+            cwd=str(self.tmp), env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nope.md", proc.stderr)
+
+    def test_summary_collapses_whitespace_and_truncates(self):
+        long_para = "word " * 80  # > 200 chars after collapsing
+        node = self.draft("## Long\n\n" + long_para + "\n")["nodes"][0]
+        self.assertLessEqual(len(node["summary"]), 200)
+        self.assertTrue(node["summary"].endswith("..."))
+        short = self.draft("## Short\n\none   two\nthree\n")["nodes"][0]
+        self.assertEqual(short["summary"], "one two three")
+
+    def test_summary_falls_back_to_title_without_paragraph(self):
+        self.assertEqual(self.draft("## Bare\n\n```sh\nls\n```\n")["nodes"][0]["summary"], "Bare")
+
+
+class DraftWriteTest(unittest.TestCase):
+    """`draft <path> --write` fills an empty state; validate checks source_ref (C-G10)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="draft-write-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull, "GIT_ADVICE_ENABLED": "false",
+                         "GIT_AUTHOR_NAME": "Tutorial Test",
+                         "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                         "GIT_COMMITTER_NAME": "Tutorial Test",
+                         "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        self.ws = self.tmp / "repo"
+        self.ws.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(self.ws), env=self.env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (self.ws / "tutorial.md").write_text("# Hello\n\n## Install tool\n\nGet it.\n\n"
+                                             "## Check it\n\nRun it.\n", encoding="utf-8")
+        self.state_path = self.ws / ".tutorial-dag.json"
+
+    def cli(self, *args):
+        """Run the CLI in the workspace; returns (exit code, stdout, stderr)."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args), cwd=str(self.ws), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def init(self):
+        code, out, err = self.cli("init", "--title", "Hello", "--source", "tutorial.md")
+        self.assertEqual(code, 0, out + err)
+
+    def state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def write_state(self, state):
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def test_write_fills_empty_nodes_and_prints_header_only(self):
+        self.init()
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(out.startswith("["), out)
+        self.assertNotIn('"nodes"', out)
+        self.assertEqual([n["id"] for n in self.state()["nodes"]],
+                         ["1-install-tool", "2-check-it"])
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+
+    def test_write_refuses_non_empty_nodes(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        before = self.state_path.read_text(encoding="utf-8")
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("nodes already present", out + err)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_write_without_state_file_is_missing_state_error(self):
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(".tutorial-dag.json", out + err)
+        self.assertFalse(self.state_path.exists())
+
+    def test_draft_check_warning_appears_in_validate(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("node '1-install-tool' still has a draft check", out + err)
+
+    def test_source_ref_shape_is_validated(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        good = {"line": 3, "heading": "Install tool"}
+        bad_refs = [
+            {"line": 0, "heading": "Install tool"},
+            {"line": "3", "heading": "Install tool"},
+            dict(good, extra=1),
+            {"line": 3},
+        ]
+        for ref in bad_refs:
+            with self.subTest(ref=ref):
+                state = self.state()
+                state["nodes"][0]["source_ref"] = ref
+                self.write_state(state)
+                code, out, err = self.cli("validate")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("source_ref", out + err)
+        state = self.state()
+        state["nodes"][0]["source_ref"] = good
+        self.write_state(state)
+        self.assertEqual(self.cli("validate")[0], 0)
+
+
+def dm_id_re():
+    """Return the ID pattern the CLI uses, read from the script."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dm_for_tests", str(CLI))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ID_RE.pattern
+
+
+class InitFromTest(unittest.TestCase):
+    """`init --from <dag.json>` starts a session from a prebuilt DAG (C-G12)."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="init-from-test-"))
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.ws), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull,
+                         "GIT_AUTHOR_NAME": "Tutorial Test",
+                         "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                         "GIT_COMMITTER_NAME": "Tutorial Test",
+                         "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(self.ws), env=self.env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.state_path = self.ws / STATE_NAME
+        self.src_dir = Path(tempfile.mkdtemp(prefix="init-from-src-"))
+        self.addCleanup(shutil.rmtree, self.src_dir, ignore_errors=True)
+        self.source = self.src_dir / "prebuilt.json"
+
+    def cli(self, *args):
+        """Run the CLI in the workspace; returns (exit code, stdout+stderr)."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args), cwd=str(self.ws), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout
+
+    def example(self):
+        return json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+
+    def write_source(self, doc):
+        self.source.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        return str(self.source)
+
+    def dirty_source(self):
+        """The example DAG with progress, runtime fields and a foreign git block."""
+        doc = self.example()
+        for i, node in enumerate(doc["nodes"]):
+            node["status"] = "completed" if i == 0 else "deviated"
+            node["commit_sha"] = "a" * 40
+            node["approved"] = True
+            node["deviations"] = [{"reason": "old"}]
+        doc["services"] = {}
+        doc["residue"] = []
+        doc["preflight"] = {"ok": True}
+        doc["active_node_id"] = doc["nodes"][0]["id"]
+        doc["git"] = {"branch": "old-branch", "initial_commit_sha": "deadbeef" * 5,
+                      "initial_dirty": True, "exclude_configured": False}
+        return doc
+
+    def state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_from_without_title_takes_title_and_source_from_file(self):
+        path = self.write_source(self.example())
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        self.assertEqual(state["title"], "Build a tiny todo CLI")
+        self.assertEqual(state["source_doc"], "examples/sample-tutorial.md")
+        self.assertEqual(state["mode"], "assisted")
+        self.assertTrue(state["nodes"])
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
+
+    def test_from_strips_progress_runtime_fields_and_git_block(self):
+        source = self.dirty_source()
+        ids = [n["id"] for n in source["nodes"]]
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        for key in ("services", "residue", "preflight"):
+            self.assertNotIn(key, state)
+        self.assertIsNone(state["active_node_id"])
+        self.assertEqual([n["id"] for n in state["nodes"]], ids)
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
+        self.assertEqual(state["nodes"][0]["summary"], source["nodes"][0]["summary"])
+        self.assertEqual(state["nodes"][0]["commands"], source["nodes"][0]["commands"])
+        self.assertNotEqual(state["git"]["branch"], "old-branch")
+        self.assertNotEqual(state["git"]["initial_commit_sha"], "deadbeef" * 5)
+        self.assertFalse(state["git"]["initial_dirty"])
+
+    def test_from_keeps_source_ref_and_uses_current_schema_version(self):
+        source = self.example()
+        source["schema_version"] = "1.0"
+        source["persistence"] = "in-context"
+        source["nodes"][0]["source_ref"] = {"line": 3, "heading": "Install"}
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        state = self.state()
+        text = CLI.read_text(encoding="utf-8")
+        current = text.split('SCHEMA_VERSION = "', 1)[1].split('"', 1)[0]
+        self.assertEqual(state["schema_version"], current)
+        self.assertEqual(state["persistence"], "file")
+        self.assertEqual(state["nodes"][0]["source_ref"], {"line": 3, "heading": "Install"})
+
+    def test_mode_flag_overrides_file_mode(self):
+        source = self.example()
+        source["mode"] = "hands-off"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.state()["mode"], "hands-off")
+        self.state_path.unlink()
+        code, out = self.cli("init", "--from", path, "--mode", "guided")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.state()["mode"], "guided")
+
+    def test_invalid_source_exits_1_and_writes_nothing(self):
+        source = self.dirty_source()
+        source["mode"] = "bogus"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_invalid_source_with_git_branch_touches_no_git_state(self):
+        source = self.dirty_source()
+        source["mode"] = "bogus"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path, "--git-branch", "tutorial/x")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/heads/tutorial/x"],
+            cwd=str(self.ws), env=self.env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertNotEqual(probe.returncode, 0, "branch tutorial/x was created")
+        exclude = (self.ws / ".git" / "info" / "exclude")
+        self.assertFalse(exclude.exists() and STATE_NAME in exclude.read_text(encoding="utf-8"))
+
+    def test_missing_title_in_file_exits_1_with_hint(self):
+        source = self.example()
+        del source["title"]
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("--title", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_no_from_and_no_title_is_usage_error(self):
+        code, out = self.cli("init", "--source", "tutorial.md")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--title", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_no_from_and_no_source_is_usage_error(self):
+        code, out = self.cli("init", "--title", "Hello")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--source", out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_missing_from_file_exits_1(self):
+        code, out = self.cli("init", "--from", str(self.src_dir / "nope.json"))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_invalid_json_from_exits_1(self):
+        self.source.write_text("{not json", encoding="utf-8")
+        code, out = self.cli("init", "--from", str(self.source))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+
+    def test_from_with_existing_state_needs_force(self):
+        path = self.write_source(self.example())
+        self.assertEqual(self.cli("init", "--from", path)[0], 0)
+        code, out = self.cli("init", "--from", path)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.cli("init", "--from", path, "--force")[0], 0)
+
+    def test_strip_progress_returns_copy_and_leaves_input_alone(self):
+        spec = importlib.util.spec_from_file_location("dag_manager_under_test", str(CLI))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = self.dirty_source()
+        before = copy.deepcopy(source)
+        stripped = module.strip_progress(source)
+        self.assertEqual(source, before)
+        self.assertIsNot(stripped, source)
+        self.assertNotIn("git", stripped)
+        self.assertNotIn("services", stripped)
+        self.assertNotIn("active_node_id", stripped)
+        for node in stripped["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+            self.assertNotIn("approved", node)
+            self.assertNotIn("deviations", node)
+
+
+class ScaffoldTest(unittest.TestCase):
+    """`scaffold <name> --from <dag.json>` packages a DAG as its own skill (C-G12)."""
+
+    TEMPLATE = (
+        "# {{name}}\n\n{{title}}\n\n{{description}}\n\nnodes: {{node_count}}\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scaffold-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.src_skill = self.tmp / "source-skill"
+        self.src_skill.mkdir()
+        for name in ("scripts", "references"):
+            shutil.copytree(str(SKILL_DIR / name), str(self.src_skill / name),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        (self.src_skill / "templates").mkdir()
+        (self.src_skill / "templates" / "SKILL.md.tmpl").write_text(
+            self.TEMPLATE, encoding="utf-8")
+        self.cli_path = self.src_skill / "scripts" / "dag_manager.py"
+        self.dest = self.tmp / "dest"
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull})
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+
+    def run_cli(self, cli_path, cwd, *args):
+        proc = subprocess.run(
+            [sys.executable, str(cli_path)] + list(args), cwd=str(cwd), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout
+
+    def scaffold(self, name="demo", *extra, cli_path=None):
+        return self.run_cli(cli_path or self.cli_path, self.ws, "scaffold", name,
+                            "--from", str(EXAMPLE_DAG), "--dest", str(self.dest), *extra)
+
+    def leftovers(self):
+        if not self.dest.exists():
+            return []
+        return [p.name for p in self.dest.iterdir() if p.name.startswith(".")]
+
+    def test_bad_name_exits_2(self):
+        for bad in ("Bad Name", "../escape", "-lead"):
+            code, out = self.scaffold(bad)
+            self.assertEqual(code, 2, out)
+        self.assertFalse(self.dest.exists() and any(self.dest.iterdir()))
+
+    def test_existing_target_without_force_exits_1_and_is_untouched(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("mine", encoding="utf-8")
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 1, out)
+        self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_force_replaces_existing_target(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "stale.txt").write_text("old", encoding="utf-8")
+        code, out = self.scaffold("demo", "--force")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((target / "stale.txt").exists())
+        self.assertTrue((target / "SKILL.md").is_file())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_output_layout_and_stripped_dag(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        target = self.dest / "demo"
+        self.assertIn(str(target), out)
+        self.assertTrue((target / "scripts" / "dag_manager.py").is_file())
+        self.assertTrue((target / "references").is_dir())
+        self.assertFalse((target / "templates").exists())
+        self.assertFalse((target / "tests").exists())
+        self.assertFalse(list(target.rglob("__pycache__")))
+        doc = json.loads((target / "dag.json").read_text(encoding="utf-8"))
+        for key in ("git", "services", "residue", "preflight", "active_node_id"):
+            self.assertNotIn(key, doc)
+        self.assertTrue(doc["nodes"])
+        for node in doc["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+
+    def test_rendered_skill_md(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        text = (self.dest / "demo" / "SKILL.md").read_text(encoding="utf-8")
+        doc = json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+        title = doc["title"]
+        self.assertIn("demo", text)
+        self.assertIn(title, text)
+        self.assertIn("Run the {} tutorial step by step with checks and rewinds. "
+                      "Use when the user wants to work through {}.".format(title, title), text)
+        self.assertIn("nodes: {}".format(len(doc["nodes"])), text)
+        self.assertNotIn("{{", text)
+
+    def test_invalid_source_exits_1_and_writes_nothing(self):
+        bad = self.tmp / "bad.json"
+        doc = json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+        doc["schema_version"] = "9.9"
+        bad.write_text(json.dumps(doc), encoding="utf-8")
+        proc_args = ["scaffold", "demo", "--from", str(bad), "--dest", str(self.dest)]
+        code, out = self.run_cli(self.cli_path, self.ws, *proc_args)
+        self.assertEqual(code, 1, out)
+        self.assertFalse((self.dest / "demo").exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_generated_skill_runs_init_and_status(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        gen_cli = self.dest / "demo" / "scripts" / "dag_manager.py"
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        git_env = dict(self.env)
+        git_env.update({"GIT_AUTHOR_NAME": "Tutorial Test",
+                        "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                        "GIT_COMMITTER_NAME": "Tutorial Test",
+                        "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(repo), env=git_env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        code, out = self.run_cli(gen_cli, repo, "init", "--from",
+                                 str(self.dest / "demo" / "dag.json"))
+        self.assertEqual(code, 0, out)
+        code, out = self.run_cli(gen_cli, repo, "status")
+        self.assertEqual(code, 0, out)
+        state = json.loads((repo / ".tutorial-dag.json").read_text(encoding="utf-8"))
+        self.assertTrue(state["nodes"])
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+
+    def test_missing_template_exits_1_with_message(self):
+        shutil.rmtree(str(self.src_skill / "templates"))
+        code, out = self.scaffold("demo", cli_path=self.cli_path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("scaffold needs templates/SKILL.md.tmpl (run it from the source skill)",
+                      out)
+        self.assertFalse((self.dest / "demo").exists())
+        self.assertEqual(self.leftovers(), [])
 
 
 if __name__ == "__main__":

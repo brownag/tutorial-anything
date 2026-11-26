@@ -1,0 +1,176 @@
+---
+name: {{name}}
+description: {{description}}
+license: MIT
+version: 1.0.0
+compatibility: python>=3.9, git>=2.25
+---
+
+# {{title}} Tutorial Runner
+
+This skill runs the {{title}} tutorial as a checked DAG of {{node_count}} steps, using the bundled CLI and `dag.json`. The DAG is prebuilt. Each step has its own verification command, and each file-changing step is checkpointed as a Git commit so steps can be replayed or reverted.
+
+Run the CLI from the tutorial workspace. Set `$SKILL_DIR` once per session:
+
+```bash
+SKILL_DIR="<absolute path of this skill directory>"
+python3 "$SKILL_DIR/scripts/dag_manager.py" --help
+```
+
+Commands read `./.tutorial-dag.json` by default. Override the path with `--file`. Verification checks run inside `--cwd` (defaults to current directory).
+
+## Step 1 — Session initialization and mode selection
+
+1. Check for existing state. If `.tutorial-dag.json` exists, read it with `status` and resume. Do not overwrite it without explicit confirmation.
+2. Set up Git. Checkpoints and rewinds require it.
+   - Run `git init` if the workspace is not a repository.
+   - Add a `.gitignore` for build output the tutorial creates (for example `__pycache__/`, `node_modules/`).
+   - Make a baseline commit of the existing files before `init`. If the workspace is dirty, commit the sources first. The baseline commit sets `initial_commit_sha`, so checkpoints hold only tutorial changes. `init` appends `.tutorial-dag.json` to `.git/info/exclude`, so Git does not track progress records.
+3. If the DAG declares `requires`, run `doctor` before the first `next`. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
+4. Select autonomy and persistence modes:
+
+   | Mode | Command execution | `confirm` check handler |
+   |---|---|---|
+   | `guided` | User runs commands | User |
+   | `assisted` (default) | Agent proposes, user approves | User |
+   | `hands-off` | Agent runs unattended | Agent (if pre-approved) |
+
+   | Persistence | State location | Best for |
+   |---|---|---|
+   | `file` (default) | `.tutorial-dag.json` | Standard environments |
+   | `in-context` | Conversation memory | Ephemeral or read-only filesystems |
+
+   In `hands-off` mode:
+   - At a branch point, take the paths in document order unless the user said otherwise, and say which you picked.
+   - A blanket pre-approval covers every `confirm` check. Before passing `--yes`, state in your reply what you confirmed.
+   - Pre-approval never covers `approve`.
+
+## Step 2 — Prebuilt DAG initialization
+
+The DAG already exists in `dag.json`, with {{node_count}} steps. Do not decompose the tutorial or run `draft`. Start the session from the prebuilt DAG:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" init --from "$SKILL_DIR/dag.json" --git-branch tutorial/{{name}}
+```
+
+Add `--mode <mode>` to override the mode in `dag.json`. `init --from` copies every node with progress reset to `pending`. It writes `.tutorial-dag.json` and records the baseline commit. Then check the result:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" validate
+python3 "$SKILL_DIR/scripts/dag_manager.py" status
+```
+
+## Step 3 — Status check
+
+Run `status` at the start of each turn:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" status
+```
+
+```text
+[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1 | svc: 1]
+```
+
+The line shows mode, persistence, branch, progress, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. `svc: N` appears only when N > 0 services are recorded. Use `--json` for full raw state.
+
+## Step 4 — Execution loop
+
+Process one node per turn:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" next
+python3 "$SKILL_DIR/scripts/dag_manager.py" verify
+python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
+```
+
+- Finish the node's work before `complete`. `complete` runs verification and blocks the update on failure.
+- Who runs commands: the CLI never runs a node's `commands`. The agent runs them, in the workspace, as the tutorial says. In `guided` mode, the user runs them and the agent does not. The CLI runs only a declared `service` command (`service start`) and declared `undo` commands (`jump --undo`).
+- `complete` makes the next node active when exactly one is ready. Then skip `next`. When several are ready it prints `branch point, pick one: …`. Choose with `next <id>`.
+- Use `--commit` when the node changed workspace files. It commits as `tutorial(<node-id>): <title>`. On a clean workspace, `complete --commit` completes the node without a checkpoint: `nothing to commit; completed <id> without a checkpoint` (exit 0, `commit_sha` stays null). Rollback then targets the nearest completed ancestor checkpoint.
+- Complete `read-only` and `instruct` nodes without `--commit`.
+- The `next:` header lists ready nodes other than the active one.
+- Use `--yes` to pass `confirm` checks only after the user confirms (see Step 1 for hands-off).
+- For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
+- If a check fails, fix your work first. Do not bypass checks by editing the state file.
+- If the tutorial itself is wrong (it contradicts itself, or the tool changed), not your work, record the fix: `deviate [<id>] (--command N | --check) --to "<cmd>" --reason "<why the tutorial is wrong>"`, then `verify` again. Use `deviate` only for a stale tutorial. Never invent behavior to make a stale check pass.
+- Run `export` at the end of the session. It writes `.tutorial-export/deviations.md` and, for a local source with at least one deviation, `tutorial.corrected.md`.
+
+### Services
+
+A node that starts a long-running process (a dev server, a watcher) declares a `service` block instead of a foreground command:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" service start    # active node, or pass <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" service stop <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" teardown         # stop all services
+```
+
+- `service start` runs the command detached, waits for `ready`, and logs to `.tutorial-logs/<id>.log`. If `ready` never passes, it prints the log tail and exits 1.
+- Complete the node after `service start`. Its `verification` confirms the service works.
+- Run `teardown` when the session ends. `jump --reset-descendants` also stops the services it rewinds.
+- Services are POSIX only.
+
+## Step 5 — Navigation and rewinds
+
+**Jump ahead.** `jump <target>` blocks jumps over incomplete prerequisites:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" status
+# Complete each prerequisite node in order:
+python3 "$SKILL_DIR/scripts/dag_manager.py" complete <ancestor> --commit
+# Or mark prerequisites satisfied:
+python3 "$SKILL_DIR/scripts/dag_manager.py" jump <target> --skip-ancestors
+```
+
+Use `--skip-ancestors` only if the prerequisites are already satisfied in the environment.
+
+**Rewind.** Determine the intended action before running changes:
+
+| Goal | Command | Result |
+|---|---|---|
+| Review earlier step | `jump <target>` | Moves active pointer. Working files remain unchanged. |
+| Redo step from clean state | `jump <target> --reset-descendants --git-rollback hard` | Runs `git reset --hard` to target checkpoint. Resets downstream nodes to `pending`. |
+| Branch to test an alternative | `jump <target> --reset-descendants --git-rollback branch [--new-branch tutorial/alt]` | Creates a new branch at target checkpoint. Keeps current work intact. |
+| Redo and revert non-repo side effects | `jump <target> --reset-descendants --git-rollback hard --force --undo` | Resets as above, then runs each rewound node's `undo` commands. Failures and unrevertable nodes become `residue`. |
+
+- Rollback targets the nearest completed parent commit.
+- `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
+- Confirm with the user before rolling back completed `mutate` or `execute` nodes, and before `--undo` on `system` scope.
+- `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed and recorded as `residue`.
+- `residue clear [<node_id> | --all]` removes residue entries once handled.
+- `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until approved.
+- Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
+- In `hands-off` mode, `complete` also refuses an unapproved high-risk node, and a node with deviations until `approve <node_id>` covers them. Ask the user first; the approval covers the recorded deviations.
+
+## Safety rules
+
+- Who runs commands: the CLI never runs node `commands`. The agent runs them in the workspace, except in `guided` mode, where the user runs them. The CLI runs only a declared `service` command (`service start`) and declared `undo` commands (`jump --undo`).
+- Run `teardown` before ending a session that started services.
+- In `hands-off` mode, run `approve <node_id>` for a high-risk node only after a person says yes.
+- Do not complete a node without running its verification check.
+- Use `confirm` checks only with a person's answer (or a pre-approval stated in Step 1). Never pass `--yes` on your own.
+- Never run `git reset --hard` or `git clean` without user approval.
+- Do not commit `.tutorial-dag.json`.
+- Do not invent nodes omitted from the DAG.
+- Do not edit `.tutorial-dag.json` to record a deviation. Use `deviate`.
+
+## In-context persistence
+
+When running without a local state file, hold state in conversation memory. Pass it via a temporary file:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" --file /tmp/<slug>.dag.json init --from "$SKILL_DIR/dag.json"
+python3 "$SKILL_DIR/scripts/dag_manager.py" --file /tmp/<slug>.dag.json status --json
+```
+
+Use `file` mode if the workspace supports local file storage.
+
+## Reference files
+
+| File | Purpose |
+|---|---|
+| `dag.json` | The prebuilt tutorial DAG |
+| `scripts/dag_manager.py` | CLI tool |
+| `references/dag-schema.md` | Schema specification and state transition rules |
+| `references/dag-schema.json` | JSON Schema Draft 2020-12 |

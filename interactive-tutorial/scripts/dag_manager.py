@@ -18,6 +18,7 @@ Conventions:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import platform
@@ -36,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILENAME = ".tutorial-dag.json"
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 MODES = ("guided", "assisted", "hands-off")
 PERSISTENCE_MODES = ("file", "in-context")
@@ -56,6 +57,7 @@ RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
 RISK_TIERS = ("low", "elevated", "high")
 RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
 LOG_DIR_NAME = ".tutorial-logs"
+EXPORT_DIR_NAME = ".tutorial-export"
 LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
 SERVICE_STOP_GRACE = 5
 SERVICE_POLL = 0.5
@@ -138,6 +140,9 @@ VERIFICATION_ALLOWED = {
     "http": ("type", "url", "expect_status", "pattern", "timeout"),
     "port_listening": ("type", "port", "host", "timeout"),
 }
+
+
+DEVIATION_TARGET_RE = re.compile(r"^(check|command:\d+)$")
 
 
 class CliError(Exception):
@@ -453,7 +458,17 @@ def collect_warnings(state: dict) -> list:
     index = node_index(state)
     for nid in node_order(state):
         node = index[nid]
-        if node.get("action_type") == "mutate" and not node.get("artifacts"):
+        check = node.get("verification") or {}
+        if (
+            check.get("type") == "confirm"
+            and str(check.get("prompt", "")).startswith("DRAFT:")
+        ):
+            warnings.append("node '{}' still has a draft check".format(nid))
+        if (
+            node.get("action_type") == "mutate"
+            and not node.get("artifacts")
+            and not node.get("side_effects")
+        ):
             warnings.append(
                 "node '{}' is a mutate node but lists no artifacts".format(nid)
             )
@@ -504,6 +519,23 @@ def validate_git_block(git) -> list:
     for field in ("initial_dirty", "exclude_configured"):
         if not isinstance(git.get(field), bool):
             problems.append("git.{!r} must be a boolean".format(field))
+    return problems
+
+
+def validate_source_ref(ref, label: str) -> list:
+    """``source_ref`` is optional; when present it is ``{"line": int>0, "heading": str}``."""
+    if not isinstance(ref, dict):
+        return ["{} field 'source_ref' must be an object".format(label)]
+    problems = []
+    if set(ref) != {"line", "heading"}:
+        problems.append(
+            "{} field 'source_ref' must have exactly the keys 'line' and 'heading'".format(label)
+        )
+    line = ref.get("line")
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+        problems.append("{} field 'source_ref.line' must be a positive integer".format(label))
+    if not isinstance(ref.get("heading"), str):
+        problems.append("{} field 'source_ref.heading' must be a string".format(label))
     return problems
 
 
@@ -576,6 +608,9 @@ def validate_node(node, position: int, seen: dict) -> list:
     if "verification" in node:
         problems.extend(validate_verification(node["verification"], label))
 
+    if "source_ref" in node:
+        problems.extend(validate_source_ref(node["source_ref"], label))
+
     if "side_effects" in node:
         value = node.get("side_effects")
         if (
@@ -607,6 +642,8 @@ def validate_node(node, position: int, seen: dict) -> list:
                 label, list(RISK_TIERS), node.get("risk")
             )
         )
+    if "deviations" in node:
+        problems.extend(validate_deviations(node["deviations"], label))
     if "approved" in node:
         value = node.get("approved")
         if (
@@ -616,6 +653,14 @@ def validate_node(node, position: int, seen: dict) -> list:
         ):
             problems.append(
                 "{} field 'approved' must be an object with 'tier' and 'at' (C-G6)".format(label)
+            )
+        elif "deviations" in value and (
+            not isinstance(value["deviations"], int)
+            or isinstance(value["deviations"], bool)
+            or value["deviations"] < 0
+        ):
+            problems.append(
+                "{} field 'approved.deviations' must be a non-negative integer".format(label)
             )
     return problems
 
@@ -656,6 +701,13 @@ def approval_covers(node: dict, tier: str) -> bool:
     if not isinstance(approved, dict) or approved.get("tier") not in RISK_TIERS:
         return False
     return RISK_TIERS.index(tier) <= RISK_TIERS.index(approved["tier"])
+
+
+def deviations_covered(node: dict) -> bool:
+    """True when the node's approval covers every recorded deviation (C-G8)."""
+    approved = node.get("approved")
+    covered = approved.get("deviations", 0) if isinstance(approved, dict) else 0
+    return covered >= len(node.get("deviations") or [])
 
 
 def risk_blocked(state: dict, node: dict) -> bool:
@@ -715,6 +767,30 @@ def validate_services(services) -> list:
             value = record.get(field)
             if not isinstance(value, str) or not value.strip():
                 problems.append("{} field {!r} must be a non-empty string".format(label, field))
+    return problems
+
+
+def validate_deviations(value, label) -> list:
+    """Validate a node's ``deviations`` records (C-G8)."""
+    if not isinstance(value, list):
+        return ["{} field 'deviations' must be an array".format(label)]
+    problems = []
+    for position, entry in enumerate(value):
+        item = "{} deviations[{}]".format(label, position)
+        if not isinstance(entry, dict):
+            problems.append("{} must be an object".format(item))
+            continue
+        target = entry.get("target")
+        if not isinstance(target, str) or not DEVIATION_TARGET_RE.fullmatch(target):
+            problems.append(
+                "{} field 'target' must match {}".format(item, DEVIATION_TARGET_RE.pattern)
+            )
+        for field in ("original", "replacement", "recorded_at"):
+            if not isinstance(entry.get(field), str):
+                problems.append("{} field {!r} must be a string".format(item, field))
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append("{} field 'reason' must be a non-empty string".format(item))
     return problems
 
 
@@ -1151,8 +1227,15 @@ def ensure_excluded(workspace: Path, line: str = EXCLUDE_LINE) -> bool:
 
 
 def current_branch(workspace: Path) -> str:
-    """Current branch name, or ``HEAD`` when detached."""
+    """Current branch name, or ``HEAD`` when detached.
+
+    Falls back to ``symbolic-ref`` so an unborn branch (no commits yet) still
+    reports its name.
+    """
     code, out, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
+    if code == 0:
+        return out
+    code, out, _ = run_git(["symbolic-ref", "--short", "HEAD"], workspace)
     return out if code == 0 else ""
 
 
@@ -1524,6 +1607,45 @@ def summary(state: dict, nid: str) -> str:
 # subcommands
 
 
+def strip_progress(doc: dict) -> dict:
+    """Return a copy of a DAG document with run progress removed.
+
+    Drops the runtime blocks (``services``, ``residue``, ``preflight``,
+    ``active_node_id``) and the ``git`` block, and resets every node to
+    ``pending`` with a null ``commit_sha``, removing ``approved`` and
+    ``deviations``. The input is never modified.
+    """
+    stripped = copy.deepcopy(doc)
+    for key in ("services", "residue", "preflight", "active_node_id", "git"):
+        stripped.pop(key, None)
+    for node in stripped.get("nodes", []) or []:
+        if isinstance(node, dict):
+            node["status"] = "pending"
+            node["commit_sha"] = None
+            node.pop("approved", None)
+            node.pop("deviations", None)
+    return stripped
+
+
+def load_init_source(path: Path) -> dict:
+    """Read the prebuilt DAG named by ``init --from``; problems exit 1."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CliError("cannot read --from file {}: {}".format(path, exc))
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError(
+            "--from file {} is not valid JSON (line {} column {}): {}".format(
+                path, exc.lineno, exc.colno, exc.msg
+            )
+        )
+    if not isinstance(doc, dict):
+        raise CliError("--from file {} must contain a JSON object".format(path))
+    return doc
+
+
 def cmd_init(args, state_path: Path, workspace: Path) -> int:
     """Create a fresh state document and hide it from Git."""
     if state_path.exists() and not args.force:
@@ -1531,6 +1653,64 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "{} already exists. Resume it, or pass --force to start over "
             "(--force discards recorded progress).".format(state_path)
         )
+    source_doc = None
+    if args.from_path:
+        source_path = Path(args.from_path)
+        if not source_path.is_absolute():
+            source_path = workspace / source_path
+        source_doc = load_init_source(source_path)
+    elif not args.title or not args.source:
+        missing = [flag for flag, value in (("--title", args.title), ("--source", args.source))
+                   if not value]
+        raise CliError(
+            "{} required unless --from is given".format(" and ".join(missing)), EXIT_USAGE
+        )
+
+    title = args.title or (source_doc or {}).get("title")
+    source = args.source or (source_doc or {}).get("source_doc")
+    if source_doc is not None and not (title and source):
+        raise CliError(
+            "--from file has no {}; pass {} to supply it".format(
+                "title" if not title else "source_doc",
+                "--title" if not title else "--source",
+            )
+        )
+    if source_doc is None:
+        seed = {"nodes": []}
+        mode = args.mode or "assisted"
+    else:
+        seed = strip_progress(source_doc)
+        mode = args.mode or source_doc.get("mode")
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "title": title,
+        "source_doc": source,
+        "mode": mode,
+        "persistence": args.persistence,
+        "active_node_id": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "git": {
+            "branch": "",
+            "initial_commit_sha": "",
+            "initial_dirty": False,
+            "exclude_configured": True,
+        },
+        "nodes": seed["nodes"] if source_doc is not None else [],
+    }
+    if source_doc is not None and "requires" in seed:
+        state["requires"] = seed["requires"]
+    if source_doc is not None:
+        problems, _ = validate_document(state)
+        if problems:
+            for problem in problems:
+                err(problem)
+            raise CliError(
+                "{} problem(s) in --from file {}; nothing written".format(
+                    len(problems), args.from_path
+                )
+            )
+
     require_git(workspace)
 
     if args.git_branch:
@@ -1556,29 +1736,18 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "`jump --git-rollback` will refuse to run until a first commit exists"
         )
 
-    state = {
-        "schema_version": SCHEMA_VERSION,
-        "title": args.title,
-        "source_doc": args.source,
-        "mode": args.mode,
-        "persistence": args.persistence,
-        "active_node_id": None,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "git": {
-            "branch": current_branch(workspace),
-            "initial_commit_sha": sha,
-            "initial_dirty": is_dirty(workspace),
-            "exclude_configured": True,
-        },
-        "nodes": [],
+    state["git"] = {
+        "branch": current_branch(workspace),
+        "initial_commit_sha": sha,
+        "initial_dirty": is_dirty(workspace),
+        "exclude_configured": True,
     }
     save_state(state_path, state)
 
     say("initialised {}".format(state_path))
-    say("  title       {}".format(args.title))
-    say("  source      {}".format(args.source))
-    say("  mode        {}".format(args.mode))
+    say("  title       {}".format(title))
+    say("  source      {}".format(source))
+    say("  mode        {}".format(mode))
     say("  persistence {}".format(args.persistence))
     say("  branch      {}".format(state["git"]["branch"]))
     say("  HEAD        {}".format(short(sha, 12) if sha else "<no commits>"))
@@ -1593,8 +1762,271 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "checkpoint contains only tutorial changes"
         )
     say("")
-    say("next: decompose {} into nodes, write them into the 'nodes' array,".format(args.source))
+    say("next: decompose {} into nodes, write them into the 'nodes' array,".format(source))
     say("      then run `validate` and `next`.")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# draft: skeleton nodes from a Markdown tutorial (C-G10)
+
+DRAFT_SHELL_INFO = ("sh", "bash", "shell", "console", "zsh")
+DRAFT_SUMMARY_MAX = 200
+DRAFT_SLUG_MAX = 40
+DRAFT_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$")
+DRAFT_SECTION_RE = re.compile(r"^#{2,3}[ \t]+(.+?)\s*$")
+DRAFT_ITEM_RE = re.compile(r"^\d+\.\s+(.*?)\s*$")
+
+
+def slugify(text: str) -> str:
+    """Return a lowercase, dash-joined slug of at most 40 characters."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:DRAFT_SLUG_MAX].rstrip("-")
+    return slug or "step"
+
+
+def scan_fences(lines):
+    """Return (kinds, fences) for a Markdown document.
+
+    ``kinds[i]`` is ``"fence"`` for a fence delimiter line, ``"code"`` for a
+    line inside a fence, and ``"text"`` otherwise. Each fence is a dict with
+    ``open``, ``close`` (None when it runs to EOF), ``info``, and ``indent``.
+    """
+    kinds = ["text"] * len(lines)
+    fences = []
+    current = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if current is None:
+            if stripped[:3] in ("```", "~~~"):
+                marker = stripped[:3]
+                current = {
+                    "open": i,
+                    "close": None,
+                    "info": stripped[3:].strip(),
+                    "indent": len(line) - len(line.lstrip()),
+                    "marker": marker,
+                }
+                kinds[i] = "fence"
+        else:
+            if stripped.startswith(current["marker"]) and not stripped.strip(current["marker"][0]):
+                current["close"] = i
+                kinds[i] = "fence"
+                fences.append(current)
+                current = None
+            else:
+                kinds[i] = "code"
+    if current is not None:
+        fences.append(current)
+    fences.sort(key=lambda fence: fence["open"])
+    return kinds, fences
+
+
+def draft_sections(lines, kinds):
+    """Return (title_hint, [(line_index, heading_text)]) for the document."""
+    title_hint = None
+    headed = []
+    items = []
+    for i, line in enumerate(lines):
+        if kinds[i] != "text":
+            continue
+        match = DRAFT_H1_RE.match(line)
+        if match and title_hint is None:
+            title_hint = match.group(1)
+        match = DRAFT_SECTION_RE.match(line)
+        if match:
+            headed.append((i, match.group(1)))
+            continue
+        match = DRAFT_ITEM_RE.match(line)
+        if match:
+            items.append((i, match.group(1)))
+    return title_hint, (headed if headed else items)
+
+
+def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
+    """Build one skeleton node from the body lines in ``[start, end)``."""
+    summary = None
+    commands = []
+    kinds_seen = []
+    for i in range(start, end):
+        if kinds[i] == "text" and lines[i].strip() and summary is None:
+            block = []
+            j = i
+            while j < end and kinds[j] == "text" and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            text = " ".join(" ".join(block).split())
+            if len(text) > DRAFT_SUMMARY_MAX:
+                text = text[: DRAFT_SUMMARY_MAX - 3] + "..."
+            summary = text
+    for fence in fences:
+        if not start <= fence["open"] < end:
+            continue
+        info_word = fence["info"].split()[0] if fence["info"] else ""
+        close = fence["close"] if fence["close"] is not None else len(lines)
+        body = []
+        for line in lines[fence["open"] + 1 : close]:
+            cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
+            body.append(line[cut:])
+        is_prompt = any(row.startswith("$ ") for row in body)
+        if info_word in DRAFT_SHELL_INFO or (not info_word and is_prompt):
+            kinds_seen.append("execute")
+            commands.append("\n".join(row[2:] if row.startswith("$ ") else row for row in body))
+        else:
+            kinds_seen.append("mutate")
+    if "execute" in kinds_seen:
+        action = "execute"
+    elif kinds_seen:
+        action = "mutate"
+    else:
+        action = "read-only"
+    if summary is None:
+        summary = title
+    node_id = "{}-{}".format(n, slugify(title))
+    return {
+        "id": node_id,
+        "title": title,
+        "summary": summary,
+        "dependencies": [previous] if previous else [],
+        "action_type": action,
+        "commands": commands,
+        "artifacts": [],
+        "verification": {
+            "type": "confirm",
+            "prompt": "DRAFT: replace with a real check for {}".format(title),
+        },
+        "status": "pending",
+        "commit_sha": None,
+        "source_ref": {"line": line_no, "heading": title},
+    }
+
+
+def build_draft(lines, stem):
+    """Return the ``draft`` document ``{"title", "nodes"}`` for ``lines``."""
+    kinds, fences = scan_fences(lines)
+    title_hint, sections = draft_sections(lines, kinds)
+    nodes = []
+    previous = None
+    for index, (line_index, heading) in enumerate(sections):
+        end = sections[index + 1][0] if index + 1 < len(sections) else len(lines)
+        node = draft_node(
+            lines, kinds, fences, line_index + 1, end, index + 1, previous, heading, line_index + 1
+        )
+        nodes.append(node)
+        previous = node["id"]
+    return {"title": title_hint or stem, "nodes": nodes}
+
+
+def cmd_draft(args, state_path: Path, workspace: Path) -> int:
+    """Print skeleton nodes for a Markdown tutorial as JSON, or fill state with --write (C-G10)."""
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = workspace / path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError("cannot read {}: {}".format(path, exc.__class__.__name__))
+    document = build_draft(text.splitlines(), path.stem)
+    if not args.write:
+        print(json.dumps(document, indent=2))
+        return EXIT_OK
+    state = load_state(state_path)
+    if state.get("nodes"):
+        raise CliError(
+            "nodes already present in {}; draft --write only fills an empty state".format(
+                state_path
+            )
+        )
+    state["nodes"] = document["nodes"]
+    problems, warnings = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        err("draft not written: {} problem(s)".format(len(problems)))
+        return EXIT_FAIL
+    save_state(state_path, state)
+    for message in warnings:
+        warn(message)
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+SCAFFOLD_TEMPLATE = Path("templates") / "SKILL.md.tmpl"
+SCAFFOLD_DESCRIPTION = (
+    "Run the {title} tutorial step by step with checks and rewinds. "
+    "Use when the user wants to work through {title}."
+)
+
+
+def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
+    """Package a validated DAG as its own skill directory (C-G12)."""
+    name = args.name
+    if not ID_RE.match(name):
+        raise CliError(
+            "skill name {!r} must match {}".format(name, ID_RE.pattern), EXIT_USAGE
+        )
+    source_path = Path(args.from_path)
+    if not source_path.is_absolute():
+        source_path = workspace / source_path
+    stripped = strip_progress(load_init_source(source_path))
+
+    placeholder_git = {
+        "branch": "",
+        "initial_commit_sha": "",
+        "initial_dirty": False,
+        "exclude_configured": True,
+    }
+    problems, _ = validate_document(dict(stripped, git=placeholder_git))
+    if problems:
+        for problem in problems:
+            err(problem)
+        raise CliError(
+            "{} problem(s) in --from file {}; nothing written".format(
+                len(problems), args.from_path
+            )
+        )
+
+    template = SKILL_ROOT / SCAFFOLD_TEMPLATE
+    if not template.is_file():
+        raise CliError(
+            "scaffold needs {} (run it from the source skill)".format(SCAFFOLD_TEMPLATE.as_posix())
+        )
+
+    dest = Path(args.dest) if args.dest else workspace / ".agents" / "skills"
+    if not dest.is_absolute():
+        dest = workspace / dest
+    target = dest / name
+    if target.exists() and not args.force:
+        raise CliError(
+            "{} already exists; pass --force to replace it".format(target)
+        )
+
+    dest.mkdir(parents=True, exist_ok=True)
+    build = Path(tempfile.mkdtemp(prefix=".{}.tmp-".format(name), dir=str(dest)))
+    try:
+        for folder in ("scripts", "references"):
+            shutil.copytree(str(SKILL_ROOT / folder), str(build / folder),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        (build / "dag.json").write_text(
+            json.dumps(stripped, indent=2) + "\n", encoding="utf-8"
+        )
+        title = stripped["title"]
+        text = template.read_text(encoding="utf-8")
+        for key, value in (
+            ("{{name}}", name),
+            ("{{title}}", title),
+            ("{{description}}", SCAFFOLD_DESCRIPTION.format(title=title)),
+            ("{{node_count}}", str(len(stripped.get("nodes") or []))),
+        ):
+            text = text.replace(key, value)
+        (build / "SKILL.md").write_text(text, encoding="utf-8")
+        if target.exists():
+            shutil.rmtree(str(target))
+        os.rename(str(build), str(target))
+    except BaseException:
+        shutil.rmtree(str(build), ignore_errors=True)
+        raise
+    say(str(target))
     return EXIT_OK
 
 
@@ -1645,6 +2077,11 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     for line in render_graph(state):
         say(line)
     say("")
+    for node in state.get("nodes") or []:
+        if node.get("deviations"):
+            say("deviations  {}: {}".format(node["id"], len(node["deviations"])))
+    if any(node.get("deviations") for node in state.get("nodes") or []):
+        say("")
     for entry in state.get("residue") or []:
         undo = entry.get("undo") or []
         say(
@@ -1681,6 +2118,8 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
         for hint in interactive_hints(node):
             say("  {}".format(hint))
         verification = node.get("verification") or {}
+        if node.get("deviations"):
+            say("  deviations: {}".format(len(node["deviations"])))
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
         unmet = [
             dep
@@ -1725,7 +2164,11 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
         return EXIT_FAIL
     node = get_node(state, args.node_id)
     tier, labels = risk_tier(node)
-    node["approved"] = {"tier": tier, "at": now_iso()}
+    node["approved"] = {
+        "tier": tier,
+        "at": now_iso(),
+        "deviations": len(node.get("deviations", [])),
+    }
     save_state(state_path, state)
     say(
         "approved {} at risk {} ({})".format(
@@ -1733,6 +2176,71 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
         )
     )
     say(header_line(state, workspace))
+    return EXIT_OK
+
+
+def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
+    """Replace a node's check or one of its commands and record why (C-G8)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    nid = resolve_target(state, args.node_id, workspace)
+    node = get_node(state, nid)
+    if node.get("status") == "completed":
+        raise CliError(
+            "'{}' is already completed. Jump back with `jump {} --reset-descendants` "
+            "before deviating.".format(nid, nid)
+        )
+    if not args.to.strip():
+        raise CliError("--to must be a non-empty command", EXIT_USAGE)
+    if not args.reason.strip():
+        raise CliError("--reason must be non-empty", EXIT_USAGE)
+
+    if args.check:
+        verification = node.get("verification") or {}
+        if verification.get("type") != "command":
+            raise CliError(
+                "'{}' check is not a command check; --check needs a 'command' "
+                "verification".format(nid),
+                EXIT_USAGE,
+            )
+        target = "check"
+        original = verification.get("command")
+    else:
+        commands = node.get("commands") or []
+        if args.index < 0 or args.index >= len(commands):
+            raise CliError(
+                "'{}' has {} command(s); --command {} is out of range".format(
+                    nid, len(commands), args.index
+                ),
+                EXIT_USAGE,
+            )
+        target = "command:{}".format(args.index)
+        original = commands[args.index]
+    if original == args.to:
+        raise CliError("--to is the same as the current text of {}".format(target), EXIT_USAGE)
+
+    if args.check:
+        node["verification"]["command"] = args.to
+    else:
+        node["commands"][args.index] = args.to
+    node.setdefault("deviations", []).append(
+        {
+            "target": target,
+            "original": original,
+            "replacement": args.to,
+            "reason": args.reason,
+            "recorded_at": now_iso(),
+        }
+    )
+    save_state(state_path, state)
+    say("deviation recorded: {} {}".format(nid, target))
+    tier, labels = risk_tier(node)
+    if tier == "high":
+        say("risk: high ({})".format(", ".join(labels) or "declared risk high"))
     return EXIT_OK
 
 
@@ -1862,6 +2370,15 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
             "`jump {} --skip-ancestors` first.".format(nid, ", ".join(unmet), nid)
         )
 
+    if state.get("mode") == "hands-off":
+        if risk_blocked(state, node):
+            check_risk(state, nid)
+        if not deviations_covered(node):
+            raise CliError(
+                "'{}' has deviated and hands-off mode needs a person to review it first. "
+                "After they say yes, run `approve {}`.".format(nid, nid)
+            )
+
     if not args.no_verify:
         passed, lines = run_verification(node, workspace, args.yes)
         for line in lines:
@@ -1879,15 +2396,12 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     if args.commit:
         require_git(workspace)
         if not is_dirty(workspace):
-            raise CliError(
-                "nothing to commit: the workspace is clean, so '{}' would create "
-                "an empty checkpoint. Complete the node without --commit, or make "
-                "the file changes first.".format(nid)
-            )
-        message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
-        commit_sha = commit_all(workspace, message)
-        say("checkpoint {}".format(commit_sha))
-        say("  message {}".format(message))
+            say("nothing to commit; completed {} without a checkpoint".format(nid))
+        else:
+            message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
+            commit_sha = commit_all(workspace, message)
+            say("checkpoint {}".format(commit_sha))
+            say("  message {}".format(message))
 
     node["status"] = "completed"
     node["commit_sha"] = commit_sha
@@ -2379,6 +2893,91 @@ def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
 # argument parsing
 
 
+def cmd_export(args, state_path: Path, workspace: Path) -> int:
+    """Write deviations.md and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+
+    if args.out:
+        out = Path(args.out)
+        if not out.is_absolute():
+            out = workspace / out
+    else:
+        out = workspace / EXPORT_DIR_NAME
+        ensure_excluded(workspace, EXPORT_DIR_NAME + "/")
+    out = Path(os.path.normpath(str(out)))
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CliError("cannot create {}: {}".format(out, exc))
+
+    records = []
+    for node in state.get("nodes") or []:
+        for record in node.get("deviations") or []:
+            records.append((node, record))
+    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+
+    source_doc = state.get("source_doc") or ""
+    source_text = None
+    if source_doc and records:
+        candidate = Path(source_doc)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            source_text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            source_text = None
+
+    not_applied = []
+    corrected = source_text
+    if corrected is not None:
+        for _, record in records:
+            original = record.get("original", "")
+            if original and original in corrected:
+                corrected = corrected.replace(original, record.get("replacement", ""), 1)
+            else:
+                not_applied.append(record)
+
+    lines = ["# Tutorial deviations", "", "Source: `{}`".format(source_doc or "(none)"), ""]
+    if not records:
+        lines.append("No deviations recorded.")
+    for node, record in records:
+        lines.extend([
+            "## {}: {}".format(node["id"], node.get("title", "")),
+            "",
+            "- target: `{}`".format(record.get("target", "")),
+            "- original: `{}`".format(record.get("original", "")),
+            "- replacement: `{}`".format(record.get("replacement", "")),
+            "- reason: {}".format(record.get("reason", "")),
+            "- recorded_at: {}".format(record.get("recorded_at", "")),
+            "",
+        ])
+    if not_applied:
+        lines.extend(["## Not applied", ""])
+        for record in not_applied:
+            lines.append("- `{}` ({})".format(record.get("original", ""), record.get("target", "")))
+        lines.append("")
+
+    written = []
+    try:
+        report_path = out / "deviations.md"
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        written.append(report_path)
+        if corrected is not None:
+            corrected_path = out / "tutorial.corrected.md"
+            corrected_path.write_text(corrected, encoding="utf-8")
+            written.append(corrected_path)
+    except OSError as exc:
+        raise CliError("cannot write export to {}: {}".format(out, exc))
+    for path in written:
+        say("wrote {}".format(path))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
     parser = argparse.ArgumentParser(
@@ -2416,9 +3015,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.required = True
 
     init = sub.add_parser("init", help="create a state document and hide it from git")
-    init.add_argument("--title", required=True)
-    init.add_argument("--source", required=True, help="tutorial file or URL being run")
-    init.add_argument("--mode", choices=MODES, default="assisted")
+    init.add_argument("--title", default=None,
+                      help="tutorial title (default: the --from file's title)")
+    init.add_argument("--source", default=None,
+                      help="tutorial file or URL being run (default: the --from file's source_doc)")
+    init.add_argument("--from", dest="from_path", metavar="DAG_JSON", default=None,
+                      help="start from a prebuilt DAG; progress is stripped")
+    init.add_argument("--mode", choices=MODES, default=None,
+                      help="default assisted, or the --from file's mode")
     init.add_argument("--persistence", choices=PERSISTENCE_MODES, default="file")
     init.add_argument(
         "--git-branch",
@@ -2427,6 +3031,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--force", action="store_true", help="overwrite an existing state file")
     init.set_defaults(func=cmd_init)
+
+    scaffold = sub.add_parser("scaffold", help="package a DAG as its own skill directory")
+    scaffold.add_argument("name", help="skill name (lowercase, digits, dot, dash, underscore)")
+    scaffold.add_argument("--from", dest="from_path", metavar="DAG_JSON", required=True,
+                          help="prebuilt DAG to package; progress is stripped")
+    scaffold.add_argument("--dest", default=None,
+                          help="parent directory (default: .agents/skills under the workspace)")
+    scaffold.add_argument("--force", action="store_true", help="replace an existing skill directory")
+    scaffold.set_defaults(func=cmd_scaffold)
+
+    draft = sub.add_parser("draft", help="print skeleton nodes from a Markdown tutorial as JSON")
+    draft.add_argument("path", help="Markdown tutorial to read")
+    draft.add_argument("--write", action="store_true",
+                       help="fill the empty nodes of the state file with the draft")
+    draft.set_defaults(func=cmd_draft)
 
     validate = sub.add_parser("validate", help="check structure, ids, and acyclicity")
     validate.set_defaults(func=cmd_validate)
@@ -2520,9 +3139,27 @@ def build_parser() -> argparse.ArgumentParser:
     teardown = sub.add_parser("teardown", help="stop every recorded service")
     teardown.set_defaults(func=cmd_teardown)
 
+    export = sub.add_parser("export", help="write a corrected tutorial and deviation report")
+    export.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="output directory (default: {}/ under the workspace)".format(EXPORT_DIR_NAME),
+    )
+    export.set_defaults(func=cmd_export)
+
     approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
     approve.add_argument("node_id", help="node whose current risk tier to approve")
     approve.set_defaults(func=cmd_approve)
+
+    deviate = sub.add_parser("deviate", help="replace a check or command and record why")
+    deviate.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    which = deviate.add_mutually_exclusive_group(required=True)
+    which.add_argument(
+        "--command", dest="index", type=int, metavar="N", help="replace commands[N] (0-based)"
+    )
+    which.add_argument("--check", action="store_true", help="replace the command check")
+    deviate.add_argument("--to", required=True, metavar="CMD", help="replacement text")
+    deviate.add_argument("--reason", required=True, metavar="TEXT", help="why the text is wrong")
+    deviate.set_defaults(func=cmd_deviate)
 
     residue = sub.add_parser("residue", help="manage residue left by jump")
     residue_sub = residue.add_subparsers(dest="residue_command", metavar="ACTION")

@@ -6,7 +6,7 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"1.0"`. Unsupported versions fail validation. |
+| `schema_version` | string | `"1.2"` (written by `init`). Any `1.x` passes validation; other majors fail. |
 | `title` | string | Tutorial title from `init --title`. |
 | `source_doc` | string | Path or URL of the tutorial. |
 | `mode` | `guided` \| `assisted` \| `hands-off` | Autonomy level. Default `assisted`. |
@@ -39,6 +39,8 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 | `artifacts` | string[] | Files created or modified by this node. |
 | `commands` | string[] | Shell commands for this step. The CLI does not execute these automatically. |
 | `verification` | object | Verification rule. Required on every node. |
+| `deviations` | object[] | Optional. Records written by `deviate` (schema 1.2). See "Deviations (C-G8)". |
+| `source_ref` | object | Optional. `{line, heading}`: `line` is a 1-based integer >= 1 (the source heading line), `heading` a string. Written by `draft`. See "Draft (C-G10)". |
 
 ### action_type taxonomy
 
@@ -106,7 +108,7 @@ Root field `residue` (optional array) holds entries `{"node_id", "scopes", "undo
 - `residue clear [<node_id> | --all]` removes entries.
 - `status` lists residue entries. The header appends ` | residue: N` inside the closing `]` when N > 0.
 - `validate` warns (not an error) when a node has non-`repo` side effects but no `undo`.
-- Schema 1.1 is written by `init`. Schema 1.0 documents remain valid.
+- Schema 1.0 and 1.1 documents remain valid.
 
 ## Risk tiers and approval (C-G6)
 
@@ -115,7 +117,7 @@ Node fields (both optional):
 | Field | Type | Notes |
 |---|---|---|
 | `risk` | string | `low`, `elevated`, or `high`. A declared value can raise a node's tier, never lower it. |
-| `approved` | object | `{"tier": tier, "at": iso8601}`, written by `approve <id>`. |
+| `approved` | object | `{"tier": tier, "at": iso8601, "deviations": int}`, written by `approve <id>`. `deviations` (optional, non-negative) counts the node's deviations it covers. |
 
 Tiers are ordered `low < elevated < high`. The effective tier is the higher of the computed tier and `risk`.
 
@@ -136,6 +138,36 @@ Tiers are ordered `low < elevated < high`. The effective tier is the higher of t
 - Gate: in `hands-off` mode only, `next` (explicit or implicit) refuses an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next` prints `risk: high (<labels>)`.
 - `status` shows a `RISK` column (`low`, `elev`, `HIGH`).
 - `validate` errors on an unknown `risk` value or a malformed `approved` object.
+- Hands-off `complete` also runs the risk gate: an effective-`high` node without covering approval is refused (exit 1, names `approve <id>`), even when `next` did not activate it.
+
+## Deviations (C-G8)
+
+`deviate` records a fix to a stale tutorial. Each record in a node's `deviations` array has these fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `target` | string | `check` (the `command` verification) or `command:<N>` (0-based index into `commands`). Pattern `^(check\|command:[0-9]+)$`. |
+| `original` | string | Text before the change. |
+| `replacement` | string | Text after the change. Non-empty. |
+| `reason` | string | Why the tutorial is wrong. Non-empty. |
+| `recorded_at` | string | ISO 8601 time. |
+
+- `deviate [<node_id>] (--command N | --check) --to "<cmd>" --reason "<text>"` replaces the text and appends the record. The default node is the active node. `--check` needs a `command` check. Out-of-range `N`, `--to` equal to the current text, or an empty `--to` or `--reason` exits 2. A completed node exits 1; run `jump <id> --reset-descendants` first. Output: `deviation recorded: <id> <target>`, plus `risk: high (...)` when the new text is high-risk.
+- `approve <id>` sets `approved.deviations` to the node's deviation count. A later deviation makes the count stale.
+- Hands-off gate: `complete` refuses a node whose deviations are not all covered by `approve` (exit 1, names `approve <id>`). A later deviation blocks again. `guided` and `assisted` are never blocked.
+- `status` shows `deviations: N` in the active block and a `deviations  <id>: N` line per node with deviations.
+- `export [--out DIR]` (default `<workspace>/.tutorial-export`, git-excluded) always writes `deviations.md`. It writes `tutorial.corrected.md` when `source_doc` is a readable local file and at least one deviation is recorded: each `original` is replaced by its `replacement` (first occurrence, in recorded order). Originals not found are listed under `## Not applied`. Exit 0; prints the written paths.
+
+## Draft (C-G10)
+
+`draft <path> [--write]` builds a skeleton DAG from a Markdown tutorial. It is a starting point to check against the tutorial, not a finished DAG.
+
+- Each H2/H3 heading starts a node. If the file has no H2/H3, each top-level numbered item (`N. `) does. Text before the first section is ignored; the H1 is the title hint.
+- Nodes form a linear chain (`dependencies` = previous node). `id` is `<n>-<slug>`. Shell fences become `commands`; `action_type` is guessed (`execute` for shell fences, `mutate` for other fences, else `read-only`).
+- Each node gets a placeholder check: `{"type": "confirm", "prompt": "DRAFT: replace with a real check for <title>"}`, and `source_ref` = `{line, heading}`.
+- Output is always JSON (`{"title", "nodes"}`). There is no `--json` flag.
+- `--write` requires an existing state file with an empty `nodes` array (otherwise exit 1, `nodes already present`). It writes the nodes, validates, and prints the header line.
+- `validate` warns `node '<id>' still has a draft check` for any `confirm` prompt starting with `DRAFT:`. Replace these before completing the tutorial.
 
 ## Sample state file
 
