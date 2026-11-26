@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -560,6 +561,83 @@ class FeatureTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         proc = run_cli(ws, "complete", "3-run-greet")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+
+
+def draft_workspace(slug: str) -> Path:
+    """Init an empty workspace and fill its state with the draft of one corpus tutorial."""
+    root = Path(tempfile.mkdtemp(prefix="corpus-draft-"))
+    ws = root / "repo"
+    home = root / "home"
+    ws.mkdir()
+    home.mkdir()
+    env = isolated_env(home)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(ws), env=env, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    init = run_cli(ws, "init", "--title", slug, "--source", "tutorial.md")
+    if init.returncode != 0:
+        raise RuntimeError("init failed: " + init.stdout + init.stderr)
+    draft = run_cli(ws, "draft", str(CORPUS / slug / "tutorial.md"), "--write")
+    if draft.returncode != 0:
+        raise RuntimeError("draft --write failed: " + draft.stdout + draft.stderr)
+    return root
+
+
+def draft_state(root: Path) -> dict:
+    """Read the live state of a workspace made by ``draft_workspace``."""
+    return json.loads((root / "repo" / ".tutorial-dag.json").read_text(encoding="utf-8"))
+
+
+def scan_tutorial(text: str) -> tuple:
+    """Return (H2/H3 heading lines, top-level numbered items) outside code fences."""
+    headings, numbered, in_fence = [], [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.match(r"^##{1,2}\s", line):
+            headings.append(line)
+        elif re.match(r"^\d+\.\s", line):
+            numbered.append(line)
+    return headings, numbered
+
+
+def words(title: str) -> set:
+    """Lowercase letter-only words of at least four letters."""
+    return {w for w in re.findall(r"[a-z]+", title.lower()) if len(w) >= 4}
+
+
+class CorpusDraftTest(unittest.TestCase):
+    """`draft --write` covers every corpus tutorial (C-G10)."""
+
+    def test_draft_covers_every_corpus_tutorial(self):
+        for slug in CORPUS_SLUGS:
+            with self.subTest(slug=slug):
+                text = (CORPUS / slug / "tutorial.md").read_text(encoding="utf-8")
+                headings, numbered = scan_tutorial(text)
+                minimum = len(headings) if headings else len(numbered)
+                root = draft_workspace(slug)
+                self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                nodes = draft_state(root)["nodes"]
+                self.assertGreaterEqual(len(nodes), minimum)
+                proc = run_cli(root / "repo", "validate")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_draft_score_report(self):
+        for slug in CORPUS_SLUGS:
+            root = draft_workspace(slug)
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            draft_titles = [n["title"] for n in draft_state(root)["nodes"]]
+            expected = json.loads((CORPUS / slug / "expected-dag.json").read_text(encoding="utf-8"))
+            e = len(expected["nodes"])
+            d = len(draft_titles)
+            k = sum(
+                1 for node in expected["nodes"]
+                if any(words(node["title"]) & words(t) for t in draft_titles)
+            )
+            print("draft {}: nodes {}/{} heading-match {}/{}".format(slug, d, e, k, e))
 
 
 if __name__ == "__main__":

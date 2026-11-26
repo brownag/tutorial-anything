@@ -1685,6 +1685,102 @@ class DraftTest(unittest.TestCase):
         self.assertEqual(self.draft("## Bare\n\n```sh\nls\n```\n")["nodes"][0]["summary"], "Bare")
 
 
+class DraftWriteTest(unittest.TestCase):
+    """`draft <path> --write` fills an empty state; validate checks source_ref (C-G10)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="draft-write-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull, "GIT_ADVICE_ENABLED": "false",
+                         "GIT_AUTHOR_NAME": "Tutorial Test",
+                         "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                         "GIT_COMMITTER_NAME": "Tutorial Test",
+                         "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        self.ws = self.tmp / "repo"
+        self.ws.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(self.ws), env=self.env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (self.ws / "tutorial.md").write_text("# Hello\n\n## Install tool\n\nGet it.\n\n"
+                                             "## Check it\n\nRun it.\n", encoding="utf-8")
+        self.state_path = self.ws / ".tutorial-dag.json"
+
+    def cli(self, *args):
+        """Run the CLI in the workspace; returns (exit code, stdout, stderr)."""
+        proc = subprocess.run(
+            [sys.executable, str(CLI)] + list(args), cwd=str(self.ws), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def init(self):
+        code, out, err = self.cli("init", "--title", "Hello", "--source", "tutorial.md")
+        self.assertEqual(code, 0, out + err)
+
+    def state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def write_state(self, state):
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def test_write_fills_empty_nodes_and_prints_header_only(self):
+        self.init()
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(out.startswith("["), out)
+        self.assertNotIn('"nodes"', out)
+        self.assertEqual([n["id"] for n in self.state()["nodes"]],
+                         ["1-install-tool", "2-check-it"])
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+
+    def test_write_refuses_non_empty_nodes(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        before = self.state_path.read_text(encoding="utf-8")
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("nodes already present", out + err)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_write_without_state_file_is_missing_state_error(self):
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(".tutorial-dag.json", out + err)
+        self.assertFalse(self.state_path.exists())
+
+    def test_draft_check_warning_appears_in_validate(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("node '1-install-tool' still has a draft check", out + err)
+
+    def test_source_ref_shape_is_validated(self):
+        self.init()
+        self.assertEqual(self.cli("draft", "tutorial.md", "--write")[0], 0)
+        good = {"line": 3, "heading": "Install tool"}
+        bad_refs = [
+            {"line": 0, "heading": "Install tool"},
+            {"line": "3", "heading": "Install tool"},
+            dict(good, extra=1),
+            {"line": 3},
+        ]
+        for ref in bad_refs:
+            with self.subTest(ref=ref):
+                state = self.state()
+                state["nodes"][0]["source_ref"] = ref
+                self.write_state(state)
+                code, out, err = self.cli("validate")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("source_ref", out + err)
+        state = self.state()
+        state["nodes"][0]["source_ref"] = good
+        self.write_state(state)
+        self.assertEqual(self.cli("validate")[0], 0)
+
+
 def dm_id_re():
     """Return the ID pattern the CLI uses, read from the script."""
     import importlib.util

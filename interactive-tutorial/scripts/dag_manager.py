@@ -457,6 +457,12 @@ def collect_warnings(state: dict) -> list:
     index = node_index(state)
     for nid in node_order(state):
         node = index[nid]
+        check = node.get("verification") or {}
+        if (
+            check.get("type") == "confirm"
+            and str(check.get("prompt", "")).startswith("DRAFT:")
+        ):
+            warnings.append("node '{}' still has a draft check".format(nid))
         if (
             node.get("action_type") == "mutate"
             and not node.get("artifacts")
@@ -512,6 +518,23 @@ def validate_git_block(git) -> list:
     for field in ("initial_dirty", "exclude_configured"):
         if not isinstance(git.get(field), bool):
             problems.append("git.{!r} must be a boolean".format(field))
+    return problems
+
+
+def validate_source_ref(ref, label: str) -> list:
+    """``source_ref`` is optional; when present it is ``{"line": int>0, "heading": str}``."""
+    if not isinstance(ref, dict):
+        return ["{} field 'source_ref' must be an object".format(label)]
+    problems = []
+    if set(ref) != {"line", "heading"}:
+        problems.append(
+            "{} field 'source_ref' must have exactly the keys 'line' and 'heading'".format(label)
+        )
+    line = ref.get("line")
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+        problems.append("{} field 'source_ref.line' must be a positive integer".format(label))
+    if not isinstance(ref.get("heading"), str):
+        problems.append("{} field 'source_ref.heading' must be a string".format(label))
     return problems
 
 
@@ -583,6 +606,9 @@ def validate_node(node, position: int, seen: dict) -> list:
 
     if "verification" in node:
         problems.extend(validate_verification(node["verification"], label))
+
+    if "source_ref" in node:
+        problems.extend(validate_source_ref(node["source_ref"], label))
 
     if "side_effects" in node:
         value = node.get("side_effects")
@@ -1804,7 +1830,7 @@ def build_draft(lines, stem):
 
 
 def cmd_draft(args, state_path: Path, workspace: Path) -> int:
-    """Print skeleton nodes for a Markdown tutorial as JSON (C-G10)."""
+    """Print skeleton nodes for a Markdown tutorial as JSON, or fill state with --write (C-G10)."""
     path = Path(args.path)
     if not path.is_absolute():
         path = workspace / path
@@ -1813,7 +1839,27 @@ def cmd_draft(args, state_path: Path, workspace: Path) -> int:
     except (OSError, UnicodeDecodeError) as exc:
         raise CliError("cannot read {}: {}".format(path, exc.__class__.__name__))
     document = build_draft(text.splitlines(), path.stem)
-    print(json.dumps(document, indent=2))
+    if not args.write:
+        print(json.dumps(document, indent=2))
+        return EXIT_OK
+    state = load_state(state_path)
+    if state.get("nodes"):
+        raise CliError(
+            "nodes already present in {}; draft --write only fills an empty state".format(
+                state_path
+            )
+        )
+    state["nodes"] = document["nodes"]
+    problems, warnings = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        err("draft not written: {} problem(s)".format(len(problems)))
+        return EXIT_FAIL
+    save_state(state_path, state)
+    for message in warnings:
+        warn(message)
+    say(header_line(state, workspace))
     return EXIT_OK
 
 
@@ -2816,6 +2862,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     draft = sub.add_parser("draft", help="print skeleton nodes from a Markdown tutorial as JSON")
     draft.add_argument("path", help="Markdown tutorial to read")
+    draft.add_argument("--write", action="store_true",
+                       help="fill the empty nodes of the state file with the draft")
     draft.set_defaults(func=cmd_draft)
 
     validate = sub.add_parser("validate", help="check structure, ids, and acyclicity")
