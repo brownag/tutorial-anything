@@ -511,9 +511,55 @@ class FeatureTest(unittest.TestCase):
         proc = run_cli(ws, "next", "write-dockerfile")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
-    @unittest.skip("Gap G8: deviation/export deferred to a later orchestration")
-    def test_g8_stale_deviation(self):
-        pass
+    def test_stale_deviation_export(self):
+        """Stale v1 tutorial: deviate, verify, complete, export; hands-off gate."""
+        case, raw = load_case("stale-tutorial")
+        expected = copy.deepcopy(raw)
+        expected["source_doc"] = str(CORPUS / "stale-tutorial" / "tutorial.md")
+        deviate_args = ("deviate", "--check", "--to", "./greet --who Ada",
+                        "--reason", "v2 renamed --name to --who")
+
+        ws = run_tutorial(case, expected, stop_before="3-run-greet")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+        proc = run_cli(ws, "next", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "3-run-greet")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, *deviate_args)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "export")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        export = ws / ".tutorial-export"
+        corrected = (export / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("./greet --who Ada", corrected)
+        self.assertNotIn("./greet --name Ada", corrected)
+        report = (export / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("v2 renamed", report)
+
+        # Hands-off: a deviated node cannot complete until approved.
+        hands = copy.deepcopy(expected)
+        hands["mode"] = "hands-off"
+        ws = run_tutorial(case, hands, stop_before="3-run-greet")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+        proc = run_cli(ws, "next", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, *deviate_args)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "3-run-greet")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("approve 3-run-greet", proc.stdout + proc.stderr)
+        proc = run_cli(ws, "approve", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":
