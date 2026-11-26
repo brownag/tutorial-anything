@@ -1996,6 +1996,8 @@ def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
     if not dest.is_absolute():
         dest = workspace / dest
     target = dest / name
+    if target.is_symlink():
+        raise CliError("{} is a symlink; remove it or pass a different name".format(target))
     if target.exists() and not args.force:
         raise CliError(
             "{} already exists; pass --force to replace it".format(target)
@@ -2020,9 +2022,28 @@ def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
         ):
             text = text.replace(key, value)
         (build / "SKILL.md").write_text(text, encoding="utf-8")
-        if target.exists():
-            shutil.rmtree(str(target))
-        os.rename(str(build), str(target))
+        old = None
+        try:
+            if target.exists():
+                old = Path(tempfile.mkdtemp(prefix=".{}.old-".format(name), dir=str(dest)))
+                old.rmdir()
+                os.rename(str(target), str(old))
+        except OSError as exc:
+            raise CliError("could not move aside existing {}: {}".format(target, exc))
+        try:
+            os.rename(str(build), str(target))
+        except OSError as exc:
+            if old is None:
+                raise CliError("could not place {}: {}".format(target, exc))
+            try:
+                os.rename(str(old), str(target))
+            except OSError as back:
+                raise CliError(
+                    "could not replace {} ({}); previous copy left at {} ({})".format(
+                        target, exc, old, back))
+            raise CliError("could not replace {}: {}; previous copy restored".format(target, exc))
+        if old is not None:
+            shutil.rmtree(str(old), ignore_errors=True)
     except BaseException:
         shutil.rmtree(str(build), ignore_errors=True)
         raise
