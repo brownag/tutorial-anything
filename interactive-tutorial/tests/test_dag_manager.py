@@ -249,6 +249,11 @@ class DagManagerTest(unittest.TestCase):
 
     # -- init -------------------------------------------------------------
 
+    def test_init_records_branch_in_unborn_repo(self):
+        self.init_command("--git-branch", "tutorial/x", check=0)
+
+        self.assertEqual(self.state()["git"]["branch"], "tutorial/x")
+
     def test_init_writes_state_and_excludes_state_file_once(self):
         anchor = self.seed_repo()
         self.init_command("--git-branch", "tutorial/todo", check=0)
@@ -426,6 +431,25 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("but no undo", output)
 
+    def test_validate_artifacts_warning_respects_side_effects(self):
+        def mutate(side_effects):
+            def edit(s):
+                node = s["nodes"][0]
+                node["action_type"] = "mutate"
+                node["artifacts"] = []
+                node.pop("side_effects", None)
+                if side_effects is not None:
+                    node["side_effects"] = side_effects
+            return edit
+
+        code, output = self._validate_edited(mutate(["user"]))
+        self.assertEqual(code, 0)
+        self.assertNotIn("lists no artifacts", output)
+
+        code, output = self._validate_edited(mutate(None))
+        self.assertEqual(code, 0)
+        self.assertIn("is a mutate node but lists no artifacts", output)
+
     def test_schema_1_0_document_still_validates(self):
         for version in ("1.0", "1.1"):
             code, _ = self._validate_edited(
@@ -587,12 +611,15 @@ class DagManagerTest(unittest.TestCase):
         self.assertNotIn(STATE_NAME, listed)
         self.assertIn("src/todo/store.py", listed)
 
-    def test_complete_commit_refuses_a_clean_workspace(self):
-        self.run_to_store()
+    def test_complete_commit_on_clean_tree_completes_without_checkpoint(self):
+        shas = self.run_to_store()
         code, output = self.cli("complete", "5-render", "--commit", "--no-verify")
-        self.assertEqual(code, 1)
-        self.assertIn("nothing to commit", output)
-        self.assertEqual(self.node("5-render")["status"], "pending")
+        self.assertEqual(code, 0, output)
+        self.assertIn("nothing to commit; completed 5-render without a checkpoint", output)
+        node = self.node("5-render")
+        self.assertEqual(node["status"], "completed")
+        self.assertIsNone(node["commit_sha"])
+        self.assertEqual(self.head(), shas["store"])
 
     def test_jump_refuses_unmet_ancestors_without_the_flag(self):
         self.run_to_store()

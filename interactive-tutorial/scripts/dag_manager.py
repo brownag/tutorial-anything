@@ -453,7 +453,11 @@ def collect_warnings(state: dict) -> list:
     index = node_index(state)
     for nid in node_order(state):
         node = index[nid]
-        if node.get("action_type") == "mutate" and not node.get("artifacts"):
+        if (
+            node.get("action_type") == "mutate"
+            and not node.get("artifacts")
+            and not node.get("side_effects")
+        ):
             warnings.append(
                 "node '{}' is a mutate node but lists no artifacts".format(nid)
             )
@@ -1151,8 +1155,15 @@ def ensure_excluded(workspace: Path, line: str = EXCLUDE_LINE) -> bool:
 
 
 def current_branch(workspace: Path) -> str:
-    """Current branch name, or ``HEAD`` when detached."""
+    """Current branch name, or ``HEAD`` when detached.
+
+    Falls back to ``symbolic-ref`` so an unborn branch (no commits yet) still
+    reports its name.
+    """
     code, out, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
+    if code == 0:
+        return out
+    code, out, _ = run_git(["symbolic-ref", "--short", "HEAD"], workspace)
     return out if code == 0 else ""
 
 
@@ -1879,15 +1890,12 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     if args.commit:
         require_git(workspace)
         if not is_dirty(workspace):
-            raise CliError(
-                "nothing to commit: the workspace is clean, so '{}' would create "
-                "an empty checkpoint. Complete the node without --commit, or make "
-                "the file changes first.".format(nid)
-            )
-        message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
-        commit_sha = commit_all(workspace, message)
-        say("checkpoint {}".format(commit_sha))
-        say("  message {}".format(message))
+            say("nothing to commit; completed {} without a checkpoint".format(nid))
+        else:
+            message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
+            commit_sha = commit_all(workspace, message)
+            say("checkpoint {}".format(commit_sha))
+            say("  message {}".format(message))
 
     node["status"] = "completed"
     node["commit_sha"] = commit_sha
