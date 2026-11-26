@@ -317,7 +317,6 @@ class GapTest(unittest.TestCase):
         status = run_cli(ws, "status")
         self.assertIn("residue: 1", status.stdout)
 
-    @unittest.expectedFailure
     def test_g6_risk_tiers(self):
         """Gap G6: risk tiers, HIGH gate in hands-off mode, and approve."""
         _, dag = load_case_from("container", "future-g6.json")

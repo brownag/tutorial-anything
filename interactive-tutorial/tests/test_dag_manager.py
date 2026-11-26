@@ -792,6 +792,60 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("4-store", output)
 
+    def _root_with(self, mode, **node_fields):
+        """Seed a repo and a DAG in ``mode``; patch the first root node's fields."""
+        self.seed_repo()
+        state = self.seed_state(mode=mode)
+        root = next(n for n in state["nodes"] if not n["dependencies"])
+        root.update(node_fields)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return root["id"]
+
+    def test_hands_off_blocks_high_risk_until_approved(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIsNone(self.state().get("active_node_id"))
+
+        self.cli("approve", root, check=0)
+        self.cli("next", root, check=0)
+        self.assertEqual(self.state()["active_node_id"], root)
+
+    def test_guided_mode_never_blocks_high_risk(self):
+        root = self._root_with("guided", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high (sudo)", output)
+
+    def test_assisted_mode_never_blocks_high_risk(self):
+        root = self._root_with("assisted", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high (sudo)", output)
+
+    def test_approval_covers_only_the_tier_it_recorded(self):
+        root = self._root_with("hands-off", side_effects=["user"], commands=["ls"])
+        self.cli("approve", root, check=0)
+        self.assertEqual(self.node(root)["approved"]["tier"], "elevated")
+        self.cli("next", root, check=0)
+
+        state = self.state()
+        self.node(root, state)["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
+    def test_validate_rejects_bad_risk_and_approved_values(self):
+        root = self._root_with("hands-off")
+        state = self.state()
+        self.node(root, state)["risk"] = "critical"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+        self.assertIn("'risk'", output)
+
 
 def load_cli_module():
     """Import scripts/dag_manager.py so pure helpers can be tested directly."""

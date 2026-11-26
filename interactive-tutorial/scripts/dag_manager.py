@@ -1241,6 +1241,42 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def check_risk(state: dict, nid: str) -> None:
+    """Gate a node on its risk tier (C-G6). Only hands-off ever blocks."""
+    node = node_index(state)[nid]
+    tier, labels = risk_tier(node)
+    if tier != "high":
+        return
+    detail = ", ".join(labels) or "declared risk high"
+    if risk_blocked(state, node):
+        raise CliError(
+            "'{}' is high risk ({}) and hands-off mode will not run it until a person "
+            "approves. After they say yes, run `approve {}`.".format(nid, detail, nid)
+        )
+    say("risk: high ({})".format(detail))
+
+
+def cmd_approve(args, state_path: Path, workspace: Path) -> int:
+    """Record a person's approval of a node's current risk tier (C-G6)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    node = get_node(state, args.node_id)
+    tier, labels = risk_tier(node)
+    node["approved"] = {"tier": tier, "at": now_iso()}
+    save_state(state_path, state)
+    say(
+        "approved {} at risk {} ({})".format(
+            args.node_id, tier, ", ".join(labels) or "declared"
+        )
+    )
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
     state = load_state(state_path)
@@ -1273,6 +1309,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
                     args.node_id, ", ".join(unmet), args.node_id
                 )
             )
+        check_risk(state, args.node_id)
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
         say("active -> {}".format(summary(state, args.node_id)))
@@ -1299,6 +1336,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
             "`next <id>`.".format(len(ready), ", ".join(ready)),
             EXIT_FAIL,
         )
+    check_risk(state, ready[0])
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
     say("active -> {}".format(summary(state, ready[0])))
@@ -1785,6 +1823,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="run undo commands of rewound user/system nodes (needs --reset-descendants)",
     )
     jump.set_defaults(func=cmd_jump)
+
+    approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
+    approve.add_argument("node_id", help="node whose current risk tier to approve")
+    approve.set_defaults(func=cmd_approve)
 
     residue = sub.add_parser("residue", help="manage residue left by jump")
     residue_sub = residue.add_subparsers(dest="residue_command", metavar="ACTION")
