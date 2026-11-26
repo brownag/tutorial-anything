@@ -3,7 +3,7 @@ name: interactive-tutorial
 description: Turn a static coding tutorial, README, workshop doc, or technical walkthrough into an interactive graph you step through one step at a time, jump ahead into, and rewind out of. Use when the user asks to follow, work through, run, or execute a tutorial or walkthrough, wants to resume a half-finished tutorial, asks to convert documentation into a checkable step-by-step plan, or mentions a tutorial DAG, nodes, fast-forward, jump ahead, or rewind. Decomposes the document into verifiable nodes with real dependencies, tracks progress in .tutorial-dag.json, gates every step behind its own verification command, and checkpoints each file-changing step as a git commit so steps can be replayed or reverted. Supports guided, assisted, and hands-off autonomy plus file and in-context state persistence.
 license: MIT
 author: Andrew Gene Brown
-version: 1.0.0
+version: 1.1.0
 compatibility: python>=3.9, git>=2.25
 ---
 
