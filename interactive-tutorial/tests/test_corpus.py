@@ -9,10 +9,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -262,6 +264,22 @@ class CorpusRunTest(unittest.TestCase):
 # --- gap tests ---
 
 
+def stop_services(ws: Path) -> None:
+    """Stop any service a test started: ``teardown``, then kill recorded process groups."""
+    run_cli(ws, "teardown")
+    state_path = ws / ".tutorial-dag.json"
+    if not state_path.exists():
+        return
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for entry in (state.get("services") or {}).values():
+        pgid = entry.get("pgid")
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 class GapTest(unittest.TestCase):
     """Expected-failure gap tests. Each fails today for the missing feature."""
 
@@ -321,6 +339,125 @@ class GapTest(unittest.TestCase):
         self.assertEqual(0, approved.returncode, approved.stdout + approved.stderr)
         allowed = run_cli(ws, "next", "docker-group")
         self.assertEqual(0, allowed.returncode, allowed.stdout + allowed.stderr)
+
+    @unittest.expectedFailure
+    def test_g3_services(self):
+        """Gap G3: background services, http and port_listening checks, teardown."""
+        case, raw = load_case_from("web-service", "future-g3.json")
+
+        # Serve, check over HTTP, then teardown leaves nothing listening.
+        port = free_port()
+        dag = substitute(raw, port, "")
+        ws = run_tutorial(case, dag, stop_before="serve")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+
+        proc = run_cli(ws, "next", "serve")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "service", "start", "serve")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "serve")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "next", "check")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "check")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "teardown")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        self.assertFalse(state.get("services"))
+
+        # Rewinding to serve with --reset-descendants stops its running service.
+        port = free_port()
+        dag = substitute(raw, port, "")
+        ws = run_tutorial(case, dag, stop_before="serve")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+        proc = run_cli(ws, "next", "serve")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "service", "start", "serve")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "jump", "serve", "--reset-descendants")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        self.assertFalse(state.get("services"))
+
+    @unittest.expectedFailure
+    def test_g11_interactive(self):
+        """Gap G11: stdin and timeout on command checks, interactive warnings."""
+        case, dag = load_case_from("python-package", "future-g11.json")
+        nodes = {node["id"]: node for node in dag["nodes"]}
+
+        # (a) A command check gets the declared stdin.
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        proc = run_cli(ws, "verify", "a-stdin-yes")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        # (b) With stdin held open, input() must see EOF quickly, not time out.
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        env = isolated_env(ws.parent / "home")
+        proc = subprocess.Popen(
+            [sys.executable, str(CLI), "verify", "b-input-eof"], cwd=str(ws), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        started = time.monotonic()
+        try:
+            returncode = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            self.fail("verify hung for more than 10 s with stdin held open")
+        finally:
+            proc.stdin.close()
+        elapsed = time.monotonic() - started
+        output = proc.stdout.read() + proc.stderr.read()
+        self.assertLess(elapsed, 10)
+        self.assertEqual(1, returncode, output)
+        self.assertIn("EOF", output)
+
+        # (c) Validate warns about an interactive command without an interactive block.
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "--file", str(CORPUS / "python-package" / "future-g11.json"),
+             "validate"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("looks interactive", proc.stdout + proc.stderr)
+        self.assertIn("npm init", nodes["c-npm-init"]["commands"][0])
+
+    @unittest.expectedFailure
+    def test_g4_doctor(self):
+        """Gap G4: root requires, doctor, and first-next preflight."""
+        _, dag = load_case_from("container", "future-g4.json")
+
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        proc = run_cli(ws, "doctor")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("zz-missing-tool-9", proc.stdout + proc.stderr)
+        proc = run_cli(ws, "next")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("--skip-doctor", proc.stdout + proc.stderr)
+        proc = run_cli(ws, "next", "--skip-doctor")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        # Without the missing tool, doctor and first next both pass.
+        fixed = json.loads(json.dumps(dag))
+        del fixed["requires"]["tools"]["zz-missing-tool-9"]
+        ws = seed_workspace(fixed)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        proc = run_cli(ws, "doctor")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "next")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
     @unittest.skip("Gap G8: deviation/export deferred to a later orchestration")
     def test_g8_stale_deviation(self):
