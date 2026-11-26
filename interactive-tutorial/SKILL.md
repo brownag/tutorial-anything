@@ -38,7 +38,8 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
    ```
 
    `init` appends `.tutorial-dag.json` to `.git/info/exclude`. Git will not track this file, protecting your progress records across checkouts and resets.
-3. Select autonomy and persistence modes:
+3. If the DAG declares `requires`, run `doctor` before the first `next`. It checks the declared tools and OS. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
+4. Select autonomy and persistence modes:
 
    | Mode | Command execution | `confirm` check handler |
    |---|---|---|

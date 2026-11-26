@@ -108,6 +108,47 @@
         }
       },
       "description": "Running background services, keyed by node id. Written by `service start`, removed by `service stop`, `teardown`, and `jump --reset-descendants`."
+    },
+    "requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {"type": "string", "pattern": "^(\\*|>=\\d+(\\.\\d+){0,2})$"},
+              {
+                "type": "object",
+                "required": ["min"],
+                "additionalProperties": false,
+                "properties": {
+                  "min": {"type": "string", "pattern": "^\\d+(\\.\\d+){0,2}$"},
+                  "version_command": {"type": "string", "minLength": 1}
+                }
+              }
+            ]
+          }
+        },
+        "os": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["linux", "darwin", "windows"]}
+        }
+      },
+      "description": "Preconditions checked by `doctor`, and by the first `next` unless --skip-doctor is passed."
+    },
+    "preflight": {
+      "type": "object",
+      "required": ["passed", "at", "missing"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": {"type": "boolean"},
+        "at": {"$ref": "#/$defs/timestamp"},
+        "missing": {"type": "array", "items": {"type": "string"}}
+      },
+      "description": "Result of the last `doctor` run. Written by `doctor` and by the first `next`."
     }
   },
   "$defs": {

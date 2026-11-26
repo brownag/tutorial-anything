@@ -50,7 +50,8 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `init --title T --source S [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state file, add exclude entry, record branch, HEAD commit, and dirty status | 1 if file exists without `--force` |
 | `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
 | `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
-| `next [<id>]` | Activate the next ready node, or pick a specific ready node | 1 if multiple nodes are ready or current node is incomplete |
+| `next [<id>] [--skip-doctor]` | Activate the next ready node, or pick a specific ready node. When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, the current node is incomplete, or the preflight failed |
+| `doctor [--json]` | Check the tools and OS declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
 | `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure, missing dependencies, or empty commit |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |

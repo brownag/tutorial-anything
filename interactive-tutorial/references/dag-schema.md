@@ -258,3 +258,16 @@ Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "l
   - `answers` prints a hint on `next` and `status`: `feed answers: printf '%s\n' <quoted answers> | <command>`.
   - `human: true` prints `a person must run this step (interactive)`. `validate` warns when `human` is true and the verification is not `confirm`.
 - `validate` warns `node '<id>' command looks interactive: <cmd>` when a command matches a known interactive pattern (`npm init` without `-y`, an unflagged `npx create-*`, `vim`/`nano`, a bare REPL such as `python3`, `git rebase -i`, `ssh-keygen` without `-N`, `passwd`, `read`). The warning does not fire when the node has an `interactive` block.
+
+## Preflight: requires and doctor (C-G4)
+
+Root field `requires` (optional) declares what the workspace must provide:
+
+- `tools`: object of command name to spec. A spec is `"*"` (any version, or none if the tool runs), `">=X[.Y[.Z]]"`, or `{"min": "X.Y", "version_command": "<shell command>"}`. The default version command is `<name> --version`. The version is the first dotted number in its stdout or stderr. Versions compare as tuples, padded to three parts.
+- `os` (optional): a unique array of `linux`, `darwin`, `windows`.
+
+Root field `preflight` (optional) holds `{"passed", "at", "missing"}`, written by `doctor` and by the first `next`.
+
+- `doctor [--json]` prints one row per tool: `ok`, `missing`, `too-old`, or `unknown-version`, then `name`, the found version, and `(need <spec>)`. It also prints an `os` row. It exits 0 when every check passes, otherwise 1. Each command times out after 10 seconds.
+- `unknown-version` passes only for the `"*"` spec.
+- `next` runs the check first when `requires` exists, no node is completed or skipped, and `preflight.passed` is not true. On failure it exits 1 with `run doctor, or pass --skip-doctor`. `next --skip-doctor` bypasses the check.
