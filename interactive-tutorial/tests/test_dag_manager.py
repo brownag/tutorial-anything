@@ -1096,6 +1096,75 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn("risk: high", output)
 
+    def test_hands_off_complete_blocks_deviated_node_until_approved(self):
+        root = self._root_with("hands-off", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        code, output = self.cli("complete", root, "--no-verify")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIn("deviated", output)
+        self.assertNotEqual(self.node(root)["status"], "completed")
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_second_deviation_reblocks_after_approval(self):
+        root = self._root_with("hands-off", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("approve", root, check=0)
+        self.cli("deviate", root, "--command", "0", "--to", "echo c", "--reason", "r2", check=0)
+        code, output = self.cli("complete", root, "--no-verify")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+
+    def test_guided_never_blocks_deviated_completion(self):
+        root = self._root_with("guided", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_assisted_never_blocks_deviated_completion(self):
+        root = self._root_with("assisted", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
+    def test_status_shows_deviation_count(self):
+        root = self._root_with("guided", commands=["echo a"])
+        self.cli("deviate", root, "--command", "0", "--to", "echo b", "--reason", "r", check=0)
+        self.cli("next", root, check=0)
+        code, output = self.cli("status", check=0)
+        self.assertIn("  deviations: 1", output)
+        self.assertIn("deviations  {}: 1".format(root), output)
+
+    def test_approved_deviations_must_be_non_negative_int(self):
+        root = self._root_with("guided")
+        for value, ok in ((-1, False), ("1", False), (0, True), (2, True)):
+            with self.subTest(value=value):
+                state = self.state()
+                self.node(root, state)["approved"] = {
+                    "tier": "low", "at": "2026-11-26T00:00:00Z", "deviations": value,
+                }
+                self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                code, output = self.cli("validate")
+                if ok:
+                    self.assertEqual(code, 0, output)
+                else:
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("approved.deviations", output)
+
+    def test_validate_rejects_target_with_trailing_newline(self):
+        self._node_with(commands=["echo a"], deviations=[{
+            "target": "check\n", "original": "a", "replacement": "b",
+            "reason": "r", "recorded_at": "2026-11-26T00:00:00Z",
+        }])
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+
     def test_validate_rejects_bad_deviation_target(self):
         self._node_with(commands=["echo a"], deviations=[{
             "target": "check2", "original": "a", "replacement": "b",

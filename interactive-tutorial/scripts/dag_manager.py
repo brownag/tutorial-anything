@@ -626,6 +626,14 @@ def validate_node(node, position: int, seen: dict) -> list:
             problems.append(
                 "{} field 'approved' must be an object with 'tier' and 'at' (C-G6)".format(label)
             )
+        elif "deviations" in value and (
+            not isinstance(value["deviations"], int)
+            or isinstance(value["deviations"], bool)
+            or value["deviations"] < 0
+        ):
+            problems.append(
+                "{} field 'approved.deviations' must be a non-negative integer".format(label)
+            )
     return problems
 
 
@@ -665,6 +673,13 @@ def approval_covers(node: dict, tier: str) -> bool:
     if not isinstance(approved, dict) or approved.get("tier") not in RISK_TIERS:
         return False
     return RISK_TIERS.index(tier) <= RISK_TIERS.index(approved["tier"])
+
+
+def deviations_covered(node: dict) -> bool:
+    """True when the node's approval covers every recorded deviation (C-G8)."""
+    approved = node.get("approved")
+    covered = approved.get("deviations", 0) if isinstance(approved, dict) else 0
+    return covered >= len(node.get("deviations") or [])
 
 
 def risk_blocked(state: dict, node: dict) -> bool:
@@ -738,7 +753,7 @@ def validate_deviations(value, label) -> list:
             problems.append("{} must be an object".format(item))
             continue
         target = entry.get("target")
-        if not isinstance(target, str) or not DEVIATION_TARGET_RE.match(target):
+        if not isinstance(target, str) or not DEVIATION_TARGET_RE.fullmatch(target):
             problems.append(
                 "{} field 'target' must match {}".format(item, DEVIATION_TARGET_RE.pattern)
             )
@@ -1685,6 +1700,11 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     for line in render_graph(state):
         say(line)
     say("")
+    for node in state.get("nodes") or []:
+        if node.get("deviations"):
+            say("deviations  {}: {}".format(node["id"], len(node["deviations"])))
+    if any(node.get("deviations") for node in state.get("nodes") or []):
+        say("")
     for entry in state.get("residue") or []:
         undo = entry.get("undo") or []
         say(
@@ -1721,6 +1741,8 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
         for hint in interactive_hints(node):
             say("  {}".format(hint))
         verification = node.get("verification") or {}
+        if node.get("deviations"):
+            say("  deviations: {}".format(len(node["deviations"])))
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
         unmet = [
             dep
@@ -1765,7 +1787,11 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
         return EXIT_FAIL
     node = get_node(state, args.node_id)
     tier, labels = risk_tier(node)
-    node["approved"] = {"tier": tier, "at": now_iso()}
+    node["approved"] = {
+        "tier": tier,
+        "at": now_iso(),
+        "deviations": len(node.get("deviations", [])),
+    }
     save_state(state_path, state)
     say(
         "approved {} at risk {} ({})".format(
@@ -1966,6 +1992,15 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
             "'{}' has unmet dependencies: {}. Complete them or run "
             "`jump {} --skip-ancestors` first.".format(nid, ", ".join(unmet), nid)
         )
+
+    if state.get("mode") == "hands-off":
+        if risk_blocked(state, node):
+            check_risk(state, nid)
+        if not deviations_covered(node):
+            raise CliError(
+                "'{}' has deviated and hands-off mode needs a person to review it first. "
+                "After they say yes, run `approve {}`.".format(nid, nid)
+            )
 
     if not args.no_verify:
         passed, lines = run_verification(node, workspace, args.yes)
