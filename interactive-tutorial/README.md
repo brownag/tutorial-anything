@@ -97,9 +97,12 @@ Persistence modes:
 make lint               # compile checks
 make validate-examples  # test sample DAG
 make test               # run test suite
+make test-corpus        # run corpus fixture tests
 ```
 
 Tests run in temporary Git repositories. They isolate global Git configurations.
+
+Corpus: `make test-corpus` runs `tests/test_corpus.py` against the fixtures in `tests/corpus/`, one directory per tutorial scenario. `make test` excludes these tests (`test_dag*.py` only), and `make all` runs both.
 
 ## License
 

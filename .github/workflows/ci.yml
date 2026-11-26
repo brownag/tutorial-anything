@@ -36,5 +36,8 @@ jobs:
       - name: Validate examples
         run: make validate-examples
 
+      - name: Test corpus
+        run: make test-corpus
+
       - name: Test
         run: make test
