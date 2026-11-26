@@ -1654,6 +1654,169 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------
+# draft: skeleton nodes from a Markdown tutorial (C-G10)
+
+DRAFT_SHELL_INFO = ("sh", "bash", "shell", "console", "zsh")
+DRAFT_SUMMARY_MAX = 200
+DRAFT_SLUG_MAX = 40
+DRAFT_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$")
+DRAFT_SECTION_RE = re.compile(r"^#{2,3}[ \t]+(.+?)\s*$")
+DRAFT_ITEM_RE = re.compile(r"^\d+\.\s+(.*?)\s*$")
+
+
+def slugify(text: str) -> str:
+    """Return a lowercase, dash-joined slug of at most 40 characters."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:DRAFT_SLUG_MAX].rstrip("-")
+    return slug or "step"
+
+
+def scan_fences(lines):
+    """Return (kinds, fences) for a Markdown document.
+
+    ``kinds[i]`` is ``"fence"`` for a fence delimiter line, ``"code"`` for a
+    line inside a fence, and ``"text"`` otherwise. Each fence is a dict with
+    ``open``, ``close`` (None when it runs to EOF), ``info``, and ``indent``.
+    """
+    kinds = ["text"] * len(lines)
+    fences = []
+    current = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if current is None:
+            if stripped[:3] in ("```", "~~~"):
+                marker = stripped[:3]
+                current = {
+                    "open": i,
+                    "close": None,
+                    "info": stripped[3:].strip(),
+                    "indent": len(line) - len(line.lstrip()),
+                    "marker": marker,
+                }
+                kinds[i] = "fence"
+        else:
+            if stripped.startswith(current["marker"]) and not stripped.strip(current["marker"][0]):
+                current["close"] = i
+                kinds[i] = "fence"
+                fences.append(current)
+                current = None
+            else:
+                kinds[i] = "code"
+    if current is not None:
+        fences.append(current)
+    fences.sort(key=lambda fence: fence["open"])
+    return kinds, fences
+
+
+def draft_sections(lines, kinds):
+    """Return (title_hint, [(line_index, heading_text)]) for the document."""
+    title_hint = None
+    headed = []
+    items = []
+    for i, line in enumerate(lines):
+        if kinds[i] != "text":
+            continue
+        match = DRAFT_H1_RE.match(line)
+        if match and title_hint is None:
+            title_hint = match.group(1)
+        match = DRAFT_SECTION_RE.match(line)
+        if match:
+            headed.append((i, match.group(1)))
+            continue
+        match = DRAFT_ITEM_RE.match(line)
+        if match:
+            items.append((i, match.group(1)))
+    return title_hint, (headed if headed else items)
+
+
+def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
+    """Build one skeleton node from the body lines in ``[start, end)``."""
+    summary = None
+    commands = []
+    kinds_seen = []
+    for i in range(start, end):
+        if kinds[i] == "text" and lines[i].strip() and summary is None:
+            block = []
+            j = i
+            while j < end and kinds[j] == "text" and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            text = " ".join(" ".join(block).split())
+            if len(text) > DRAFT_SUMMARY_MAX:
+                text = text[: DRAFT_SUMMARY_MAX - 3] + "..."
+            summary = text
+    for fence in fences:
+        if not start <= fence["open"] < end:
+            continue
+        info_word = fence["info"].split()[0] if fence["info"] else ""
+        close = fence["close"] if fence["close"] is not None else len(lines)
+        body = []
+        for line in lines[fence["open"] + 1 : close]:
+            cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
+            body.append(line[cut:])
+        is_prompt = any(row.startswith("$ ") for row in body)
+        if info_word in DRAFT_SHELL_INFO or (not info_word and is_prompt):
+            kinds_seen.append("execute")
+            commands.append("\n".join(row[2:] if row.startswith("$ ") else row for row in body))
+        else:
+            kinds_seen.append("mutate")
+    if "execute" in kinds_seen:
+        action = "execute"
+    elif kinds_seen:
+        action = "mutate"
+    else:
+        action = "read-only"
+    if summary is None:
+        summary = title
+    node_id = "{}-{}".format(n, slugify(title))
+    return {
+        "id": node_id,
+        "title": title,
+        "summary": summary,
+        "dependencies": [previous] if previous else [],
+        "action_type": action,
+        "commands": commands,
+        "artifacts": [],
+        "verification": {
+            "type": "confirm",
+            "prompt": "DRAFT: replace with a real check for {}".format(title),
+        },
+        "status": "pending",
+        "commit_sha": None,
+        "source_ref": {"line": line_no, "heading": title},
+    }
+
+
+def build_draft(lines, stem):
+    """Return the ``draft`` document ``{"title", "nodes"}`` for ``lines``."""
+    kinds, fences = scan_fences(lines)
+    title_hint, sections = draft_sections(lines, kinds)
+    nodes = []
+    previous = None
+    for index, (line_index, heading) in enumerate(sections):
+        end = sections[index + 1][0] if index + 1 < len(sections) else len(lines)
+        node = draft_node(
+            lines, kinds, fences, line_index + 1, end, index + 1, previous, heading, line_index + 1
+        )
+        nodes.append(node)
+        previous = node["id"]
+    return {"title": title_hint or stem, "nodes": nodes}
+
+
+def cmd_draft(args, state_path: Path, workspace: Path) -> int:
+    """Print skeleton nodes for a Markdown tutorial as JSON (C-G10)."""
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = workspace / path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError("cannot read {}: {}".format(path, exc.__class__.__name__))
+    document = build_draft(text.splitlines(), path.stem)
+    print(json.dumps(document, indent=2))
+    return EXIT_OK
+
+
 def cmd_validate(args, state_path: Path, workspace: Path) -> int:
     """Report document, id-integrity, and cycle problems."""
     state = load_state(state_path)
@@ -2650,6 +2813,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--force", action="store_true", help="overwrite an existing state file")
     init.set_defaults(func=cmd_init)
+
+    draft = sub.add_parser("draft", help="print skeleton nodes from a Markdown tutorial as JSON")
+    draft.add_argument("path", help="Markdown tutorial to read")
+    draft.set_defaults(func=cmd_draft)
 
     validate = sub.add_parser("validate", help="check structure, ids, and acyclicity")
     validate.set_defaults(func=cmd_validate)

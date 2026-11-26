@@ -1555,5 +1555,144 @@ class VerificationTypesTest(unittest.TestCase):
             self.assertTrue(self.dm.validate_verification(verification, "node 'n'"), verification)
 
 
+class DraftTest(unittest.TestCase):
+    """`draft <path>` turns a Markdown tutorial into skeleton nodes (C-G10)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="draft-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull})
+
+    def draft(self, text, name="tutorial.md"):
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "draft", str(path)],
+            cwd=str(self.tmp), env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_headings_become_linear_nodes_with_source_ref(self):
+        doc = self.draft("# Hello Tutorial\n\nIntro text.\n\n## Install tool\n\nGet it.\n\n"
+                         "### Check it\n\nRun the check.\n")
+        self.assertEqual(doc["title"], "Hello Tutorial")
+        nodes = doc["nodes"]
+        self.assertEqual([n["id"] for n in nodes], ["1-install-tool", "2-check-it"])
+        self.assertEqual(nodes[0]["dependencies"], [])
+        self.assertEqual(nodes[1]["dependencies"], ["1-install-tool"])
+        self.assertEqual(nodes[0]["source_ref"], {"line": 5, "heading": "Install tool"})
+        self.assertEqual(nodes[1]["source_ref"], {"line": 9, "heading": "Check it"})
+        self.assertEqual(nodes[0]["summary"], "Get it.")
+        self.assertEqual(nodes[0]["artifacts"], [])
+        self.assertEqual(nodes[0]["status"], "pending")
+        self.assertIsNone(nodes[0]["commit_sha"])
+        self.assertEqual(nodes[0]["verification"]["type"], "confirm")
+        self.assertTrue(nodes[0]["verification"]["prompt"].startswith("DRAFT: replace with a real check for "))
+
+    def test_title_falls_back_to_file_stem(self):
+        self.assertEqual(self.draft("## Only\n", name="my-guide.md")["title"], "my-guide")
+
+    def test_text_before_first_section_is_ignored(self):
+        doc = self.draft("preamble line\n\n## A step\n")
+        self.assertEqual([n["title"] for n in doc["nodes"]], ["A step"])
+
+    def test_numbered_list_fallback(self):
+        doc = self.draft("# Title\n\nIntro.\n\n1. First thing\n2. Second thing\n")
+        self.assertEqual([n["title"] for n in doc["nodes"]], ["First thing", "Second thing"])
+        self.assertEqual(doc["nodes"][1]["source_ref"], {"line": 6, "heading": "Second thing"})
+        self.assertEqual(doc["nodes"][1]["dependencies"], ["1-first-thing"])
+
+    def test_indented_sh_fence_under_numbered_item(self):
+        text = ("1. Make a file\n\n   ```sh\n   $ echo one\n   echo two\n   ```\n\n"
+                "2. Done\n")
+        nodes = self.draft(text)["nodes"]
+        self.assertEqual(nodes[0]["action_type"], "execute")
+        self.assertEqual(nodes[0]["commands"], ["echo one\necho two"])
+        self.assertEqual(nodes[0]["title"], "Make a file")
+
+    def test_shell_fence_is_execute_with_prompts_stripped(self):
+        doc = self.draft("## Run\n\n```bash\n$ make all\nmake test\n```\n\n```sh\nls\n```\n")
+        node = doc["nodes"][0]
+        self.assertEqual(node["action_type"], "execute")
+        self.assertEqual(node["commands"], ["make all\nmake test", "ls"])
+
+    def test_python_fence_is_mutate_without_commands(self):
+        node = self.draft("## Code\n\n```python\nprint(1)\n```\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "mutate")
+        self.assertEqual(node["commands"], [])
+
+    def test_empty_info_fence_without_prompts_is_mutate(self):
+        node = self.draft("## Blob\n\n```\nraw text\n```\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "mutate")
+        self.assertEqual(node["commands"], [])
+
+    def test_no_fences_is_read_only(self):
+        node = self.draft("## Read\n\nJust prose.\n")["nodes"][0]
+        self.assertEqual(node["action_type"], "read-only")
+        self.assertEqual(node["commands"], [])
+
+    def test_headings_inside_fences_are_not_headings(self):
+        text = "## Real\n\n```md\n## Fake\n```\n\n~~~\n# Also fake\n~~~\n"
+        self.assertEqual([n["title"] for n in self.draft(text)["nodes"]], ["Real"])
+
+    def test_unclosed_fence_runs_to_eof(self):
+        text = "## Real\n\n```sh\necho hi\n## Hidden\nstill code\n"
+        nodes = self.draft(text)["nodes"]
+        self.assertEqual([n["title"] for n in nodes], ["Real"])
+        self.assertEqual(nodes[0]["commands"], ["echo hi\n## Hidden\nstill code"])
+
+    def test_symbol_only_heading_gets_step_slug(self):
+        self.assertEqual(self.draft("## !!! ???\n")["nodes"][0]["id"], "1-step")
+
+    def test_long_slug_is_truncated_without_trailing_dash(self):
+        heading = "## " + "abcdefghij " * 5  # slug would be 54 chars
+        node = self.draft(heading + "\n")["nodes"][0]
+        self.assertLessEqual(len(node["id"].split("-", 1)[1]), 40)
+        self.assertFalse(node["id"].endswith("-"))
+        self.assertRegex(node["id"], dm_id_re())
+
+    def test_duplicate_headings_get_distinct_ids(self):
+        ids = [n["id"] for n in self.draft("## Same\n\n## Same\n")["nodes"]]
+        self.assertEqual(ids, ["1-same", "2-same"])
+
+    def test_every_id_matches_id_re(self):
+        text = "## Ünïcode & Symbols!\n\n## Step: two (2)\n\n## 3. Three\n"
+        for node in self.draft(text)["nodes"]:
+            self.assertRegex(node["id"], dm_id_re())
+
+    def test_missing_file_exits_1(self):
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "draft", str(self.tmp / "nope.md")],
+            cwd=str(self.tmp), env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nope.md", proc.stderr)
+
+    def test_summary_collapses_whitespace_and_truncates(self):
+        long_para = "word " * 80  # > 200 chars after collapsing
+        node = self.draft("## Long\n\n" + long_para + "\n")["nodes"][0]
+        self.assertLessEqual(len(node["summary"]), 200)
+        self.assertTrue(node["summary"].endswith("..."))
+        short = self.draft("## Short\n\none   two\nthree\n")["nodes"][0]
+        self.assertEqual(short["summary"], "one two three")
+
+    def test_summary_falls_back_to_title_without_paragraph(self):
+        self.assertEqual(self.draft("## Bare\n\n```sh\nls\n```\n")["nodes"][0]["summary"], "Bare")
+
+
+def dm_id_re():
+    """Return the ID pattern the CLI uses, read from the script."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dm_for_tests", str(CLI))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ID_RE.pattern
+
+
 if __name__ == "__main__":
     unittest.main()
