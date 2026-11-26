@@ -96,6 +96,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - `--commit` stages workspace changes and commits as `tutorial(<node-id>): <title>`. Use this for `mutate` and stateful `execute` nodes. Write files only for the current node.
 - Complete `read-only` and `instruct` nodes without `--commit`.
 - Use `--yes` to pass `confirm` checks after user confirmation.
+- For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
 - If multiple paths are ready, `next` stops and lists them. Ask the user which path to take.
 - If a check fails, fix the code or update the test. Do not bypass checks by editing the state file directly.
 

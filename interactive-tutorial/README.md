@@ -95,6 +95,10 @@ Persistence modes:
 | No ancestor checkpoint exists | Git repository had no commits at `init`. Commit current state first, or use `--git-rollback none`. |
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
 | `confirm` check fails with no output | Needs `--yes` flag to confirm human approval. |
+| A command check hangs or reads nothing | Command checks no longer inherit the CLI's stdin. Their stdin is `/dev/null` unless the check sets `"stdin"`, so prompts see EOF. Add `"stdin": "answer\n"` to feed input, and `"timeout"` (seconds) to bound the run. |
+| `command looks interactive` warning | The command may wait for input. Add `"interactive": {"answers": [...]}`, or `"human": true` for a step a person must run, or use the non-interactive flag (for example `npm init -y`). |
+| `services require a POSIX system` | `service` commands are POSIX only. Run the service step on Linux or macOS. |
+| `service start` fails with `ready check did not pass` | The printed log tail shows why. Raise `ready_timeout` if the server is slow to start. |
 
 ## Development
 

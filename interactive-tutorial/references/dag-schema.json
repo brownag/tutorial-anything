@@ -238,6 +238,23 @@
           },
           "description": "Commands that revert the node's non-repo side effects, run by `jump --undo`."
         },
+        "interactive": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "answers": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "Answers to feed the step's prompts, in order. Printed as a hint."
+            },
+            "human": {
+              "type": "boolean",
+              "default": false,
+              "description": "True when a person must run this step."
+            }
+          },
+          "description": "Marks a step that prompts for input. Hints print on `next` and `status`."
+        },
         "service": {
           "type": "object",
           "required": ["command", "ready"],
@@ -314,6 +331,15 @@
                 "type": "integer",
                 "minimum": 0,
                 "default": 0
+              },
+              "stdin": {
+                "type": "string",
+                "description": "Text fed to the command's standard input. Absent means /dev/null (EOF)."
+              },
+              "timeout": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Seconds before the check is killed. Default 600."
               }
             }
           }

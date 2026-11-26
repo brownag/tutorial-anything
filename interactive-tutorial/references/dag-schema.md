@@ -250,3 +250,11 @@ Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "l
 - `service` commands are POSIX only. Elsewhere they exit 2 with `services require a POSIX system`.
 - `service.command` counts as an inspected command for risk tiers (C-G6).
 - The CLI adds `.tutorial-logs/` to `.git/info/exclude`. It never edits a learner's `.gitignore`.
+
+## Interactive steps and command-check stdin (C-G11)
+
+- A `command` check accepts two new keys. `stdin` is text fed to the command's standard input. `timeout` is seconds (default 600). Without `stdin`, the command runs with `/dev/null` as stdin, so it reads EOF instead of inheriting the CLI's stdin. This is a behavior change from earlier versions.
+- Node `interactive` (optional): `{"answers": [str…], "human": bool}`.
+  - `answers` prints a hint on `next` and `status`: `feed answers: printf '%s\n' <quoted answers> | <command>`.
+  - `human: true` prints `a person must run this step (interactive)`. `validate` warns when `human` is true and the verification is not `confirm`.
+- `validate` warns `node '<id>' command looks interactive: <cmd>` when a command matches a known interactive pattern (`npm init` without `-y`, an unflagged `npx create-*`, `vim`/`nano`, a bare REPL such as `python3`, `git rebase -i`, `ssh-keygen` without `-N`, `passwd`, `read`). The warning does not fire when the node has an `interactive` block.
