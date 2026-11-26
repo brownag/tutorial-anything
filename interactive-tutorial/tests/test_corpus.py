@@ -81,6 +81,14 @@ def load_case(slug: str) -> tuple:
     return case, dag
 
 
+def load_case_from(slug: str, future_name: str) -> tuple:
+    """Return (fixture metadata, future DAG) for a gap fixture under ``slug``."""
+    folder = CORPUS / slug
+    case = json.loads((folder / "fixture.json").read_text(encoding="utf-8"))
+    dag = json.loads((folder / future_name).read_text(encoding="utf-8"))
+    return case, dag
+
+
 def topological_order(nodes: list) -> list:
     """Kahn's algorithm over ``dependencies``; keeps file order for ties."""
     by_id = {node["id"]: node for node in nodes}
@@ -100,11 +108,19 @@ def topological_order(nodes: list) -> list:
     return order
 
 
-def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
-    """Run ``dag`` to completion (or up to ``stop_before``) in a fresh workspace.
+def run_cli(ws: Path, *args) -> subprocess.CompletedProcess:
+    """Run the CLI in ``ws`` with the isolated environment of that workspace."""
+    return subprocess.run(
+        [sys.executable, str(CLI)] + list(args), cwd=str(ws),
+        env=isolated_env(ws.parent / "home"), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+    )
 
-    Returns the workspace path. Caller owns cleanup via the returned parent
-    directory's ``repo`` and ``home`` children.
+
+def seed_workspace(dag: dict) -> Path:
+    """Create a fresh git workspace, ``init`` it, and copy ``dag`` into live state.
+
+    Returns the workspace path. The caller owns cleanup of ``ws.parent``.
     """
     root = Path(tempfile.mkdtemp(prefix="corpus-"))
     ws = root / "repo"
@@ -119,21 +135,14 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-    def cli(*args) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [sys.executable, str(CLI)] + list(args), cwd=str(ws), env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, universal_newlines=True,
-        )
-
     # Seed commit first: rollback falls back to initial_commit_sha.
     git("init", "-q", "-b", "main")
     (ws / "README.md").write_text("# Scratch workspace\n", encoding="utf-8")
     git("add", "-A")
     git("commit", "-q", "-m", "seed")
 
-    init = cli("init", "--title", dag["title"], "--source", dag["source_doc"],
-               "--mode", dag["mode"])
+    init = run_cli(ws, "init", "--title", dag["title"], "--source", dag["source_doc"],
+                   "--mode", dag["mode"])
     if init.returncode != 0:
         raise RuntimeError("init failed: " + init.stdout + init.stderr)
 
@@ -144,11 +153,22 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
             state[key] = value
     state["nodes"] = dag["nodes"]
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return ws
+
+
+def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
+    """Run ``dag`` to completion (or up to ``stop_before``) in a fresh workspace.
+
+    Returns the workspace path. Caller owns cleanup via the returned parent
+    directory's ``repo`` and ``home`` children.
+    """
+    ws = seed_workspace(dag)
+    env = isolated_env(ws.parent / "home")
 
     for node in topological_order(dag["nodes"]):
         if node["id"] == stop_before:
             break
-        proc = cli("next", node["id"])
+        proc = run_cli(ws, "next", node["id"])
         if proc.returncode != 0:
             raise RuntimeError("next {} failed: {}".format(node["id"], proc.stderr))
         for command in node["commands"]:
@@ -165,7 +185,7 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
             complete_args.append("--commit")
         if node["verification"]["type"] == "confirm":
             complete_args.append("--yes")
-        proc = cli(*complete_args)
+        proc = run_cli(ws, *complete_args)
         if proc.returncode != 0:
             raise RuntimeError("complete {} failed: {}".format(node["id"], proc.stdout + proc.stderr))
     return ws
@@ -240,6 +260,71 @@ class CorpusRunTest(unittest.TestCase):
 
 
 # --- gap tests ---
+
+
+class GapTest(unittest.TestCase):
+    """Expected-failure gap tests. Each fails today for the missing feature."""
+
+    @unittest.expectedFailure
+    def test_g2_side_effects(self):
+        """Gap G2: side-effect scopes, undo, jump --undo, and residue."""
+        case, dag = load_case_from("shell-sysadmin", "future-g2.json")
+        parent = next(n for n in dag["nodes"] if n["id"] == "write-config")["dependencies"][0]
+        config = "{{HOME}}/.config/greet/greet.conf"
+
+        # With --undo: the file is removed and no residue is recorded for write-config.
+        ws = run_tutorial(case, dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        home = ws.parent / "home"
+        proc = run_cli(ws, "jump", parent, "--reset-descendants",
+                       "--git-rollback", "hard", "--force", "--undo")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertFalse((home / ".config" / "greet" / "greet.conf").exists(), config)
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        self.assertFalse(
+            [entry for entry in state.get("residue", []) if entry["node_id"] == "write-config"]
+        )
+
+        # Without --undo: the file remains and exactly one not-run residue entry is recorded.
+        ws = run_tutorial(case, dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        home = ws.parent / "home"
+        proc = run_cli(ws, "jump", parent, "--reset-descendants",
+                       "--git-rollback", "hard", "--force")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue((home / ".config" / "greet" / "greet.conf").exists(), config)
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        entries = [entry for entry in state.get("residue", []) if entry["node_id"] == "write-config"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("not-run", entries[0]["reason"])
+        status = run_cli(ws, "status")
+        self.assertIn("residue: 1", status.stdout)
+
+    @unittest.expectedFailure
+    def test_g6_risk_tiers(self):
+        """Gap G6: risk tiers, HIGH gate in hands-off mode, and approve."""
+        _, dag = load_case_from("container", "future-g6.json")
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+
+        status = run_cli(ws, "status")
+        self.assertEqual(0, status.returncode, status.stderr)
+        rows = {line.split()[0]: line for line in status.stdout.splitlines() if line.strip()}
+        self.assertIn("HIGH", rows.get("docker-group", ""), status.stdout)
+        self.assertIn("low", rows.get("write-dockerfile", ""), status.stdout)
+
+        blocked = run_cli(ws, "next", "docker-group")
+        self.assertEqual(1, blocked.returncode, blocked.stdout + blocked.stderr)
+        self.assertIn("approve docker-group", blocked.stdout + blocked.stderr)
+
+        approved = run_cli(ws, "approve", "docker-group")
+        self.assertEqual(0, approved.returncode, approved.stdout + approved.stderr)
+        allowed = run_cli(ws, "next", "docker-group")
+        self.assertEqual(0, allowed.returncode, allowed.stdout + allowed.stderr)
+
+    @unittest.skip("Gap G8: deviation/export deferred to a later orchestration")
+    def test_g8_stale_deviation(self):
+        pass
 
 
 if __name__ == "__main__":
