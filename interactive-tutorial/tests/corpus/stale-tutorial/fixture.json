@@ -2,6 +2,5 @@
   "domain": "stale-tutorial",
   "runnable": true,
   "reason": null,
-  "expect_fail_at": "3-run-greet",
-  "gaps": {}
+  "expect_fail_at": "3-run-greet"
 }

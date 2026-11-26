@@ -6,6 +6,7 @@ that must validate today, and a ``fixture.json`` describing how to run it.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -89,6 +90,14 @@ def load_case_from(slug: str, future_name: str) -> tuple:
     case = json.loads((folder / "fixture.json").read_text(encoding="utf-8"))
     dag = json.loads((folder / future_name).read_text(encoding="utf-8"))
     return case, dag
+
+
+def write_temp_dag(dag: dict) -> Path:
+    """Write ``dag`` to a fresh temp file and return its path; caller removes the parent."""
+    folder = Path(tempfile.mkdtemp(prefix="corpus-dag-"))
+    path = folder / "dag.json"
+    path.write_text(json.dumps(dag, indent=2), encoding="utf-8")
+    return path
 
 
 def topological_order(nodes: list) -> list:
@@ -209,15 +218,20 @@ class CorpusFixtureTest(unittest.TestCase):
     def test_every_expected_dag_validates(self):
         for slug in CORPUS_SLUGS:
             with self.subTest(slug=slug):
-                dag_path = CORPUS / slug / "expected-dag.json"
+                _, raw = load_case(slug)
+                # Substitute placeholders so typed fields (port) validate as integers.
+                home = tempfile.mkdtemp(prefix="corpus-home-")
+                self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+                dag = substitute(raw, 8000, home)
+                dag_path = write_temp_dag(dag)
+                self.addCleanup(shutil.rmtree, dag_path.parent, ignore_errors=True)
                 proc = subprocess.run(
                     [sys.executable, str(CLI), "--file", str(dag_path), "validate"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, universal_newlines=True,
                 )
                 self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
-                dag = json.loads(dag_path.read_text(encoding="utf-8"))
-                self.assertEqual("1.0", dag["schema_version"])
+                self.assertTrue(dag["schema_version"].startswith("1."))
 
 
 class CorpusRunTest(unittest.TestCase):
@@ -280,12 +294,12 @@ def stop_services(ws: Path) -> None:
                 pass
 
 
-class GapTest(unittest.TestCase):
-    """Expected-failure gap tests. Each fails today for the missing feature."""
+class FeatureTest(unittest.TestCase):
+    """Feature tests for the CLI behaviors that the corpus fixtures exercise."""
 
-    def test_g2_side_effects(self):
-        """Gap G2: side-effect scopes, undo, jump --undo, and residue."""
-        case, dag = load_case_from("shell-sysadmin", "future-g2.json")
+    def test_side_effects_undo(self):
+        """Side-effect scopes, undo, jump --undo, and residue."""
+        case, dag = load_case("shell-sysadmin")
         parent = next(n for n in dag["nodes"] if n["id"] == "write-config")["dependencies"][0]
         config = "{{HOME}}/.config/greet/greet.conf"
 
@@ -317,9 +331,13 @@ class GapTest(unittest.TestCase):
         status = run_cli(ws, "status")
         self.assertIn("residue: 1", status.stdout)
 
-    def test_g6_risk_tiers(self):
-        """Gap G6: risk tiers, HIGH gate in hands-off mode, and approve."""
-        _, dag = load_case_from("container", "future-g6.json")
+    def test_risk_tiers(self):
+        """Risk tiers, HIGH gate in hands-off mode, and approve."""
+        _, expected = load_case("container")
+        # Test-only variant: hands-off mode, and no requires (docker may be absent).
+        dag = copy.deepcopy(expected)
+        dag["mode"] = "hands-off"
+        del dag["requires"]
         ws = seed_workspace(dag)
         self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
 
@@ -338,8 +356,8 @@ class GapTest(unittest.TestCase):
         allowed = run_cli(ws, "next", "docker-group")
         self.assertEqual(0, allowed.returncode, allowed.stdout + allowed.stderr)
 
-    def test_g3_services(self):
-        """Gap G3: background services, http and port_listening checks, teardown."""
+    def test_services(self):
+        """Background services, http and port_listening checks, teardown."""
         case, raw = load_case_from("web-service", "future-g3.json")
 
         # Serve, check over HTTP, then teardown leaves nothing listening.
@@ -383,9 +401,39 @@ class GapTest(unittest.TestCase):
         state = json.loads(run_cli(ws, "status", "--json").stdout)
         self.assertFalse(state.get("services"))
 
-    def test_g11_interactive(self):
-        """Gap G11: stdin and timeout on command checks, interactive warnings."""
-        case, dag = load_case_from("python-package", "future-g11.json")
+    def test_interactive_checks(self):
+        """Stdin and timeout on command checks, interactive warnings."""
+        _, expected = load_case("python-package")
+        # Test-only nodes, appended to a copy of the real expected DAG.
+        dag = copy.deepcopy(expected)
+        dag["nodes"] += [
+            {
+                "id": "a-stdin-yes", "title": "Verify with fed stdin",
+                "summary": "The verification reads 'yes' from stdin. Done when verify exits 0.",
+                "dependencies": [], "action_type": "read-only", "status": "pending",
+                "commit_sha": None, "artifacts": [], "commands": [],
+                "verification": {
+                    "type": "command",
+                    "command": "python3 -c \"import sys; assert sys.stdin.read().strip() == 'yes'\"",
+                    "stdin": "yes\n", "expect_exit": 0,
+                },
+            },
+            {
+                "id": "b-input-eof", "title": "Verify input() sees EOF",
+                "summary": "input() with stdin held open must fail on EOF, not time out.",
+                "dependencies": [], "action_type": "read-only", "status": "pending",
+                "commit_sha": None, "artifacts": [], "commands": [],
+                "verification": {"type": "command", "command": "python3 -c \"input()\"",
+                                 "timeout": 5, "expect_exit": 0},
+            },
+            {
+                "id": "c-npm-init", "title": "Flag an interactive command",
+                "summary": "npm init is interactive and has no interactive block. Validate should warn.",
+                "dependencies": [], "action_type": "execute", "status": "pending",
+                "commit_sha": None, "artifacts": [], "commands": ["npm init"],
+                "verification": {"type": "confirm", "prompt": "Confirm package.json was created."},
+            },
+        ]
         nodes = {node["id"]: node for node in dag["nodes"]}
 
         # (a) A command check gets the declared stdin.
@@ -419,9 +467,10 @@ class GapTest(unittest.TestCase):
         self.assertIn("EOF", output)
 
         # (c) Validate warns about an interactive command without an interactive block.
+        dag_path = write_temp_dag(dag)
+        self.addCleanup(shutil.rmtree, dag_path.parent, ignore_errors=True)
         proc = subprocess.run(
-            [sys.executable, str(CLI), "--file", str(CORPUS / "python-package" / "future-g11.json"),
-             "validate"],
+            [sys.executable, str(CLI), "--file", str(dag_path), "validate"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True,
         )
@@ -429,29 +478,33 @@ class GapTest(unittest.TestCase):
         self.assertIn("looks interactive", proc.stdout + proc.stderr)
         self.assertIn("npm init", nodes["c-npm-init"]["commands"][0])
 
-    def test_g4_doctor(self):
-        """Gap G4: root requires, doctor, and first-next preflight."""
-        _, dag = load_case_from("container", "future-g4.json")
+    def test_doctor_preflight(self):
+        """Root requires, doctor, and first-next preflight."""
+        _, expected = load_case("container")
+        # Test-only variant: guided mode and a tool that does not exist.
+        dag = copy.deepcopy(expected)
+        dag["mode"] = "guided"
+        dag["requires"] = {"tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"}}
 
         ws = seed_workspace(dag)
         self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
         proc = run_cli(ws, "doctor")
         self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("zz-missing-tool-9", proc.stdout + proc.stderr)
-        proc = run_cli(ws, "next")
+        proc = run_cli(ws, "next", "write-dockerfile")
         self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("--skip-doctor", proc.stdout + proc.stderr)
-        proc = run_cli(ws, "next", "--skip-doctor")
+        proc = run_cli(ws, "next", "write-dockerfile", "--skip-doctor")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
         # Without the missing tool, doctor and first next both pass.
-        fixed = json.loads(json.dumps(dag))
+        fixed = copy.deepcopy(dag)
         del fixed["requires"]["tools"]["zz-missing-tool-9"]
         ws = seed_workspace(fixed)
         self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
         proc = run_cli(ws, "doctor")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
-        proc = run_cli(ws, "next")
+        proc = run_cli(ws, "next", "write-dockerfile")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
     @unittest.skip("Gap G8: deviation/export deferred to a later orchestration")

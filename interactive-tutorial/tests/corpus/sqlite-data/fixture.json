@@ -2,6 +2,5 @@
   "domain": "sqlite-data",
   "runnable": true,
   "reason": null,
-  "expect_fail_at": null,
-  "gaps": {}
+  "expect_fail_at": null
 }
