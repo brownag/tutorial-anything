@@ -1917,6 +1917,22 @@ class InitFromTest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertFalse(self.state_path.exists())
 
+    def test_invalid_source_with_git_branch_touches_no_git_state(self):
+        source = self.dirty_source()
+        source["mode"] = "bogus"
+        path = self.write_source(source)
+        code, out = self.cli("init", "--from", path, "--git-branch", "tutorial/x")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.state_path.exists())
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/heads/tutorial/x"],
+            cwd=str(self.ws), env=self.env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertNotEqual(probe.returncode, 0, "branch tutorial/x was created")
+        exclude = (self.ws / ".git" / "info" / "exclude")
+        self.assertFalse(exclude.exists() and STATE_NAME in exclude.read_text(encoding="utf-8"))
+
     def test_missing_title_in_file_exits_1_with_hint(self):
         source = self.example()
         del source["title"]

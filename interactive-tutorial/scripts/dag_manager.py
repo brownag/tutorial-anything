@@ -1675,6 +1675,42 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
                 "--title" if not title else "--source",
             )
         )
+    if source_doc is None:
+        seed = {"nodes": []}
+        mode = args.mode or "assisted"
+    else:
+        seed = strip_progress(source_doc)
+        mode = args.mode or source_doc.get("mode")
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "title": title,
+        "source_doc": source,
+        "mode": mode,
+        "persistence": args.persistence,
+        "active_node_id": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "git": {
+            "branch": "",
+            "initial_commit_sha": "",
+            "initial_dirty": False,
+            "exclude_configured": True,
+        },
+        "nodes": seed["nodes"] if source_doc is not None else [],
+    }
+    if source_doc is not None and "requires" in seed:
+        state["requires"] = seed["requires"]
+    if source_doc is not None:
+        problems, _ = validate_document(state)
+        if problems:
+            for problem in problems:
+                err(problem)
+            raise CliError(
+                "{} problem(s) in --from file {}; nothing written".format(
+                    len(problems), args.from_path
+                )
+            )
+
     require_git(workspace)
 
     if args.git_branch:
@@ -1700,41 +1736,12 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
             "`jump --git-rollback` will refuse to run until a first commit exists"
         )
 
-    if source_doc is None:
-        seed = {"nodes": []}
-        mode = args.mode or "assisted"
-    else:
-        seed = strip_progress(source_doc)
-        mode = args.mode or source_doc.get("mode")
-    state = {
-        "schema_version": SCHEMA_VERSION,
-        "title": title,
-        "source_doc": source,
-        "mode": mode,
-        "persistence": args.persistence,
-        "active_node_id": None,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "git": {
-            "branch": current_branch(workspace),
-            "initial_commit_sha": sha,
-            "initial_dirty": is_dirty(workspace),
-            "exclude_configured": True,
-        },
-        "nodes": seed["nodes"] if source_doc is not None else [],
+    state["git"] = {
+        "branch": current_branch(workspace),
+        "initial_commit_sha": sha,
+        "initial_dirty": is_dirty(workspace),
+        "exclude_configured": True,
     }
-    if source_doc is not None and "requires" in seed:
-        state["requires"] = seed["requires"]
-    if source_doc is not None:
-        problems, _ = validate_document(state)
-        if problems:
-            for problem in problems:
-                err(problem)
-            raise CliError(
-                "{} problem(s) in --from file {}; nothing written".format(
-                    len(problems), args.from_path
-                )
-            )
     save_state(state_path, state)
 
     say("initialised {}".format(state_path))
