@@ -13,9 +13,12 @@ import copy
 import json
 import os
 import shutil
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -850,6 +853,107 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("next", root)
         self.assertEqual(code, 1, output)
         self.assertIn("approve {}".format(root), output)
+
+    def _free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def _service_root(self, command, ready, **service_extra):
+        service = dict({"command": command, "ready": ready}, **service_extra)
+        node_id = self._root_with("assisted", service=service, verification=ready)
+        self.addCleanup(self.cli, "teardown")
+        return node_id
+
+    def _http_server_command(self, port):
+        return "{} -m http.server {} --bind 127.0.0.1".format(
+            shlex.quote(sys.executable), port
+        )
+
+    def test_service_start_ready_then_stop_round_trip(self):
+        port = self._free_port()
+        node_id = self._service_root(
+            self._http_server_command(port), {"type": "port_listening", "port": port}
+        )
+        self.cli("next", node_id, check=0)
+        code, output = self.cli("service", "start", node_id)
+        self.assertEqual(code, 0, output)
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+        services = json.loads(self.cli("status", "--json")[1])["services"]
+        self.assertEqual(services[node_id]["pid"], services[node_id]["pgid"])
+        self.assertTrue((self.workspace / ".tutorial-logs" / "{}.log".format(node_id)).is_file())
+        self.assertIn("svc: 1", self.cli("status")[1])
+
+        self.cli("service", "stop", node_id, check=0)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        self.assertFalse(json.loads(self.cli("status", "--json")[1]).get("services"))
+
+    def test_service_start_refuses_a_running_service(self):
+        port = self._free_port()
+        node_id = self._service_root(
+            self._http_server_command(port), {"type": "port_listening", "port": port}
+        )
+        self.cli("next", node_id, check=0)
+        self.cli("service", "start", node_id, check=0)
+        code, output = self.cli("service", "start", node_id)
+        self.assertEqual(code, 1, output)
+        self.assertIn("already running", output)
+
+    def test_ready_timeout_stops_the_process_and_drops_the_record(self):
+        node_id = self._service_root(
+            "echo never-ready; sleep 30",
+            {"type": "port_listening", "port": self._free_port()},
+            ready_timeout=1,
+        )
+        self.cli("next", node_id, check=0)
+        started = time.monotonic()
+        code, output = self.cli("service", "start", node_id)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(code, 1, output)
+        self.assertIn("did not pass within 1s", output)
+        self.assertIn("log tail", output)
+        self.assertIn("never-ready", output)
+        self.assertFalse(json.loads(self.cli("status", "--json")[1]).get("services"))
+
+    def test_stop_of_an_already_dead_process_is_not_an_error(self):
+        node_id = self._service_root(
+            "true", {"type": "port_listening", "port": self._free_port()}
+        )
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        state = self.state()
+        state["services"] = {
+            node_id: {
+                "pid": dead.pid,
+                "pgid": dead.pid,
+                "command": "true",
+                "log": ".tutorial-logs/{}.log".format(node_id),
+                "started_at": "2026-11-26T00:00:00Z",
+            }
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("service", "stop", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("was not running", output)
+        self.assertFalse(self.state().get("services"))
+
+    def test_service_block_validation(self):
+        node_id = self._service_root(
+            "true", {"type": "port_listening", "port": self._free_port()}
+        )
+        for bad in (
+            {"command": "true", "ready": {"type": "confirm", "prompt": "ok?"}},
+            {"command": "true"},
+            {"command": "true", "ready": {"type": "port_listening", "port": 1}, "stop_signal": "HUP"},
+        ):
+            state = self.state()
+            self.node(node_id, state)["service"] = bad
+            self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            code, output = self.cli("validate")
+            self.assertEqual(code, 1, bad)
+            self.assertIn("service", output)
 
     def test_validate_rejects_bad_risk_and_approved_values(self):
         root = self._root_with("hands-off")

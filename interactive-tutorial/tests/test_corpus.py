@@ -338,7 +338,6 @@ class GapTest(unittest.TestCase):
         allowed = run_cli(ws, "next", "docker-group")
         self.assertEqual(0, allowed.returncode, allowed.stdout + allowed.stderr)
 
-    @unittest.expectedFailure
     def test_g3_services(self):
         """Gap G3: background services, http and port_listening checks, teardown."""
         case, raw = load_case_from("web-service", "future-g3.json")

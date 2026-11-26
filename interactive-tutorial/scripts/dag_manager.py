@@ -22,10 +22,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -51,6 +53,12 @@ SIDE_EFFECT_SCOPES = ("repo", "user", "system", "remote")
 RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
 RISK_TIERS = ("low", "elevated", "high")
 RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
+LOG_DIR_NAME = ".tutorial-logs"
+LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
+SERVICE_STOP_GRACE = 5
+SERVICE_POLL = 0.5
+SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
+SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
 HIGH_RISK_PATTERNS = (
     (re.compile(r"\bsudo\b"), "sudo"),
     (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "pipe-to-shell"),
@@ -365,6 +373,8 @@ def validate_document(state: dict) -> tuple:
 
     if "residue" in state:
         problems.extend(validate_residue(state.get("residue")))
+    if "services" in state:
+        problems.extend(validate_services(state.get("services")))
 
     nodes = state.get("nodes")
     if not isinstance(nodes, list):
@@ -551,6 +561,8 @@ def validate_node(node, position: int, seen: dict) -> list:
             problems.append(
                 "{} field 'undo' must be an array of non-empty command strings".format(label)
             )
+    if "service" in node:
+        problems.extend(validate_service(node["service"], label))
     if "risk" in node and node.get("risk") not in RISK_TIERS:
         problems.append(
             "{} field 'risk' must be one of {}, got {!r}".format(
@@ -576,6 +588,9 @@ def inspected_commands(node: dict) -> list:
     verification = node.get("verification") or {}
     if verification.get("type") == "command" and isinstance(verification.get("command"), str):
         commands.append(verification["command"])
+    service = node.get("service") or {}
+    if isinstance(service.get("command"), str):
+        commands.append(service["command"])
     return commands
 
 
@@ -613,6 +628,56 @@ def risk_blocked(state: dict, node: dict) -> bool:
         and tier == "high"
         and not approval_covers(node, tier)
     )
+
+
+def validate_service(service, label: str) -> list:
+    """Validate a node's ``service`` block (C-G3)."""
+    if not isinstance(service, dict):
+        return ["{} field 'service' must be an object".format(label)]
+    problems = []
+    for field in service:
+        if field not in SERVICE_FIELDS:
+            problems.append("{} service does not accept {!r}".format(label, field))
+    command = service.get("command")
+    if not isinstance(command, str) or not command.strip():
+        problems.append("{} service requires a non-empty 'command'".format(label))
+    if "ready" not in service:
+        problems.append("{} service requires 'ready'".format(label))
+    else:
+        ready = service["ready"]
+        if not isinstance(ready, dict) or ready.get("type") == "confirm":
+            problems.append(
+                "{} service.ready must be a verification other than confirm".format(label)
+            )
+        else:
+            problems.extend(validate_verification(ready, label + " service"))
+    if "ready_timeout" in service and not is_positive_int(service["ready_timeout"]):
+        problems.append("{} service.ready_timeout must be a positive integer".format(label))
+    if "stop_signal" in service and service["stop_signal"] not in SERVICE_SIGNALS:
+        problems.append(
+            "{} service.stop_signal must be one of {}".format(label, list(SERVICE_SIGNALS))
+        )
+    return problems
+
+
+def validate_services(services) -> list:
+    """Validate the root ``services`` map of live processes (C-G3)."""
+    if not isinstance(services, dict):
+        return ["root field 'services' must be an object"]
+    problems = []
+    for nid, record in services.items():
+        label = "services[{!r}]".format(nid)
+        if not isinstance(record, dict):
+            problems.append("{} must be an object".format(label))
+            continue
+        for field in ("pid", "pgid"):
+            if not is_positive_int(record.get(field)):
+                problems.append("{} field {!r} must be a positive integer".format(label, field))
+        for field in ("command", "log", "started_at"):
+            value = record.get(field)
+            if not isinstance(value, str) or not value.strip():
+                problems.append("{} field {!r} must be a non-empty string".format(label, field))
+    return problems
 
 
 def validate_residue(residue) -> list:
@@ -793,8 +858,8 @@ def git_common_dir(workspace: Path) -> Path:
     return path.resolve()
 
 
-def ensure_excluded(workspace: Path) -> bool:
-    """Add the state file to ``.git/info/exclude``. Returns True if it changed."""
+def ensure_excluded(workspace: Path, line: str = EXCLUDE_LINE) -> bool:
+    """Add ``line`` (default: the state file) to ``.git/info/exclude``. Returns True if it changed."""
     exclude = git_common_dir(workspace) / "info" / "exclude"
     existing = ""
     if exclude.exists():
@@ -802,14 +867,14 @@ def ensure_excluded(workspace: Path) -> bool:
             existing = exclude.read_text(encoding="utf-8")
         except OSError as exc:
             raise CliError("cannot read {}: {}".format(exclude, exc))
-    for line in existing.splitlines():
-        if line.strip() == EXCLUDE_LINE:
+    for known in existing.splitlines():
+        if known.strip() == line:
             return False
     exclude.parent.mkdir(parents=True, exist_ok=True)
     with exclude.open("a", encoding="utf-8") as handle:
         if existing and not existing.endswith("\n"):
             handle.write("\n")
-        handle.write("{}\n".format(EXCLUDE_LINE))
+        handle.write("{}\n".format(line))
     return True
 
 
@@ -1066,7 +1131,9 @@ def header_line(state: dict, workspace: Path) -> str:
         unlocked_text += ", +{}".format(len(unlocked) - 4)
     residue_count = len(state.get("residue") or [])
     residue_text = " | residue: {}".format(residue_count) if residue_count else ""
-    return "[{} | {} | {} | {} | active: {} | next: {}{}]".format(
+    svc_count = len(state.get("services") or {})
+    svc_text = " | svc: {}".format(svc_count) if svc_count else ""
+    return "[{} | {} | {} | {} | active: {} | next: {}{}{}]".format(
         state.get("mode"),
         state.get("persistence"),
         branch,
@@ -1074,6 +1141,7 @@ def header_line(state: dict, workspace: Path) -> str:
         active,
         unlocked_text,
         residue_text,
+        svc_text,
     )
 
 
@@ -1201,6 +1269,7 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
                 )
 
     excluded = ensure_excluded(workspace)
+    ensure_excluded(workspace, LOG_EXCLUDE_LINE)
     sha = head_sha(workspace)
     if not sha:
         warn(
@@ -1308,6 +1377,16 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
             )
         )
     if state.get("residue"):
+        say("")
+    services = state.get("services") or {}
+    for nid in sorted(services):
+        record = services[nid]
+        say(
+            "services: {} (pid {}, {})".format(
+                nid, record["pid"], "running" if pid_alive(record["pid"]) else "dead"
+            )
+        )
+    if services:
         say("")
     index = node_index(state)
     parents, _ = relation_maps(state)
@@ -1736,6 +1815,16 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
         say(
             "reset to pending: {}".format(", ".join(reset_from) if reset_from else "(none)")
         )
+        for nid in [target] + list(descendants):
+            record = (state.get("services") or {}).get(nid)
+            if record:
+                was_running = stop_record(record, node_stop_signal(state, nid))
+                say(
+                    "stopped service {} (pid {}{})".format(
+                        nid, record["pid"], "" if was_running else ", was not running"
+                    )
+                )
+                drop_service(state, nid)
 
     # Rewound nodes with non-repo side effects, newest first (C-G2).
     listed = [nid for nid in reversed(rewound) if set(node_scopes(index[nid])) - {"repo"}]
@@ -1777,6 +1866,203 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
         )
     say(header_line(state, workspace))
     return EXIT_FAIL if undo_failed else EXIT_OK
+
+
+def require_posix() -> None:
+    """Services need process groups and signals; refuse cleanly elsewhere (C-G3)."""
+    if os.name != "posix":
+        raise CliError("services require a POSIX system", EXIT_USAGE)
+
+
+def pid_alive(pid: int) -> bool:
+    """True when ``pid`` exists. Always False off POSIX, where services never run."""
+    if os.name != "posix":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def signal_group(pgid: int, name: str) -> None:
+    """Send a named signal to a process group; a group that is already gone is fine."""
+    try:
+        os.killpg(pgid, getattr(signal, SERVICE_SIGNALS[name]))
+    except ProcessLookupError:
+        pass
+
+
+def node_stop_signal(state: dict, nid: str) -> str:
+    """The node's declared ``stop_signal``, defaulting to TERM."""
+    node = node_index(state).get(nid) or {}
+    return (node.get("service") or {}).get("stop_signal", "TERM")
+
+
+def stop_record(record: dict, stop_signal: str = "TERM", proc=None) -> bool:
+    """Stop one recorded service group: signal, wait up to the grace period, then KILL.
+
+    ``proc`` is the live Popen handle when this process started the service, so the
+    exit can be reaped; otherwise liveness is probed by pid. Returns True if it ran.
+    """
+    def alive() -> bool:
+        return proc.poll() is None if proc is not None else pid_alive(record["pid"])
+
+    if not alive():
+        return False
+    signal_group(record["pgid"], stop_signal)
+    deadline = time.monotonic() + SERVICE_STOP_GRACE
+    while alive() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if alive():
+        signal_group(record["pgid"], "KILL")
+        if proc is not None:
+            proc.wait()
+    return True
+
+
+def drop_service(state: dict, nid: str) -> None:
+    """Remove a service record and the ``services`` key when it is empty."""
+    services = state.get("services") or {}
+    services.pop(nid, None)
+    if services:
+        state["services"] = services
+    else:
+        state.pop("services", None)
+
+
+def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
+    """Start a node's service detached and wait for its ``ready`` check (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+
+    nid = args.node_id or require_active_node(state)
+    node = get_node(state, nid)
+    service = node.get("service")
+    if not service:
+        raise CliError("node '{}' has no service block".format(nid), EXIT_USAGE)
+    check_risk(state, nid)
+
+    services = state.setdefault("services", {})
+    previous = services.get(nid)
+    if previous and pid_alive(previous["pid"]):
+        raise CliError(
+            "service for {} is already running (pid {}); run `service stop {}` "
+            "first".format(nid, previous["pid"], nid)
+        )
+    drop_service(state, nid)
+    ensure_excluded(workspace, LOG_EXCLUDE_LINE)
+
+    log_rel = "{}/{}.log".format(LOG_DIR_NAME, nid)
+    log_path = workspace / log_rel
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            service["command"],
+            shell=True,
+            cwd=str(workspace),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    record = {
+        "pid": proc.pid,
+        "pgid": proc.pid,
+        "command": service["command"],
+        "log": log_rel,
+        "started_at": now_iso(),
+    }
+    state.setdefault("services", {})[nid] = record
+    save_state(state_path, state)
+    say("starting {} (pid {}), waiting for ready".format(nid, proc.pid))
+
+    ready = service["ready"]
+    timeout = service.get("ready_timeout", 30)
+    deadline = time.monotonic() + timeout
+    while True:
+        if proc.poll() is not None:
+            reason = "exited with code {}".format(proc.returncode)
+            break
+        passed, _ = run_verification({"id": nid, "verification": ready}, workspace, False)
+        if passed:
+            save_state(state_path, state)
+            say("service {} ready (pid {}, log {})".format(nid, proc.pid, log_rel))
+            say(header_line(state, workspace))
+            return EXIT_OK
+        if time.monotonic() >= deadline:
+            reason = "ready check did not pass within {}s".format(timeout)
+            break
+        time.sleep(SERVICE_POLL)
+
+    stop_record(record, service.get("stop_signal", "TERM"), proc)
+    drop_service(state, nid)
+    save_state(state_path, state)
+    err("service {} failed: {}".format(nid, reason))
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if log_text.strip():
+        err("--- log tail ({}) ---".format(log_rel))
+        err(tail(log_text))
+    return EXIT_FAIL
+
+
+def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
+    """Stop a recorded service; a process that already exited is not an error (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    nid = args.node_id or require_active_node(state)
+    record = (state.get("services") or {}).get(nid)
+    if not record:
+        say("no service recorded for {}".format(nid))
+        return EXIT_OK
+    was_running = stop_record(record, node_stop_signal(state, nid))
+    drop_service(state, nid)
+    save_state(state_path, state)
+    if was_running:
+        say("stopped {} (pid {})".format(nid, record["pid"]))
+    else:
+        say("{} was not running (pid {}); record removed".format(nid, record["pid"]))
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
+def cmd_teardown(args, state_path: Path, workspace: Path) -> int:
+    """Stop every recorded service (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    services = dict(state.get("services") or {})
+    if not services:
+        say("no services recorded")
+        return EXIT_OK
+    for nid in sorted(services):
+        record = services[nid]
+        was_running = stop_record(record, node_stop_signal(state, nid))
+        say(
+            "stopped {} (pid {})".format(nid, record["pid"])
+            if was_running
+            else "{} was not running (pid {})".format(nid, record["pid"])
+        )
+        drop_service(state, nid)
+    save_state(state_path, state)
+    say(header_line(state, workspace))
+    return EXIT_OK
 
 
 def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
@@ -1925,6 +2211,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="run undo commands of rewound user/system nodes (needs --reset-descendants)",
     )
     jump.set_defaults(func=cmd_jump)
+
+    service = sub.add_parser("service", help="start, stop, or check background services")
+    service_sub = service.add_subparsers(dest="service_command", metavar="ACTION")
+    service_sub.required = True
+    svc_start = service_sub.add_parser("start", help="start a node's service and wait for ready")
+    svc_start.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    svc_start.set_defaults(func=cmd_service_start)
+    svc_stop = service_sub.add_parser("stop", help="stop a node's recorded service")
+    svc_stop.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    svc_stop.set_defaults(func=cmd_service_stop)
+
+    teardown = sub.add_parser("teardown", help="stop every recorded service")
+    teardown.set_defaults(func=cmd_teardown)
 
     approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
     approve.add_argument("node_id", help="node whose current risk tier to approve")
