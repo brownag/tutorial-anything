@@ -221,6 +221,27 @@
             "minLength": 1
           },
           "description": "Commands that revert the node's non-repo side effects, run by `jump --undo`."
+        },
+        "risk": {
+          "type": "string",
+          "enum": ["low", "elevated", "high"],
+          "description": "Declared minimum risk tier. The effective tier is the higher of this and the computed tier."
+        },
+        "approved": {
+          "type": "object",
+          "required": ["tier", "at"],
+          "additionalProperties": false,
+          "properties": {
+            "tier": {
+              "type": "string",
+              "enum": ["low", "elevated", "high"]
+            },
+            "at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "description": "Written by `approve <node_id>`. Covers the node while its effective tier is at or below `tier`."
         }
       }
     },

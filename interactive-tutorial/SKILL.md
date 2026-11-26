@@ -128,6 +128,8 @@ Only use `--skip-ancestors` if prerequisite steps are already satisfied in the e
 - `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed as `side effects: <id> [<scopes>] undo: <cmd> | irreversible` and recorded as `residue`.
 - Confirm with the user before `--undo` on `system` scope.
 - `residue clear [<node_id> | --all]` removes residue entries once they are handled.
+- `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until it is approved.
+- Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
 
 ## In-context persistence
 
@@ -147,6 +149,7 @@ Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2
 ## Safety rules
 
 - Do not execute node `commands` directly in `guided` mode.
+- In `hands-off` mode, run `approve <node_id>` for a high-risk node only after a person says yes.
 - Do not complete a node without running its verification check.
 - Never run `git reset --hard` or `git clean` without user approval.
 - Do not commit `.tutorial-dag.json`.

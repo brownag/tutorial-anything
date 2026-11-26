@@ -108,6 +108,35 @@ Root field `residue` (optional array) holds entries `{"node_id", "scopes", "undo
 - `validate` warns (not an error) when a node has non-`repo` side effects but no `undo`.
 - Schema 1.1 is written by `init`. Schema 1.0 documents remain valid.
 
+## Risk tiers and approval (C-G6)
+
+Node fields (both optional):
+
+| Field | Type | Notes |
+|---|---|---|
+| `risk` | string | `low`, `elevated`, or `high`. A declared value can raise a node's tier, never lower it. |
+| `approved` | object | `{"tier": tier, "at": iso8601}`, written by `approve <id>`. |
+
+Tiers are ordered `low < elevated < high`. The effective tier is the higher of the computed tier and `risk`.
+
+- Computed `low`: `side_effects` is `["repo"]` (or absent). Computed `elevated`: any of `user`, `system`, `remote`.
+- Computed `high`: any inspected command matches a HIGH pattern. Inspected commands are `commands`, `undo`, and a `verification.command` check. Each match adds its label:
+
+| Label | Matches |
+|---|---|
+| `sudo` | `sudo` as a word |
+| `pipe-to-shell` | `curl`/`wget` piped into `sh`/`bash`/`zsh` (optionally via `sudo`) |
+| `recursive-delete` | `rm -r…` targeting `/`, `~`, or `$HOME` |
+| `chmod-777` | `chmod 777` or `chmod -R 777` |
+| `system-path-write` | `>` or `tee` into `/etc`, `/usr`, `/opt`, `/boot`, or `/var` |
+| `mkfs` | `mkfs` |
+| `dd` | `dd if=` |
+
+- `approve <id>` records `approved` with the node's current effective tier. The approval covers the node while its effective tier is at or below the recorded tier. A later edit that raises the tier needs a new approval.
+- Gate: in `hands-off` mode only, `next` (explicit or implicit) refuses an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next` prints `risk: high (<labels>)`.
+- `status` shows a `RISK` column (`low`, `elev`, `HIGH`).
+- `validate` errors on an unknown `risk` value or a malformed `approved` object.
+
 ## Sample state file
 
 ```json
