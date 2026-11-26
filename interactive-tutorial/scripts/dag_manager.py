@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILENAME = ".tutorial-dag.json"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 MODES = ("guided", "assisted", "hands-off")
 PERSISTENCE_MODES = ("file", "in-context")
@@ -37,6 +37,8 @@ ACTION_TYPES = ("read-only", "instruct", "mutate", "execute")
 CHECKPOINTED_ACTIONS = ("mutate", "execute")
 STATUSES = ("pending", "completed", "skipped")
 VERIFICATION_TYPES = ("command", "file_exists", "file_contains", "confirm")
+SIDE_EFFECT_SCOPES = ("repo", "user", "system", "remote")
+RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
 GIT_ROLLBACK_MODES = ("none", "branch", "hard")
 DERIVED_ORDER = ("ACTIVE", "READY", "PENDING", "COMPLETED", "SKIPPED")
 
@@ -336,6 +338,9 @@ def validate_document(state: dict) -> tuple:
 
     problems.extend(validate_git_block(state.get("git")))
 
+    if "residue" in state:
+        problems.extend(validate_residue(state.get("residue")))
+
     nodes = state.get("nodes")
     if not isinstance(nodes, list):
         problems.append("root field 'nodes' must be an array")
@@ -393,6 +398,13 @@ def collect_warnings(state: dict) -> list:
         if node.get("action_type") == "mutate" and not node.get("artifacts"):
             warnings.append(
                 "node '{}' is a mutate node but lists no artifacts".format(nid)
+            )
+        scopes = [s for s in node.get("side_effects", []) if s != "repo"]
+        if isinstance(node.get("side_effects"), list) and scopes and not node.get("undo"):
+            warnings.append(
+                "node '{}' has {} side effects but no undo (rewinds cannot revert it)".format(
+                    nid, ", ".join(scopes)
+                )
             )
     return warnings
 
@@ -492,6 +504,69 @@ def validate_node(node, position: int, seen: dict) -> list:
 
     if "verification" in node:
         problems.extend(validate_verification(node["verification"], label))
+
+    if "side_effects" in node:
+        value = node.get("side_effects")
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(set(value)) != len(value)
+            or any(scope not in SIDE_EFFECT_SCOPES for scope in value)
+        ):
+            problems.append(
+                "{} field 'side_effects' must be a non-empty unique array of {}".format(
+                    label, list(SIDE_EFFECT_SCOPES)
+                )
+            )
+    if "undo" in node:
+        value = node.get("undo")
+        if not isinstance(value, list) or any(
+            not isinstance(cmd, str) or not cmd.strip() for cmd in value
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(label)
+            )
+    return problems
+
+
+def validate_residue(residue) -> list:
+    """Validate the root ``residue`` array (C-G2)."""
+    if not isinstance(residue, list):
+        return ["root field 'residue' must be an array"]
+    problems = []
+    for position, entry in enumerate(residue):
+        label = "residue[{}]".format(position)
+        if not isinstance(entry, dict):
+            problems.append("{} must be an object".format(label))
+            continue
+        node_id = entry.get("node_id")
+        if not isinstance(node_id, str) or not ID_RE.match(node_id):
+            problems.append("{} field 'node_id' must be a valid id".format(label))
+        scopes = entry.get("scopes")
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or any(scope not in SIDE_EFFECT_SCOPES for scope in scopes)
+        ):
+            problems.append(
+                "{} field 'scopes' must be an array of {}".format(label, list(SIDE_EFFECT_SCOPES))
+            )
+        undo = entry.get("undo")
+        if not isinstance(undo, list) or any(
+            not isinstance(cmd, str) or not cmd.strip() for cmd in undo
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(label)
+            )
+        if entry.get("reason") not in RESIDUE_REASONS:
+            problems.append(
+                "{} field 'reason' must be one of {}, got {!r}".format(
+                    label, list(RESIDUE_REASONS), entry.get("reason")
+                )
+            )
+        recorded = entry.get("recorded_at")
+        if not isinstance(recorded, str) or not recorded.strip():
+            problems.append("{} field 'recorded_at' must be a non-empty string".format(label))
     return problems
 
 

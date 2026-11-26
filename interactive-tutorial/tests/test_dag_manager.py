@@ -347,6 +347,93 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("validate", check=0)
         self.assertIn("decompose", output)
 
+    def _validate_edited(self, edit):
+        """Seed a valid DAG, let ``edit`` mutate it, and run validate."""
+        if not hasattr(self, "_base_state"):
+            self.seed_repo()
+            self._base_state = self.seed_state()
+        state = copy.deepcopy(self._base_state)
+        edit(state)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return self.cli("validate")
+
+    def test_validate_side_effects_shapes(self):
+        def node(value):
+            return lambda s: s["nodes"][0].__setitem__("side_effects", value)
+
+        code, _ = self._validate_edited(node(["repo", "user"]))
+        self.assertEqual(code, 0)
+        for bad in ([], ["repo", "repo"], ["cloud"], "user", [""]):
+            code, output = self._validate_edited(node(bad))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("side_effects", output)
+
+    def test_validate_undo_shapes(self):
+        def node(value):
+            return lambda s: s["nodes"][0].__setitem__("undo", value)
+
+        code, _ = self._validate_edited(node(["rm -f x"]))
+        self.assertEqual(code, 0)
+        for bad in ("rm -f x", [""], [3]):
+            code, output = self._validate_edited(node(bad))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("undo", output)
+
+    def test_validate_residue_shapes(self):
+        entry = {
+            "node_id": "1-a",
+            "scopes": ["user"],
+            "undo": ["rm -f x"],
+            "reason": "not-run",
+            "recorded_at": "2026-11-26T00:00:00+00:00",
+        }
+
+        def residue(value):
+            return lambda s: s.__setitem__("residue", value)
+
+        code, _ = self._validate_edited(residue([entry]))
+        self.assertEqual(code, 0)
+        bad_entries = [
+            dict(entry, reason="maybe"),
+            dict(entry, scopes=["cloud"]),
+            dict(entry, undo="rm -f x"),
+            {k: v for k, v in entry.items() if k != "node_id"},
+            dict(entry, recorded_at=None),
+        ]
+        for bad in bad_entries:
+            code, output = self._validate_edited(residue([bad]))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("residue", output)
+
+    def test_validate_warns_when_side_effects_have_no_undo(self):
+        def node(extra):
+            def edit(s):
+                s["nodes"][0]["side_effects"] = ["user", "system"]
+                s["nodes"][0].pop("undo", None)
+                s["nodes"][0].update(extra)
+            return edit
+
+        code, output = self._validate_edited(node({}))
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "has user, system side effects but no undo (rewinds cannot revert it)",
+            output,
+        )
+        code, output = self._validate_edited(node({"undo": ["rm -f x"]}))
+        self.assertEqual(code, 0)
+        self.assertNotIn("but no undo", output)
+
+    def test_schema_1_0_document_still_validates(self):
+        for version in ("1.0", "1.1"):
+            code, _ = self._validate_edited(
+                lambda s, v=version: s.__setitem__("schema_version", v)
+            )
+            self.assertEqual(code, 0, version)
+        code, _ = self._validate_edited(
+            lambda s: s.__setitem__("schema_version", "2.0")
+        )
+        self.assertEqual(code, 1)
+
     # -- next / status ----------------------------------------------------
 
     def test_next_walks_the_linear_core(self):
