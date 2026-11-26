@@ -1991,5 +1991,147 @@ class InitFromTest(unittest.TestCase):
             self.assertNotIn("deviations", node)
 
 
+class ScaffoldTest(unittest.TestCase):
+    """`scaffold <name> --from <dag.json>` packages a DAG as its own skill (C-G12)."""
+
+    TEMPLATE = (
+        "# {{name}}\n\n{{title}}\n\n{{description}}\n\nnodes: {{node_count}}\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scaffold-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.src_skill = self.tmp / "source-skill"
+        self.src_skill.mkdir()
+        for name in ("scripts", "references"):
+            shutil.copytree(str(SKILL_DIR / name), str(self.src_skill / name),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        (self.src_skill / "templates").mkdir()
+        (self.src_skill / "templates" / "SKILL.md.tmpl").write_text(
+            self.TEMPLATE, encoding="utf-8")
+        self.cli_path = self.src_skill / "scripts" / "dag_manager.py"
+        self.dest = self.tmp / "dest"
+        self.env = dict(os.environ)
+        self.env.update({"HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull})
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+
+    def run_cli(self, cli_path, cwd, *args):
+        proc = subprocess.run(
+            [sys.executable, str(cli_path)] + list(args), cwd=str(cwd), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        return proc.returncode, proc.stdout
+
+    def scaffold(self, name="demo", *extra, cli_path=None):
+        return self.run_cli(cli_path or self.cli_path, self.ws, "scaffold", name,
+                            "--from", str(EXAMPLE_DAG), "--dest", str(self.dest), *extra)
+
+    def leftovers(self):
+        if not self.dest.exists():
+            return []
+        return [p.name for p in self.dest.iterdir() if p.name.startswith(".")]
+
+    def test_bad_name_exits_2(self):
+        for bad in ("Bad Name", "../escape", "-lead"):
+            code, out = self.scaffold(bad)
+            self.assertEqual(code, 2, out)
+        self.assertFalse(self.dest.exists() and any(self.dest.iterdir()))
+
+    def test_existing_target_without_force_exits_1_and_is_untouched(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("mine", encoding="utf-8")
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 1, out)
+        self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_force_replaces_existing_target(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "stale.txt").write_text("old", encoding="utf-8")
+        code, out = self.scaffold("demo", "--force")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((target / "stale.txt").exists())
+        self.assertTrue((target / "SKILL.md").is_file())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_output_layout_and_stripped_dag(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        target = self.dest / "demo"
+        self.assertIn(str(target), out)
+        self.assertTrue((target / "scripts" / "dag_manager.py").is_file())
+        self.assertTrue((target / "references").is_dir())
+        self.assertFalse((target / "templates").exists())
+        self.assertFalse((target / "tests").exists())
+        self.assertFalse(list(target.rglob("__pycache__")))
+        doc = json.loads((target / "dag.json").read_text(encoding="utf-8"))
+        for key in ("git", "services", "residue", "preflight", "active_node_id"):
+            self.assertNotIn(key, doc)
+        self.assertTrue(doc["nodes"])
+        for node in doc["nodes"]:
+            self.assertEqual(node["status"], "pending")
+            self.assertIsNone(node["commit_sha"])
+
+    def test_rendered_skill_md(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        text = (self.dest / "demo" / "SKILL.md").read_text(encoding="utf-8")
+        doc = json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+        title = doc["title"]
+        self.assertIn("demo", text)
+        self.assertIn(title, text)
+        self.assertIn("Run the {} tutorial step by step with checks and rewinds. "
+                      "Use when the user wants to work through {}.".format(title, title), text)
+        self.assertIn("nodes: {}".format(len(doc["nodes"])), text)
+        self.assertNotIn("{{", text)
+
+    def test_invalid_source_exits_1_and_writes_nothing(self):
+        bad = self.tmp / "bad.json"
+        doc = json.loads(EXAMPLE_DAG.read_text(encoding="utf-8"))
+        doc["schema_version"] = "9.9"
+        bad.write_text(json.dumps(doc), encoding="utf-8")
+        proc_args = ["scaffold", "demo", "--from", str(bad), "--dest", str(self.dest)]
+        code, out = self.run_cli(self.cli_path, self.ws, *proc_args)
+        self.assertEqual(code, 1, out)
+        self.assertFalse((self.dest / "demo").exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_generated_skill_runs_init_and_status(self):
+        code, out = self.scaffold("demo")
+        self.assertEqual(code, 0, out)
+        gen_cli = self.dest / "demo" / "scripts" / "dag_manager.py"
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        git_env = dict(self.env)
+        git_env.update({"GIT_AUTHOR_NAME": "Tutorial Test",
+                        "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                        "GIT_COMMITTER_NAME": "Tutorial Test",
+                        "GIT_COMMITTER_EMAIL": "tutorial@example.invalid"})
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(repo), env=git_env,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        code, out = self.run_cli(gen_cli, repo, "init", "--from",
+                                 str(self.dest / "demo" / "dag.json"))
+        self.assertEqual(code, 0, out)
+        code, out = self.run_cli(gen_cli, repo, "status")
+        self.assertEqual(code, 0, out)
+        state = json.loads((repo / ".tutorial-dag.json").read_text(encoding="utf-8"))
+        self.assertTrue(state["nodes"])
+        for node in state["nodes"]:
+            self.assertEqual(node["status"], "pending")
+
+    def test_missing_template_exits_1_with_message(self):
+        shutil.rmtree(str(self.src_skill / "templates"))
+        code, out = self.scaffold("demo", cli_path=self.cli_path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("scaffold needs templates/SKILL.md.tmpl (run it from the source skill)",
+                      out)
+        self.assertFalse((self.dest / "demo").exists())
+        self.assertEqual(self.leftovers(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

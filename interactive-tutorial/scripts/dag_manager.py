@@ -1950,6 +1950,86 @@ def cmd_draft(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+SCAFFOLD_TEMPLATE = Path("templates") / "SKILL.md.tmpl"
+SCAFFOLD_DESCRIPTION = (
+    "Run the {title} tutorial step by step with checks and rewinds. "
+    "Use when the user wants to work through {title}."
+)
+
+
+def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
+    """Package a validated DAG as its own skill directory (C-G12)."""
+    name = args.name
+    if not ID_RE.match(name):
+        raise CliError(
+            "skill name {!r} must match {}".format(name, ID_RE.pattern), EXIT_USAGE
+        )
+    source_path = Path(args.from_path)
+    if not source_path.is_absolute():
+        source_path = workspace / source_path
+    stripped = strip_progress(load_init_source(source_path))
+
+    placeholder_git = {
+        "branch": "",
+        "initial_commit_sha": "",
+        "initial_dirty": False,
+        "exclude_configured": True,
+    }
+    problems, _ = validate_document(dict(stripped, git=placeholder_git))
+    if problems:
+        for problem in problems:
+            err(problem)
+        raise CliError(
+            "{} problem(s) in --from file {}; nothing written".format(
+                len(problems), args.from_path
+            )
+        )
+
+    template = SKILL_ROOT / SCAFFOLD_TEMPLATE
+    if not template.is_file():
+        raise CliError(
+            "scaffold needs {} (run it from the source skill)".format(SCAFFOLD_TEMPLATE.as_posix())
+        )
+
+    dest = Path(args.dest) if args.dest else workspace / ".agents" / "skills"
+    if not dest.is_absolute():
+        dest = workspace / dest
+    target = dest / name
+    if target.exists() and not args.force:
+        raise CliError(
+            "{} already exists; pass --force to replace it".format(target)
+        )
+
+    dest.mkdir(parents=True, exist_ok=True)
+    build = Path(tempfile.mkdtemp(prefix=".{}.tmp-".format(name), dir=str(dest)))
+    try:
+        for folder in ("scripts", "references"):
+            shutil.copytree(str(SKILL_ROOT / folder), str(build / folder),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        (build / "dag.json").write_text(
+            json.dumps(stripped, indent=2) + "\n", encoding="utf-8"
+        )
+        title = stripped["title"]
+        text = template.read_text(encoding="utf-8")
+        for key, value in (
+            ("{{name}}", name),
+            ("{{title}}", title),
+            ("{{description}}", SCAFFOLD_DESCRIPTION.format(title=title)),
+            ("{{node_count}}", str(len(stripped.get("nodes") or []))),
+        ):
+            text = text.replace(key, value)
+        (build / "SKILL.md").write_text(text, encoding="utf-8")
+        if target.exists():
+            shutil.rmtree(str(target))
+        os.rename(str(build), str(target))
+    except BaseException:
+        shutil.rmtree(str(build), ignore_errors=True)
+        raise
+    say(str(target))
+    return EXIT_OK
+
+
 def cmd_validate(args, state_path: Path, workspace: Path) -> int:
     """Report document, id-integrity, and cycle problems."""
     state = load_state(state_path)
@@ -2951,6 +3031,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--force", action="store_true", help="overwrite an existing state file")
     init.set_defaults(func=cmd_init)
+
+    scaffold = sub.add_parser("scaffold", help="package a DAG as its own skill directory")
+    scaffold.add_argument("name", help="skill name (lowercase, digits, dot, dash, underscore)")
+    scaffold.add_argument("--from", dest="from_path", metavar="DAG_JSON", required=True,
+                          help="prebuilt DAG to package; progress is stripped")
+    scaffold.add_argument("--dest", default=None,
+                          help="parent directory (default: .agents/skills under the workspace)")
+    scaffold.add_argument("--force", action="store_true", help="replace an existing skill directory")
+    scaffold.set_defaults(func=cmd_scaffold)
 
     draft = sub.add_parser("draft", help="print skeleton nodes from a Markdown tutorial as JSON")
     draft.add_argument("path", help="Markdown tutorial to read")
