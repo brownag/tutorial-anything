@@ -429,7 +429,6 @@ class GapTest(unittest.TestCase):
         self.assertIn("looks interactive", proc.stdout + proc.stderr)
         self.assertIn("npm init", nodes["c-npm-init"]["commands"][0])
 
-    @unittest.expectedFailure
     def test_g4_doctor(self):
         """Gap G4: root requires, doctor, and first-next preflight."""
         _, dag = load_case_from("container", "future-g4.json")

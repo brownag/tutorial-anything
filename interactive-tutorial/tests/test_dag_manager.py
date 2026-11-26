@@ -1131,6 +1131,52 @@ class InteractiveStepsTest(unittest.TestCase):
         self.assertIn("timed out after 1s", "\n".join(lines))
 
 
+class PreflightTest(unittest.TestCase):
+    """Version parsing, comparison, overrides, and OS checks for doctor (C-G4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def test_version_is_the_first_dotted_number_in_the_output(self):
+        match = self.dm.VERSION_FIND_RE.search("Docker version 24.0.7, build afdd53b")
+        self.assertEqual("24.0.7", match.group(0))
+        self.assertEqual((24, 0, 7), self.dm.version_tuple("24.0.7"))
+        self.assertEqual((3, 0, 0), self.dm.version_tuple("3"))
+
+    def test_comparison_pads_short_versions(self):
+        ok = self.dm.check_tool("py-ok", {"min": "3.0", "version_command": "echo 'v3.0.0'"})
+        self.assertEqual("ok", ok["status"])
+        old = self.dm.check_tool("py-old", {"min": "3.11", "version_command": "echo 'v3.10.9'"})
+        self.assertEqual("too-old", old["status"])
+
+    def test_version_command_override_is_used(self):
+        row = self.dm.check_tool(
+            "anything", {"min": "2.0", "version_command": "echo 'tool 2.4.1'"}
+        )
+        self.assertEqual(("ok", "2.4.1"), (row["status"], row["found"]))
+
+    def test_star_passes_a_tool_that_runs_even_without_a_version(self):
+        row = self.dm.check_tool("zz-missing-tool-9", "*")
+        self.assertEqual("missing", row["status"])
+        self.assertFalse(row["ok"])
+        row = self.dm.check_tool("quiet", {"min": "1.0", "version_command": "true"})
+        self.assertEqual("unknown-version", row["status"])
+        self.assertFalse(row["ok"])
+
+    def test_os_mismatch_fails_the_run(self):
+        passed, rows, missing = self.dm.run_checks({"os": ["plan9"]})
+        self.assertFalse(passed)
+        self.assertEqual([], missing)
+        self.assertEqual("mismatch", rows[-1]["status"])
+
+    def test_validate_tool_spec_shapes(self):
+        for good in ("*", ">=3", ">=3.0.1", {"min": "1.2"}, {"min": "1", "version_command": "x"}):
+            self.assertEqual([], self.dm.validate_tool_spec(good, "t"), good)
+        for bad in ("3.0", ">3", {"min": "x"}, {"max": "1"}, 7):
+            self.assertTrue(self.dm.validate_tool_spec(bad, "t"), bad)
+
+
 class VerificationTypesTest(unittest.TestCase):
     """http and port_listening checks against loopback services (C-G3)."""
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -61,6 +62,12 @@ SERVICE_POLL = 0.5
 SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
 SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
 INTERACTIVE_FIELDS = ("answers", "human")
+PREFLIGHT_OS = ("linux", "darwin", "windows")
+REQUIRES_FIELDS = ("tools", "os")
+TOOL_SPEC_FIELDS = ("min", "version_command")
+VERSION_SPEC_RE = re.compile(r"^\d+(?:\.\d+){0,2}$")
+VERSION_FIND_RE = re.compile(r"\d+(?:\.\d+)+")
+DOCTOR_TIMEOUT = 10
 INTERACTIVE_PATTERNS = (
     re.compile(r"^\s*(npm|yarn|pnpm) init\b(?!.*(-y|--yes))"),
     re.compile(r"\bnpx create-\S+(?!.*(--yes|-y))"),
@@ -387,6 +394,10 @@ def validate_document(state: dict) -> tuple:
         problems.extend(validate_residue(state.get("residue")))
     if "services" in state:
         problems.extend(validate_services(state.get("services")))
+    if "requires" in state:
+        problems.extend(validate_requires(state.get("requires")))
+    if "preflight" in state:
+        problems.extend(validate_preflight(state.get("preflight")))
 
     nodes = state.get("nodes")
     if not isinstance(nodes, list):
@@ -792,6 +803,198 @@ def interactive_hints(node: dict) -> list:
     if block.get("human"):
         lines.append("a person must run this step (interactive)")
     return lines
+
+
+def validate_requires(requires) -> list:
+    """Validate the root ``requires`` block: tools and OS preconditions (C-G4)."""
+    if not isinstance(requires, dict):
+        return ["root field 'requires' must be an object"]
+    problems = []
+    for field in requires:
+        if field not in REQUIRES_FIELDS:
+            problems.append("requires does not accept {!r}".format(field))
+    tools = requires.get("tools", {})
+    if not isinstance(tools, dict):
+        problems.append("requires.tools must be an object of name -> version spec")
+        tools = {}
+    for name, spec in tools.items():
+        if not re.match(r"^[A-Za-z0-9._+-]+$", name):
+            problems.append("requires.tools name {!r} is not a plain command name".format(name))
+        problems.extend(validate_tool_spec(spec, name))
+    if "os" in requires:
+        value = requires["os"]
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(set(value)) != len(value)
+            or any(item not in PREFLIGHT_OS for item in value)
+        ):
+            problems.append("requires.os must be a unique array of {}".format(list(PREFLIGHT_OS)))
+    return problems
+
+
+def validate_tool_spec(spec, name: str) -> list:
+    """A spec is ``"*"``, ``">=X[.Y[.Z]]"``, or ``{"min": "X.Y", "version_command": str}``."""
+    label = "requires.tools[{!r}]".format(name)
+    if isinstance(spec, str):
+        if spec == "*" or re.match(r"^>=\d+(?:\.\d+){0,2}$", spec):
+            return []
+        return ["{} must be \"*\", \">=X[.Y[.Z]]\", or an object, got {!r}".format(label, spec)]
+    if isinstance(spec, dict):
+        problems = []
+        for field in spec:
+            if field not in TOOL_SPEC_FIELDS:
+                problems.append("{} does not accept {!r}".format(label, field))
+        if not isinstance(spec.get("min"), str) or not VERSION_SPEC_RE.match(spec.get("min")):
+            problems.append("{} needs 'min' as X[.Y[.Z]]".format(label))
+        command = spec.get("version_command")
+        if "version_command" in spec and (not isinstance(command, str) or not command.strip()):
+            problems.append("{} version_command must be a non-empty string".format(label))
+        return problems
+    return ["{} must be a string or an object".format(label)]
+
+
+def validate_preflight(record) -> list:
+    """The root ``preflight`` record written by ``doctor`` (C-G4)."""
+    if not isinstance(record, dict):
+        return ["root field 'preflight' must be an object"]
+    problems = []
+    if not isinstance(record.get("passed"), bool):
+        problems.append("preflight.passed must be a boolean")
+    if not isinstance(record.get("at"), str):
+        problems.append("preflight.at must be a timestamp string")
+    missing = record.get("missing")
+    if not isinstance(missing, list) or any(not isinstance(item, str) for item in missing):
+        problems.append("preflight.missing must be an array of strings")
+    return problems
+
+
+def version_tuple(text: str) -> tuple:
+    """'24.0.7' -> (24, 0, 7), padded to three parts for comparison."""
+    parts = tuple(int(piece) for piece in text.split("."))
+    return parts + (0,) * (3 - len(parts))
+
+
+def spec_parts(spec) -> tuple:
+    """(minimum tuple or None, version command or None) for a validated spec."""
+    if spec == "*":
+        return None, None
+    if isinstance(spec, str):
+        return version_tuple(spec[2:]), None
+    return version_tuple(spec["min"]), spec.get("version_command")
+
+
+def probe_tool(name: str, command) -> tuple:
+    """Run the version command. Returns (kind, text): kind is missing, found, or unknown."""
+    shell_command = command or "{} --version".format(shlex.quote(name))
+    try:
+        proc = subprocess.run(
+            shell_command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=DOCTOR_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "timed out"
+    except OSError:
+        return "missing", ""
+    if proc.returncode == 127:
+        return "missing", ""
+    match = VERSION_FIND_RE.search(proc.stdout or "")
+    if match:
+        return "found", match.group(0)
+    return "unknown", ""
+
+
+def check_tool(name: str, spec) -> dict:
+    """One ``doctor`` row for a tool (C-G4)."""
+    minimum, command = spec_parts(spec)
+    need = spec if isinstance(spec, str) else "min {}".format(spec["min"])
+    kind, text = probe_tool(name, command)
+    row = {"name": name, "found": text or "-", "need": need}
+    if kind == "missing":
+        row.update(status="missing", ok=False)
+    elif minimum is None:
+        # "*" accepts any tool that runs, even when its version cannot be read.
+        row.update(status="ok" if kind == "found" else "unknown-version", ok=True)
+    elif kind != "found":
+        row.update(status="unknown-version", ok=False)
+    elif version_tuple(text) < minimum:
+        row.update(status="too-old", ok=False)
+    else:
+        row.update(status="ok", ok=True)
+    return row
+
+
+def run_checks(requires: dict) -> tuple:
+    """Check every declared tool and the OS. Returns (passed, rows, missing names)."""
+    rows = [check_tool(name, spec) for name, spec in (requires.get("tools") or {}).items()]
+    missing = [row["name"] for row in rows if not row["ok"]]
+    passed = not missing
+    if "os" in requires:
+        current = platform.system().lower()
+        ok = current in requires["os"]
+        rows.append({
+            "name": "os",
+            "status": "ok" if ok else "mismatch",
+            "found": current,
+            "need": ", ".join(requires["os"]),
+            "ok": ok,
+        })
+        passed = passed and ok
+    return passed, rows, missing
+
+
+def format_check(row: dict) -> str:
+    return "{:<16} {:<22} {} (need {})".format(row["status"], row["name"], row["found"], row["need"])
+
+
+def cmd_doctor(args, state_path: Path, workspace: Path) -> int:
+    """Check declared tools and OS; record the result as ``preflight`` (C-G4)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    if "requires" not in state:
+        say("no requires block; nothing to check")
+        return EXIT_OK
+    passed, rows, missing = run_checks(state["requires"])
+    state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
+    save_state(state_path, state)
+    if args.json:
+        say(json.dumps({"passed": passed, "checks": rows}, indent=2))
+    else:
+        for row in rows:
+            say(format_check(row))
+        say("preflight passed" if passed else "preflight failed: {}".format(
+            ", ".join(missing) or "os mismatch"))
+    return EXIT_OK if passed else EXIT_FAIL
+
+
+def preflight_gate(state: dict, state_path: Path, skip: bool) -> None:
+    """Run doctor before the first node when the DAG declares ``requires`` (C-G4)."""
+    if skip or "requires" not in state:
+        return
+    if any(node.get("status") in ("completed", "skipped") for node in state.get("nodes") or []):
+        return
+    if (state.get("preflight") or {}).get("passed") is True:
+        return
+    passed, rows, missing = run_checks(state["requires"])
+    state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
+    save_state(state_path, state)
+    if passed:
+        return
+    failing = ", ".join(missing) or "os mismatch"
+    raise CliError(
+        "preflight failed ({}): run doctor, or pass --skip-doctor to continue anyway".format(
+            failing
+        )
+    )
 
 
 def validate_verification(verification, label: str) -> list:
@@ -1541,6 +1744,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
         for problem in problems:
             err(problem)
         return EXIT_FAIL
+    preflight_gate(state, state_path, getattr(args, "skip_doctor", False))
 
     if args.node_id:
         node = get_node(state, args.node_id)
@@ -2235,7 +2439,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     nxt = sub.add_parser("next", help="advance the active pointer")
     nxt.add_argument("node_id", nargs="?", default=None, help="ready node to activate")
+    nxt.add_argument(
+        "--skip-doctor",
+        action="store_true",
+        help="continue past a failed preflight (requires block) without running doctor",
+    )
     nxt.set_defaults(func=cmd_next)
+
+    doctor = sub.add_parser("doctor", help="check the tools and OS declared in requires")
+    doctor.add_argument("--json", action="store_true", help="print the checks as JSON")
+    doctor.set_defaults(func=cmd_doctor)
 
     verify = sub.add_parser("verify", help="run a node's verification gate")
     verify.add_argument("node_id", nargs="?", default=None)
