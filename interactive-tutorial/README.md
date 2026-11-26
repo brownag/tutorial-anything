@@ -53,7 +53,8 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `next [<id>]` | Activate the next ready node, or pick a specific ready node | 1 if multiple nodes are ready or current node is incomplete |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
 | `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure, missing dependencies, or empty commit |
-| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force]` | Move active pointer, fast-forward, or rollback workspace | 1 if prerequisites are incomplete or rollback is unsafe |
+| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
+| `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 
 `verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
 

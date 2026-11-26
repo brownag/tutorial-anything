@@ -85,6 +85,13 @@
         "$ref": "#/$defs/node"
       },
       "description": "An empty array is legal only between `init` and decomposition; validate warns about it."
+    },
+    "residue": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/residueEntry"
+      },
+      "description": "Side effects that `jump --undo` could not revert. Cleared with `residue clear`."
     }
   },
   "$defs": {
@@ -96,6 +103,37 @@
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]*$",
       "maxLength": 64
+    },
+    "residueEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "scopes", "undo", "reason", "recorded_at"],
+      "properties": {
+        "node_id": {
+          "$ref": "#/$defs/nodeId"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["repo", "user", "system", "remote"]
+          }
+        },
+        "undo": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["not-run", "failed", "irreversible", "remote"]
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
     },
     "shortCommit": {
       "type": ["string", "null"],
@@ -165,6 +203,24 @@
         },
         "verification": {
           "$ref": "#/$defs/verification"
+        },
+        "side_effects": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["repo", "user", "system", "remote"]
+          },
+          "description": "Scopes the node touches. Absent means [\"repo\"]."
+        },
+        "undo": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Commands that revert the node's non-repo side effects, run by `jump --undo`."
         }
       }
     },

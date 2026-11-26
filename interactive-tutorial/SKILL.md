@@ -77,10 +77,10 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" status
 ```
 
 ```text
-[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render]
+[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1]
 ```
 
-This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. Use `--json` when you need full raw state.
+This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. Use `--json` when you need full raw state.
 
 ## Step 4 — Execution loop
 
@@ -120,10 +120,14 @@ Only use `--skip-ancestors` if prerequisite steps are already satisfied in the e
 | Review earlier step | `jump <target>` | Moves active pointer. Working files remain unchanged. |
 | Redo step from clean state | `jump <target> --reset-descendants --git-rollback hard` | Runs `git reset --hard` to target checkpoint. Resets downstream nodes to `pending`. |
 | Branch to test an alternative | `jump <target> --reset-descendants --git-rollback branch [--new-branch tutorial/alt]` | Creates a new branch at target checkpoint. Keeps current work intact. |
+| Redo and revert non-repo side effects | `jump <target> --reset-descendants --git-rollback hard --force --undo` | Resets as above, then runs each rewound node's `undo` commands. Failures and unrevertable nodes become `residue`. |
 
 - Rollback targets the nearest completed parent commit.
 - `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
 - Confirm with the user before rolling back completed `mutate` or `execute` nodes.
+- `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed as `side effects: <id> [<scopes>] undo: <cmd> | irreversible` and recorded as `residue`.
+- Confirm with the user before `--undo` on `system` scope.
+- `residue clear [<node_id> | --all]` removes residue entries once they are handled.
 
 ## In-context persistence
 

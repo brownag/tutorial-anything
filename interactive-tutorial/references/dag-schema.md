@@ -89,6 +89,25 @@ Computed on every read and never stored:
 
 Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option.
 
+## Side effects, undo, and residue (schema 1.1)
+
+Node fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `side_effects` | array | Non-empty unique subset of `repo`, `user`, `system`, `remote`. Absent means `["repo"]`. |
+| `undo` | array of strings | Commands that revert the node's non-repo effects. Each must be non-empty. |
+
+Root field `residue` (optional array) holds entries `{"node_id", "scopes", "undo", "reason", "recorded_at"}`. `reason` is `not-run`, `failed`, `irreversible`, or `remote`.
+
+- `jump <id> --reset-descendants` lists each rewound node (status `completed` to `pending`) that has non-`repo` scopes, newest first: `side effects: <id> [<scopes>] undo: <cmd; …> | irreversible`.
+- `jump --undo` (requires `--reset-descendants`) runs each listed node's `undo` commands, newest node first, when its scopes minus `repo` are within `user` and `system`. Nodes with `remote` become `remote` residue and are not undone. Nodes with no `undo` become `irreversible`. On the first failure, that node and the remaining listed nodes become residue (`failed`, then `not-run`) and the command exits 1.
+- Without `--undo`, every listed node becomes `not-run` residue and the command exits 0.
+- `residue clear [<node_id> | --all]` removes entries.
+- `status` lists residue entries. The header appends ` | residue: N` inside the closing `]` when N > 0.
+- `validate` warns (not an error) when a node has non-`repo` side effects but no `undo`.
+- Schema 1.1 is written by `init`. Schema 1.0 documents remain valid.
+
 ## Sample state file
 
 ```json
