@@ -50,10 +50,16 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `init --title T --source S [--mode M] [--persistence P] [--git-branch B] [--force]` | Create the state file, add exclude entry, record branch, HEAD commit, and dirty status | 1 if file exists without `--force` |
 | `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
 | `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
-| `next [<id>]` | Activate the next ready node, or pick a specific ready node | 1 if multiple nodes are ready or current node is incomplete |
+| `next [<id>] [--skip-doctor]` | Activate the next ready node, or pick a specific ready node. When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, the current node is incomplete, or the preflight failed |
+| `doctor [--json]` | Check the tools and OS declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
 | `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure, missing dependencies, or empty commit |
-| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force]` | Move active pointer, fast-forward, or rollback workspace | 1 if prerequisites are incomplete or rollback is unsafe |
+| `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
+| `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
+| `approve <id>` | Record a person's approval of a node's current risk tier; clears the `hands-off` gate for that node while its tier does not rise | 1 if the state is invalid |
+| `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
+| `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
+| `teardown` | Stop every recorded service | 0 |
 
 `verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
 
@@ -90,6 +96,10 @@ Persistence modes:
 | No ancestor checkpoint exists | Git repository had no commits at `init`. Commit current state first, or use `--git-rollback none`. |
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
 | `confirm` check fails with no output | Needs `--yes` flag to confirm human approval. |
+| A command check hangs or reads nothing | Command checks no longer inherit the CLI's stdin. Their stdin is `/dev/null` unless the check sets `"stdin"`, so prompts see EOF. Add `"stdin": "answer\n"` to feed input, and `"timeout"` (seconds) to bound the run. |
+| `command looks interactive` warning | The command may wait for input. Add `"interactive": {"answers": [...]}`, or `"human": true` for a step a person must run, or use the non-interactive flag (for example `npm init -y`). |
+| `services require a POSIX system` | `service` commands are POSIX only. Run the service step on Linux or macOS. |
+| `service start` fails with `ready check did not pass` | The printed log tail shows why. Raise `ready_timeout` if the server is slow to start. |
 
 ## Development
 
@@ -97,9 +107,12 @@ Persistence modes:
 make lint               # compile checks
 make validate-examples  # test sample DAG
 make test               # run test suite
+make test-corpus        # run corpus fixture tests
 ```
 
 Tests run in temporary Git repositories. They isolate global Git configurations.
+
+Corpus: `make test-corpus` runs `tests/test_corpus.py` against the fixtures in `tests/corpus/`, one directory per tutorial scenario. `make test` excludes these tests (`test_dag*.py` only), and `make all` runs both.
 
 ## License
 

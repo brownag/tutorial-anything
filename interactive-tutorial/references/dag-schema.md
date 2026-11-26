@@ -89,6 +89,54 @@ Computed on every read and never stored:
 
 Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option.
 
+## Side effects, undo, and residue (schema 1.1)
+
+Node fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `side_effects` | array | Non-empty unique subset of `repo`, `user`, `system`, `remote`. Absent means `["repo"]`. |
+| `undo` | array of strings | Commands that revert the node's non-repo effects. Each must be non-empty. |
+
+Root field `residue` (optional array) holds entries `{"node_id", "scopes", "undo", "reason", "recorded_at"}`. `reason` is `not-run`, `failed`, `irreversible`, or `remote`.
+
+- `jump <id> --reset-descendants` lists each rewound node (status `completed` to `pending`) that has non-`repo` scopes, newest first: `side effects: <id> [<scopes>] undo: <cmd; …> | irreversible`.
+- `jump --undo` (requires `--reset-descendants`) runs each listed node's `undo` commands, newest node first, when its scopes minus `repo` are within `user` and `system`. Nodes with `remote` become `remote` residue and are not undone. Nodes with no `undo` become `irreversible`. On the first failure, that node and the remaining listed nodes become residue (`failed`, then `not-run`) and the command exits 1.
+- Without `--undo`, every listed node becomes `not-run` residue and the command exits 0.
+- `residue clear [<node_id> | --all]` removes entries.
+- `status` lists residue entries. The header appends ` | residue: N` inside the closing `]` when N > 0.
+- `validate` warns (not an error) when a node has non-`repo` side effects but no `undo`.
+- Schema 1.1 is written by `init`. Schema 1.0 documents remain valid.
+
+## Risk tiers and approval (C-G6)
+
+Node fields (both optional):
+
+| Field | Type | Notes |
+|---|---|---|
+| `risk` | string | `low`, `elevated`, or `high`. A declared value can raise a node's tier, never lower it. |
+| `approved` | object | `{"tier": tier, "at": iso8601}`, written by `approve <id>`. |
+
+Tiers are ordered `low < elevated < high`. The effective tier is the higher of the computed tier and `risk`.
+
+- Computed `low`: `side_effects` is `["repo"]` (or absent). Computed `elevated`: any of `user`, `system`, `remote`.
+- Computed `high`: any inspected command matches a HIGH pattern. Inspected commands are `commands`, `undo`, and a `verification.command` check. Each match adds its label:
+
+| Label | Matches |
+|---|---|
+| `sudo` | `sudo` as a word |
+| `pipe-to-shell` | `curl`/`wget` piped into `sh`/`bash`/`zsh` (optionally via `sudo`) |
+| `recursive-delete` | `rm -r…` targeting `/`, `~`, or `$HOME` |
+| `chmod-777` | `chmod 777` or `chmod -R 777` |
+| `system-path-write` | `>` or `tee` into `/etc`, `/usr`, `/opt`, `/boot`, or `/var` |
+| `mkfs` | `mkfs` |
+| `dd` | `dd if=` |
+
+- `approve <id>` records `approved` with the node's current effective tier. The approval covers the node while its effective tier is at or below the recorded tier. A later edit that raises the tier needs a new approval.
+- Gate: in `hands-off` mode only, `next` (explicit or implicit) refuses an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next` prints `risk: high (<labels>)`.
+- `status` shows a `RISK` column (`low`, `elev`, `HIGH`).
+- `validate` errors on an unknown `risk` value or a malformed `approved` object.
+
 ## Sample state file
 
 ```json
@@ -173,3 +221,53 @@ Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rol
 ```
 
 This graph uses a diamond pattern (`1 → 2 → {3a, 3b} → 4`). Steps `3a` and `3b` are sibling nodes that depend on `2`. Both must complete before step `4`.
+
+## Background services and http/port checks (C-G3)
+
+Verification types `http` and `port_listening` can gate any node.
+
+| Type | Fields | Passes when |
+|---|---|---|
+| `http` | `url` (`http://` or `https://`), `expect_status` (default 200), `pattern` (optional regex on the body), `timeout` (seconds, default 5) | The response status equals `expect_status`, and the body matches `pattern` if given. Proxies are ignored. |
+| `port_listening` | `port` (integer 1-65535), `host` (default `127.0.0.1`), `timeout` (seconds, default 2) | A TCP connection to `host:port` is accepted. |
+
+Node field `service` (optional) declares a background process the CLI starts and stops:
+
+| Field | Type | Notes |
+|---|---|---|
+| `command` | string | Run through the shell in the workspace. |
+| `ready` | verification | Any type except `confirm`. Polled until it passes. |
+| `ready_timeout` | integer | Seconds to wait for `ready`. Default 30. |
+| `stop_signal` | `TERM` \| `INT` \| `KILL` | Sent first on stop. Default `TERM`. |
+
+Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "log", "started_at"}`. Logs go to `.tutorial-logs/<id>.log`.
+
+- `service start [<id>]` (default: the active node) starts the command detached in its own process group with stdin from `/dev/null` and output to the log. It polls `ready` until it passes or `ready_timeout` elapses. On failure it stops the process, drops the record, prints the log tail, and exits 1. It refuses if the recorded process is still alive.
+- `service stop [<id>]` signals the process group, waits up to 5 seconds, then sends `KILL`. An already-dead process is not an error.
+- `teardown` stops every recorded service. Run it at the end of a session.
+- `jump <id> --reset-descendants` stops the services of every node it resets, including the target when it is reset.
+- `status` lists `services: <id> (pid N, running|dead)`. The header appends ` | svc: N` when N > 0.
+- `service` commands are POSIX only. Elsewhere they exit 2 with `services require a POSIX system`.
+- `service.command` counts as an inspected command for risk tiers (C-G6).
+- The CLI adds `.tutorial-logs/` to `.git/info/exclude`. It never edits a learner's `.gitignore`.
+
+## Interactive steps and command-check stdin (C-G11)
+
+- A `command` check accepts two new keys. `stdin` is text fed to the command's standard input. `timeout` is seconds (default 600). Without `stdin`, the command runs with `/dev/null` as stdin, so it reads EOF instead of inheriting the CLI's stdin. This is a behavior change from earlier versions.
+- Node `interactive` (optional): `{"answers": [str…], "human": bool}`.
+  - `answers` prints a hint on `next` and `status`: `feed answers: printf '%s\n' <quoted answers> | <command>`.
+  - `human: true` prints `a person must run this step (interactive)`. `validate` warns when `human` is true and the verification is not `confirm`.
+- `validate` warns `node '<id>' command looks interactive: <cmd>` when a command matches a known interactive pattern (`npm init` without `-y`, an unflagged `npx create-*`, `vim`/`nano`, a bare REPL such as `python3`, `git rebase -i`, `ssh-keygen` without `-N`, `passwd`, `read`). The warning does not fire when the node has an `interactive` block.
+
+## Preflight: requires and doctor (C-G4)
+
+Root field `requires` (optional) declares what the workspace must provide:
+
+- `tools`: object of command name to spec. A spec is `"*"` (any version, or none if the tool runs), `">=X[.Y[.Z]]"`, or `{"min": "X.Y", "version_command": "<shell command>"}`. The default version command is `<name> --version`. The version is the first dotted number in its stdout or stderr. Versions compare as tuples, padded to three parts.
+- `os` (optional): a unique array of `linux`, `darwin`, `windows`.
+
+Root field `preflight` (optional) holds `{"passed", "at", "missing"}`, written by `doctor` and by the first `next`.
+
+- `doctor [--json]` prints one row per tool: `ok`, `missing`, `too-old`, or `unknown-version`, then `name`, the found version, and `(need <spec>)`. It also prints an `os` row. It exits 0 when every check passes, otherwise 1. Each command times out after 10 seconds.
+- `unknown-version` passes only for the `"*"` spec.
+- `next` runs the check first when `requires` exists, no node is completed or skipped, and `preflight.passed` is not true. On failure it exits 1 with `run doctor, or pass --skip-doctor`. `next --skip-doctor` bypasses the check.

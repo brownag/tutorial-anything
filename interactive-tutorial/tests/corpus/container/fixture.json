@@ -1,0 +1,7 @@
+{
+  "domain": "container",
+  "runnable": false,
+  "reason": "needs docker/sudo; validate-only",
+  "expect_fail_at": null,
+  "gaps": {"G6": "future-g6.json", "G4": "future-g4.json"}
+}

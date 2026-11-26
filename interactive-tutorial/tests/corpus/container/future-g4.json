@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "title": "Build and run a greeting container",
+  "source_doc": "tests/corpus/container/tutorial.md",
+  "mode": "guided",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-11-25T09:00:00Z",
+  "updated_at": "2026-11-25T09:00:00Z",
+  "git": {
+    "branch": "tutorial/container",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "requires": {
+    "tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"}
+  },
+  "nodes": [
+    {
+      "id": "write-dockerfile",
+      "title": "Write the Dockerfile",
+      "summary": "Create a Dockerfile that prints hello.",
+      "dependencies": [],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["Dockerfile"],
+      "commands": ["echo 'FROM alpine' > Dockerfile"],
+      "verification": {"type": "file_exists", "path": "Dockerfile"}
+    },
+    {
+      "id": "build-image",
+      "title": "Build the image",
+      "summary": "Build greet:latest from the Dockerfile.",
+      "dependencies": ["write-dockerfile"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["docker build -t greet:latest ."],
+      "verification": {"type": "confirm", "prompt": "Confirm the build finished."}
+    }
+  ]
+}

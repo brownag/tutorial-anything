@@ -24,7 +24,7 @@ This repository is a container for the skill. Source files live in `interactive-
 ├── Makefile                                  forwards to the skill
 ├── README.md                                 you are here
 ├── LICENSE                                   MIT, Andrew Gene Brown 2026
-├── TODO.md                                   development plan
+├── planning/                                 local-only notes (git-ignored)
 ├── .github/workflows/ci.yml                  CI workflow (lint, examples, tests)
 ├── planning/INITIAL_PROMPT.md                original specification
 ├── interactive-tutorial/                     skill source directory
@@ -36,7 +36,9 @@ This repository is a container for the skill. Source files live in `interactive-
 │   ├── scripts/dag_manager.py                CLI tool (Python stdlib)
 │   ├── examples/sample-tutorial.md           sample tutorial with two branches
 │   ├── examples/expected-dag.json            DAG decomposition of sample tutorial
-│   └── tests/test_dag_manager.py             CLI test suite
+│   ├── tests/test_dag_manager.py             CLI test suite
+│   ├── tests/test_corpus.py                  corpus fixture tests
+│   └── tests/corpus/                         tutorial fixtures (one directory per scenario)
 └── .agents/skills/interactive-tutorial/      symlinks to interactive-tutorial/*
 ```
 
@@ -90,7 +92,8 @@ Update step 2 in `SKILL.md` with your tutorial's nodes, files, and verification 
 make lint               # byte-compile scripts and tests
 make validate-examples  # validate and print sample DAG
 make test               # run test suite in temporary git repos
-make all                # run lint, validate-examples, and test
+make test-corpus        # run corpus fixture tests (tests/corpus/)
+make all                # run lint, validate-examples, test-corpus, and test
 ```
 
 CI tests on Python 3.9 and 3.12. Tests isolate Git by pointing `HOME` and `GIT_CONFIG_GLOBAL` to a temporary directory.

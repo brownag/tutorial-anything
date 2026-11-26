@@ -1,0 +1,7 @@
+{
+  "domain": "web",
+  "runnable": false,
+  "reason": "needs background service: G3",
+  "expect_fail_at": null,
+  "gaps": {"G3": "future-g3.json"}
+}

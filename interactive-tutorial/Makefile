@@ -1,6 +1,7 @@
 # interactive-tutorial skill - lint, test, example validation, install.
 #
 #   make test                                  run the unittest suite
+#   make test-corpus                           run the corpus fixture tests
 #   make validate-examples                     validate + render examples/
 #   make install                               symlink into ~/.agents/skills
 #   make install LOCAL=1                       link into ./.agents/skills instead
@@ -22,7 +23,7 @@ SKILLS_DIR := $(CURDIR)/.agents/skills
 endif
 endif
 
-.PHONY: help all lint test validate-examples install uninstall
+.PHONY: help all lint test test-corpus validate-examples install uninstall
 
 help: ## show available targets
 	@echo "targets:"
@@ -30,7 +31,7 @@ help: ## show available targets
 	@echo "  skill        $(SKILL_DIR)"
 	@echo "  skills dir   $(SKILLS_DIR)  (LOCAL=$(if $(LOCAL),$(LOCAL),0))"
 
-all: lint validate-examples test ## lint, validate the examples, then test
+all: lint validate-examples test-corpus test ## lint, validate the examples, run the corpus and unit tests
 
 lint: ## byte-compile the CLI and tests (catches syntax errors only)
 	@cd "$(SKILL_DIR)" && $(PYTHON) -m py_compile scripts/dag_manager.py && \
@@ -38,7 +39,10 @@ lint: ## byte-compile the CLI and tests (catches syntax errors only)
 		echo "lint OK ($(PYTHON))"
 
 test: ## run the unittest suite in throwaway git repositories
-	@cd "$(SKILL_DIR)" && $(PYTHON) -m unittest discover -s tests -v
+	@cd "$(SKILL_DIR)" && $(PYTHON) -m unittest discover -s tests -p "test_dag*.py" -v
+
+test-corpus: ## run the corpus fixture tests (tests/corpus)
+	@cd "$(SKILL_DIR)" && $(PYTHON) -m unittest tests.test_corpus -v
 
 validate-examples: ## validate and render the reference DAG
 	@cd "$(SKILL_DIR)" && $(PYTHON) scripts/dag_manager.py \

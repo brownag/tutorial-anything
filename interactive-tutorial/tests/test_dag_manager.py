@@ -13,9 +13,12 @@ import copy
 import json
 import os
 import shutil
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -347,6 +350,93 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("validate", check=0)
         self.assertIn("decompose", output)
 
+    def _validate_edited(self, edit):
+        """Seed a valid DAG, let ``edit`` mutate it, and run validate."""
+        if not hasattr(self, "_base_state"):
+            self.seed_repo()
+            self._base_state = self.seed_state()
+        state = copy.deepcopy(self._base_state)
+        edit(state)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return self.cli("validate")
+
+    def test_validate_side_effects_shapes(self):
+        def node(value):
+            return lambda s: s["nodes"][0].__setitem__("side_effects", value)
+
+        code, _ = self._validate_edited(node(["repo", "user"]))
+        self.assertEqual(code, 0)
+        for bad in ([], ["repo", "repo"], ["cloud"], "user", [""]):
+            code, output = self._validate_edited(node(bad))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("side_effects", output)
+
+    def test_validate_undo_shapes(self):
+        def node(value):
+            return lambda s: s["nodes"][0].__setitem__("undo", value)
+
+        code, _ = self._validate_edited(node(["rm -f x"]))
+        self.assertEqual(code, 0)
+        for bad in ("rm -f x", [""], [3]):
+            code, output = self._validate_edited(node(bad))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("undo", output)
+
+    def test_validate_residue_shapes(self):
+        entry = {
+            "node_id": "1-a",
+            "scopes": ["user"],
+            "undo": ["rm -f x"],
+            "reason": "not-run",
+            "recorded_at": "2026-11-26T00:00:00+00:00",
+        }
+
+        def residue(value):
+            return lambda s: s.__setitem__("residue", value)
+
+        code, _ = self._validate_edited(residue([entry]))
+        self.assertEqual(code, 0)
+        bad_entries = [
+            dict(entry, reason="maybe"),
+            dict(entry, scopes=["cloud"]),
+            dict(entry, undo="rm -f x"),
+            {k: v for k, v in entry.items() if k != "node_id"},
+            dict(entry, recorded_at=None),
+        ]
+        for bad in bad_entries:
+            code, output = self._validate_edited(residue([bad]))
+            self.assertEqual(code, 1, bad)
+            self.assertIn("residue", output)
+
+    def test_validate_warns_when_side_effects_have_no_undo(self):
+        def node(extra):
+            def edit(s):
+                s["nodes"][0]["side_effects"] = ["user", "system"]
+                s["nodes"][0].pop("undo", None)
+                s["nodes"][0].update(extra)
+            return edit
+
+        code, output = self._validate_edited(node({}))
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "has user, system side effects but no undo (rewinds cannot revert it)",
+            output,
+        )
+        code, output = self._validate_edited(node({"undo": ["rm -f x"]}))
+        self.assertEqual(code, 0)
+        self.assertNotIn("but no undo", output)
+
+    def test_schema_1_0_document_still_validates(self):
+        for version in ("1.0", "1.1"):
+            code, _ = self._validate_edited(
+                lambda s, v=version: s.__setitem__("schema_version", v)
+            )
+            self.assertEqual(code, 0, version)
+        code, _ = self._validate_edited(
+            lambda s: s.__setitem__("schema_version", "2.0")
+        )
+        self.assertEqual(code, 1)
+
     # -- next / status ----------------------------------------------------
 
     def test_next_walks_the_linear_core(self):
@@ -620,6 +710,92 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("--reset-descendants", output)
 
+    def _set_side_effects(self, node_id, scopes, undo):
+        """Declare side effects on a live node (run_to_store leaves 2-scaffold, 3-smoke, 4-store completed)."""
+        state = self.state()
+        node = self.node(node_id, state)
+        node["side_effects"] = scopes
+        node["undo"] = undo
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def test_jump_undo_runs_undo_and_leaves_no_residue(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", "--undo")
+        self.assertEqual(code, 0, output)
+        self.assertIn("side effects: 4-store [user] undo: touch undone.flag", output)
+        self.assertTrue((self.workspace / "undone.flag").exists())
+        self.assertFalse(self.state().get("residue"))
+
+    def test_jump_without_undo_records_not_run_residue(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", check=0)
+        self.assertFalse((self.workspace / "undone.flag").exists())
+        residue = self.state()["residue"]
+        self.assertEqual([(e["node_id"], e["reason"]) for e in residue], [("4-store", "not-run")])
+        _, status = self.cli("status", check=0)
+        self.assertIn("residue: 1", status)
+
+    def test_failed_undo_stops_and_marks_the_rest_not_run(self):
+        self.run_to_store()
+        self._set_side_effects("3-smoke", ["user"], ["touch older.flag"])
+        self._set_side_effects("4-store", ["user"], ["false"])
+        code, output = self.cli("jump", "2-scaffold", "--reset-descendants", "--undo")
+        self.assertEqual(code, 1, output)
+        self.assertFalse((self.workspace / "older.flag").exists())
+        reasons = {e["node_id"]: e["reason"] for e in self.state()["residue"]}
+        self.assertEqual(reasons, {"4-store": "failed", "3-smoke": "not-run"})
+
+    def test_remote_and_irreversible_nodes_are_never_undone(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["remote"], ["touch remote.flag"])
+        self._set_side_effects("3-smoke", ["user"], [])
+        code, output = self.cli("jump", "2-scaffold", "--reset-descendants", "--undo", check=0)
+        self.assertFalse((self.workspace / "remote.flag").exists())
+        reasons = {e["node_id"]: e["reason"] for e in self.state()["residue"]}
+        self.assertEqual(reasons, {"4-store": "remote", "3-smoke": "irreversible"})
+        self.assertIn("residue: 2", self.cli("status", check=0)[1])
+
+    def test_hands_off_skips_undo_of_unapproved_high_risk_node(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["sudo rm -f undone.flag"])
+        state = self.state()
+        state["mode"] = "hands-off"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", "--undo")
+        self.assertEqual(code, 0, output)
+        self.assertIn("skipped undo of 4-store", output)
+        self.assertEqual(
+            [("4-store", "not-run")],
+            [(e["node_id"], e["reason"]) for e in self.state().get("residue") or []],
+        )
+
+    def test_undo_requires_reset_descendants(self):
+        self.run_to_store()
+        code, output = self.cli("jump", "3-smoke", "--undo")
+        self.assertEqual(code, 2)
+        self.assertIn("--reset-descendants", output)
+
+    def test_residue_clear_removes_one_entry_or_all(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["touch undone.flag"])
+        self.cli("jump", "3-smoke", "--reset-descendants", check=0)
+        self.cli("residue", "clear", check=2)
+        self.cli("residue", "clear", "4-store", "--all", check=2)
+        self.cli("residue", "clear", "4-store", check=0)
+        self.assertEqual(self.state()["residue"], [])
+        state = self.state()
+        state["residue"] = [
+            {"node_id": "3-smoke", "scopes": ["user"], "undo": [], "reason": "irreversible",
+             "recorded_at": "2026-11-26T00:00:00Z"},
+            {"node_id": "4-store", "scopes": ["user"], "undo": ["true"], "reason": "not-run",
+             "recorded_at": "2026-11-26T00:00:00Z"},
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("residue", "clear", "--all", check=0)
+        self.assertEqual(self.state()["residue"], [])
+
     def test_status_json_round_trips(self):
         self.run_to_store()
         rendered = self.cli_stdout("status", "--json")
@@ -632,6 +808,474 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("--file", "in-context.json", "status")
         self.assertEqual(code, 0)
         self.assertIn("4-store", output)
+
+    def _root_with(self, mode, **node_fields):
+        """Seed a repo and a DAG in ``mode``; patch the first root node's fields."""
+        self.seed_repo()
+        state = self.seed_state(mode=mode)
+        root = next(n for n in state["nodes"] if not n["dependencies"])
+        root.update(node_fields)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return root["id"]
+
+    def test_hands_off_blocks_high_risk_until_approved(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIsNone(self.state().get("active_node_id"))
+
+        self.cli("approve", root, check=0)
+        self.cli("next", root, check=0)
+        self.assertEqual(self.state()["active_node_id"], root)
+
+    def test_guided_mode_never_blocks_high_risk(self):
+        root = self._root_with("guided", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high (sudo)", output)
+
+    def test_assisted_mode_never_blocks_high_risk(self):
+        root = self._root_with("assisted", commands=["sudo true"])
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 0, output)
+        self.assertIn("risk: high (sudo)", output)
+
+    def test_approval_covers_only_the_tier_it_recorded(self):
+        root = self._root_with("hands-off", side_effects=["user"], commands=["ls"])
+        self.cli("approve", root, check=0)
+        self.assertEqual(self.node(root)["approved"]["tier"], "elevated")
+        self.cli("next", root, check=0)
+
+        state = self.state()
+        self.node(root, state)["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("next", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
+    def _free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def _service_root(self, command, ready, **service_extra):
+        service = dict({"command": command, "ready": ready}, **service_extra)
+        node_id = self._root_with("assisted", service=service, verification=ready)
+        self.addCleanup(self.cli, "teardown")
+        return node_id
+
+    def _http_server_command(self, port):
+        return "{} -m http.server {} --bind 127.0.0.1".format(
+            shlex.quote(sys.executable), port
+        )
+
+    def test_service_start_ready_then_stop_round_trip(self):
+        port = self._free_port()
+        node_id = self._service_root(
+            self._http_server_command(port), {"type": "port_listening", "port": port}
+        )
+        self.cli("next", node_id, check=0)
+        code, output = self.cli("service", "start", node_id)
+        self.assertEqual(code, 0, output)
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+        services = json.loads(self.cli("status", "--json")[1])["services"]
+        self.assertEqual(services[node_id]["pid"], services[node_id]["pgid"])
+        self.assertTrue((self.workspace / ".tutorial-logs" / "{}.log".format(node_id)).is_file())
+        self.assertIn("svc: 1", self.cli("status")[1])
+
+        self.cli("service", "stop", node_id, check=0)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        self.assertFalse(json.loads(self.cli("status", "--json")[1]).get("services"))
+
+    def test_service_start_refuses_a_running_service(self):
+        port = self._free_port()
+        node_id = self._service_root(
+            self._http_server_command(port), {"type": "port_listening", "port": port}
+        )
+        self.cli("next", node_id, check=0)
+        self.cli("service", "start", node_id, check=0)
+        code, output = self.cli("service", "start", node_id)
+        self.assertEqual(code, 1, output)
+        self.assertIn("already running", output)
+
+    def test_ready_timeout_stops_the_process_and_drops_the_record(self):
+        node_id = self._service_root(
+            "echo never-ready; sleep 30",
+            {"type": "port_listening", "port": self._free_port()},
+            ready_timeout=1,
+        )
+        self.cli("next", node_id, check=0)
+        started = time.monotonic()
+        code, output = self.cli("service", "start", node_id)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(code, 1, output)
+        self.assertIn("did not pass within 1s", output)
+        self.assertIn("log tail", output)
+        self.assertIn("never-ready", output)
+        self.assertFalse(json.loads(self.cli("status", "--json")[1]).get("services"))
+
+    def test_stop_of_an_already_dead_process_is_not_an_error(self):
+        node_id = self._service_root(
+            "true", {"type": "port_listening", "port": self._free_port()}
+        )
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        state = self.state()
+        state["services"] = {
+            node_id: {
+                "pid": dead.pid,
+                "pgid": dead.pid,
+                "command": "true",
+                "log": ".tutorial-logs/{}.log".format(node_id),
+                "started_at": "2026-11-26T00:00:00Z",
+            }
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("service", "stop", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("was not running", output)
+        self.assertFalse(self.state().get("services"))
+
+    def test_interactive_hints_print_on_next(self):
+        node_id = self._root_with(
+            "assisted",
+            commands=["sh ask.sh"],
+            interactive={"answers": ["y", "my name"]},
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("next", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("feed answers: printf '%s\\n' y 'my name' | sh ask.sh", output)
+
+    def test_human_interactive_hint_prints_on_next(self):
+        node_id = self._root_with(
+            "assisted",
+            interactive={"human": True},
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("next", node_id)
+        self.assertEqual(code, 0, output)
+        self.assertIn("a person must run this step (interactive)", output)
+
+    def test_validate_warns_on_interactive_command_without_block(self):
+        node_id = self._root_with(
+            "assisted",
+            commands=["npm init"],
+            verification={"type": "confirm", "prompt": "ok?"},
+        )
+        code, output = self.cli("validate")
+        self.assertEqual(code, 0, output)
+        self.assertIn("node '{}' command looks interactive: npm init".format(node_id), output)
+
+    def test_service_block_validation(self):
+        node_id = self._service_root(
+            "true", {"type": "port_listening", "port": self._free_port()}
+        )
+        for bad in (
+            {"command": "true", "ready": {"type": "confirm", "prompt": "ok?"}},
+            {"command": "true"},
+            {"command": "true", "ready": {"type": "port_listening", "port": 1}, "stop_signal": "HUP"},
+        ):
+            state = self.state()
+            self.node(node_id, state)["service"] = bad
+            self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            code, output = self.cli("validate")
+            self.assertEqual(code, 1, bad)
+            self.assertIn("service", output)
+
+    def test_validate_rejects_bad_risk_and_approved_values(self):
+        root = self._root_with("hands-off")
+        state = self.state()
+        self.node(root, state)["risk"] = "critical"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("validate")
+        self.assertEqual(code, 1, output)
+        self.assertIn("'risk'", output)
+
+
+def load_cli_module():
+    """Import scripts/dag_manager.py so pure helpers can be tested directly."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dag_manager", CLI)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RiskTierTest(unittest.TestCase):
+    """Computed and declared risk tiers (C-G6)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def tier(self, **node):
+        node.setdefault("id", "n")
+        return self.dm.risk_tier(node)
+
+    def test_each_high_pattern_matches_and_near_misses_stay_low(self):
+        cases = {
+            "sudo": ("sudo usermod -aG docker x", "pseudo-tool --x", "sudo"),
+            "pipe-to-shell": (
+                "curl -fsSL https://example.invalid/i.sh | bash",
+                "curl -fsSL https://example.invalid/i.sh -o i.sh",
+                "pipe-to-shell",
+            ),
+            "recursive-delete": ("rm -rf /", "rm -rf build/", "recursive-delete"),
+            "chmod-777": ("chmod -R 777 /srv", "chmod 755 bin/tool", "chmod-777"),
+            "system-path-write": (
+                "echo x > /etc/app.conf",
+                "echo x > ./etc/app.conf",
+                "system-path-write",
+            ),
+            "mkfs": ("mkfs.ext4 /dev/sdb1", "make fs-check", "mkfs"),
+            "dd": ("dd if=/dev/zero of=disk.img bs=1M count=1", "dd-notes.txt", "dd"),
+        }
+        for label, (hit, miss, expected) in cases.items():
+            tier, labels = self.tier(commands=[hit])
+            self.assertEqual(("high", [expected]), (tier, labels), label)
+            tier, labels = self.tier(commands=[miss])
+            self.assertEqual(("low", []), (tier, labels), label)
+
+    def test_high_pattern_is_read_from_undo_and_command_checks(self):
+        self.assertEqual("high", self.tier(undo=["sudo rm x"])[0])
+        verification = {"type": "command", "command": "sudo true"}
+        self.assertEqual("high", self.tier(verification=verification)[0])
+        other = {"type": "confirm", "prompt": "sudo said yes?"}
+        self.assertEqual("low", self.tier(verification=other)[0])
+
+    def test_scope_raises_to_elevated_and_declared_risk_never_lowers(self):
+        self.assertEqual("low", self.tier(commands=["ls"])[0])
+        self.assertEqual("elevated", self.tier(side_effects=["user"])[0])
+        self.assertEqual("elevated", self.tier(side_effects=["repo", "remote"])[0])
+        self.assertEqual("high", self.tier(commands=["sudo ls"], risk="low")[0])
+        self.assertEqual("high", self.tier(commands=["ls"], risk="high")[0])
+        self.assertEqual("elevated", self.tier(side_effects=["user"], risk="low")[0])
+
+    def test_validate_rejects_bad_risk_and_approved_shapes(self):
+        validate = self.dm.validate_node
+        for node in (
+            {"id": "a", "risk": "critical"},
+            {"id": "a", "approved": {"tier": "high"}},
+            {"id": "a", "approved": {"tier": "urgent", "at": "2026-11-26T00:00:00Z"}},
+        ):
+            problems = [p for p in validate(dict(node, title="t", summary="s",
+                        dependencies=[], action_type="instruct", status="pending",
+                        commit_sha=None, artifacts=[], commands=[],
+                        verification={"type": "confirm", "prompt": "ok"}), 0, {})]
+            self.assertTrue(any("'risk'" in p or "'approved'" in p for p in problems), node)
+
+
+class InteractiveStepsTest(unittest.TestCase):
+    """Interactive detection and command-check stdin/timeout (C-G11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def matches(self, command):
+        return any(pattern.search(command) for pattern in self.dm.INTERACTIVE_PATTERNS)
+
+    def test_each_interactive_pattern_has_a_positive_and_a_negative(self):
+        positives = [
+            "npm init",
+            "yarn init",
+            "npx create-react-app app",
+            "vim notes.md",
+            "python3",
+            "node",
+            "git rebase -i HEAD~2",
+            "git add -i",
+            "ssh-keygen -t ed25519",
+            "passwd",
+            "read name",
+        ]
+        negatives = [
+            "npm init -y",
+            "npx create-react-app app --yes",
+            "view notes.md",
+            "python3 -m http.server 8000",
+            "git rebase main",
+            "ssh-keygen -t ed25519 -N '' -f key",
+            "echo thread",
+            "cat notes.md",
+        ]
+        for command in positives:
+            self.assertTrue(self.matches(command), command)
+        for command in negatives:
+            self.assertFalse(self.matches(command), command)
+
+    def test_command_check_gets_declared_stdin_and_defaults_to_eof(self):
+        fed = {
+            "type": "command",
+            "command": "python3 -c \"import sys; assert sys.stdin.read().strip() == 'yes'\"",
+            "stdin": "yes\n",
+        }
+        passed, lines = self.dm.run_verification({"id": "n", "verification": fed}, Path("."), False)
+        self.assertTrue(passed, lines)
+        eof = {
+            "type": "command",
+            "command": "python3 -c \"import sys; sys.exit(0 if sys.stdin.read() == '' else 1)\"",
+        }
+        passed, lines = self.dm.run_verification({"id": "n", "verification": eof}, Path("."), False)
+        self.assertTrue(passed, lines)
+
+    def test_command_check_honours_its_own_timeout(self):
+        slow = {"type": "command", "command": "sleep 3", "timeout": 1}
+        passed, lines = self.dm.run_verification({"id": "n", "verification": slow}, Path("."), False)
+        self.assertFalse(passed)
+        self.assertIn("timed out after 1s", "\n".join(lines))
+
+
+class PreflightTest(unittest.TestCase):
+    """Version parsing, comparison, overrides, and OS checks for doctor (C-G4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+
+    def test_version_is_the_first_dotted_number_in_the_output(self):
+        match = self.dm.VERSION_FIND_RE.search("Docker version 24.0.7, build afdd53b")
+        self.assertEqual("24.0.7", match.group(0))
+        self.assertEqual((24, 0, 7), self.dm.version_tuple("24.0.7"))
+        self.assertEqual((3, 0, 0), self.dm.version_tuple("3"))
+
+    def test_comparison_pads_short_versions(self):
+        ok = self.dm.check_tool("py-ok", {"min": "3.0", "version_command": "echo 'v3.0.0'"})
+        self.assertEqual("ok", ok["status"])
+        old = self.dm.check_tool("py-old", {"min": "3.11", "version_command": "echo 'v3.10.9'"})
+        self.assertEqual("too-old", old["status"])
+
+    def test_version_command_override_is_used(self):
+        row = self.dm.check_tool(
+            "anything", {"min": "2.0", "version_command": "echo 'tool 2.4.1'"}
+        )
+        self.assertEqual(("ok", "2.4.1"), (row["status"], row["found"]))
+
+    def test_star_passes_a_tool_that_runs_even_without_a_version(self):
+        row = self.dm.check_tool("zz-missing-tool-9", "*")
+        self.assertEqual("missing", row["status"])
+        self.assertFalse(row["ok"])
+        row = self.dm.check_tool("quiet", {"min": "1.0", "version_command": "true"})
+        self.assertEqual("unknown-version", row["status"])
+        self.assertFalse(row["ok"])
+
+    def test_os_mismatch_fails_the_run(self):
+        passed, rows, missing = self.dm.run_checks({"os": ["plan9"]})
+        self.assertFalse(passed)
+        self.assertEqual([], missing)
+        self.assertEqual("mismatch", rows[-1]["status"])
+
+    def test_validate_tool_spec_shapes(self):
+        for good in ("*", ">=3", ">=3.0.1", {"min": "1.2"}, {"min": "1", "version_command": "x"}):
+            self.assertEqual([], self.dm.validate_tool_spec(good, "t"), good)
+        for bad in ("3.0", ">3", {"min": "x"}, {"max": "1"}, 7):
+            self.assertTrue(self.dm.validate_tool_spec(bad, "t"), bad)
+
+
+class VerificationTypesTest(unittest.TestCase):
+    """http and port_listening checks against loopback services (C-G3)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        cls.dm = load_cli_module()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                code = 200 if self.path == "/" else 404
+                body = b"hello from the test server"
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        thread.start()
+        cls.addClassCleanup(cls.server.server_close)
+        cls.addClassCleanup(cls.server.shutdown)
+
+    def run_check(self, verification):
+        node = {"id": "n", "verification": verification}
+        return self.dm.run_verification(node, Path("."), False)
+
+    def closed_port(self):
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_http_passes_on_expected_status_and_pattern(self):
+        base = "http://127.0.0.1:{}".format(self.port)
+        passed, _ = self.run_check({"type": "http", "url": base + "/"})
+        self.assertTrue(passed)
+        passed, _ = self.run_check({"type": "http", "url": base + "/missing", "expect_status": 404})
+        self.assertTrue(passed)
+        passed, _ = self.run_check({"type": "http", "url": base + "/", "pattern": "hello"})
+        self.assertTrue(passed)
+
+    def test_http_fails_on_status_mismatch_pattern_miss_and_closed_port(self):
+        base = "http://127.0.0.1:{}".format(self.port)
+        passed, lines = self.run_check({"type": "http", "url": base + "/missing"})
+        self.assertFalse(passed)
+        self.assertIn("expected 200", "\n".join(lines))
+        passed, lines = self.run_check({"type": "http", "url": base + "/", "pattern": "absent"})
+        self.assertFalse(passed)
+        self.assertIn("did not match", "\n".join(lines))
+        passed, _ = self.run_check(
+            {"type": "http", "url": "http://127.0.0.1:{}/".format(self.closed_port()), "timeout": 2}
+        )
+        self.assertFalse(passed)
+
+    def test_port_listening_passes_on_open_port_and_fails_on_closed_one(self):
+        import socket
+
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            passed, _ = self.run_check({"type": "port_listening", "port": listener.getsockname()[1]})
+            self.assertTrue(passed)
+        passed, lines = self.run_check({"type": "port_listening", "port": self.closed_port()})
+        self.assertFalse(passed)
+        self.assertIn("nothing accepts connections", "\n".join(lines))
+
+    def test_validate_accepts_the_new_shapes(self):
+        ok = [
+            {"type": "http", "url": "http://127.0.0.1:8000/"},
+            {"type": "http", "url": "https://example.invalid/", "expect_status": 301, "pattern": "x", "timeout": 3},
+            {"type": "port_listening", "port": 8000},
+            {"type": "port_listening", "port": 65535, "host": "127.0.0.1", "timeout": 1},
+        ]
+        for verification in ok:
+            self.assertEqual([], self.dm.validate_verification(verification, "node 'n'"), verification)
+
+    def test_validate_rejects_bad_scheme_port_status_and_fields(self):
+        bad = [
+            {"type": "http", "url": "ftp://example.invalid/"},
+            {"type": "http", "url": "http://127.0.0.1/", "expect_status": 42},
+            {"type": "http", "url": "http://127.0.0.1/", "pattern": "("},
+            {"type": "http", "url": "http://127.0.0.1/", "host": "x"},
+            {"type": "port_listening"},
+            {"type": "port_listening", "port": "8000"},
+            {"type": "port_listening", "port": 0},
+            {"type": "port_listening", "port": 65536},
+            {"type": "port_listening", "port": True},
+            {"type": "port_listening", "port": 80, "timeout": 0},
+        ]
+        for verification in bad:
+            self.assertTrue(self.dm.validate_verification(verification, "node 'n'"), verification)
 
 
 if __name__ == "__main__":

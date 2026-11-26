@@ -7,6 +7,7 @@
 #
 #   make all                       lint + validate-examples + test
 #   make test                      unittest suite
+#   make test-corpus               corpus fixture tests
 #   make validate-examples         validate + render the reference DAG
 #   make lint                      byte-compile scripts and tests
 #   make install                   symlink the skill into ~/.agents/skills
@@ -15,7 +16,7 @@
 #   make uninstall                 remove that symlink
 
 SKILL_DIR ?= interactive-tutorial
-TARGETS := all lint test validate-examples install uninstall
+TARGETS := all lint test test-corpus validate-examples install uninstall
 
 .DEFAULT_GOAL := all
 

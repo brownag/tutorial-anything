@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.0",
+  "title": "Greet CLI (stale v1 tutorial)",
+  "source_doc": "tests/corpus/stale-tutorial/tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-01-31T09:00:00Z",
+  "updated_at": "2026-01-31T09:00:00Z",
+  "git": {
+    "branch": "tutorial/greet-stale",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "nodes": [
+    {
+      "id": "1-read",
+      "title": "Read the greet tutorial",
+      "summary": "Section 1: the tutorial was written for greet v1, which took --name. No files change. Done when you can name the flag the tutorial uses.",
+      "dependencies": [],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Say which flag the tutorial uses to pass the name."
+      }
+    },
+    {
+      "id": "2-write-greet",
+      "title": "Install the greet script (v2)",
+      "summary": "Section 2: write an executable greet script. This is v2, which takes --who and rejects --name.",
+      "dependencies": ["1-read"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["greet"],
+      "commands": ["cat > greet <<'EOF'\n#!/usr/bin/env python3\nimport argparse\n\nparser = argparse.ArgumentParser(prog='greet')\nparser.add_argument('--who', default='world')\nargs = parser.parse_args()\nprint('Hello, ' + args.who)\nEOF\nchmod +x greet"],
+      "verification": {
+        "type": "file_contains",
+        "path": "greet",
+        "pattern": "--who",
+        "regex": false
+      }
+    },
+    {
+      "id": "2b-env-note",
+      "title": "Note your Python version",
+      "summary": "Section 2b: a manual side note outside the workspace. Sibling of 2-write-greet.",
+      "dependencies": ["1-read"],
+      "action_type": "instruct",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm you noted your python3 version."
+      }
+    },
+    {
+      "id": "3-run-greet",
+      "title": "Run greet with --name Ada",
+      "summary": "Section 3: the v1 prose runs ./greet --name Ada. Against v2 this fails, so the node is the stale point. Done when the output contains Hello, Ada.",
+      "dependencies": ["2-write-greet"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "command",
+        "command": "./greet --name Ada",
+        "pattern": "Hello",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "4-finish",
+      "title": "Finish the tutorial",
+      "summary": "Section 4: a closing manual check. Only reachable after 3-run-greet.",
+      "dependencies": ["3-run-greet"],
+      "action_type": "instruct",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm the greeting printed as expected."
+      }
+    }
+  ]
+}

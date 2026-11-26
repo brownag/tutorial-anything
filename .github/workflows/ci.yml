@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     name: lint + examples + tests (python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # python 3.9 has no setup-python build for ubuntu 26.04
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +35,9 @@ jobs:
 
       - name: Validate examples
         run: make validate-examples
+
+      - name: Test corpus
+        run: make test-corpus
 
       - name: Test
         run: make test

@@ -1,0 +1,146 @@
+{
+  "schema_version": "1.0",
+  "title": "Build the greetpkg package",
+  "source_doc": "tests/corpus/python-package/tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-01-31T09:00:00Z",
+  "updated_at": "2026-01-31T09:00:00Z",
+  "git": {
+    "branch": "tutorial/greetpkg",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "nodes": [
+    {
+      "id": "1-design",
+      "title": "Read the package layout",
+      "summary": "Section 1: a src-layout package with one function and a unittest suite. No files change. Done when you can name the file that holds greet().",
+      "dependencies": [],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Say which file defines greet() and why it lives under src/."
+      }
+    },
+    {
+      "id": "2-scaffold",
+      "title": "Create the greet() function",
+      "summary": "Section 2: create src/greetpkg/__init__.py with greet(name). Done when the file exists.",
+      "dependencies": ["1-design"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["src/greetpkg/__init__.py"],
+      "commands": ["mkdir -p src/greetpkg tests\ncat > src/greetpkg/__init__.py <<'EOF'\ndef greet(name):\n    return 'Hello, ' + name + '!'\nEOF"],
+      "verification": {
+        "type": "file_exists",
+        "path": "src/greetpkg/__init__.py"
+      }
+    },
+    {
+      "id": "3-pyproject",
+      "title": "Write pyproject.toml",
+      "summary": "Section 3: a build config written but not installed. Done when pyproject.toml exists and names the package.",
+      "dependencies": ["2-scaffold"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["pyproject.toml"],
+      "commands": ["cat > pyproject.toml <<'EOF'\n[build-system]\nrequires = [\"setuptools>=61\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"greetpkg\"\nversion = \"0.1.0\"\nEOF"],
+      "verification": {
+        "type": "file_contains",
+        "path": "pyproject.toml",
+        "pattern": "name = \"greetpkg\"",
+        "regex": false
+      }
+    },
+    {
+      "id": "4-greet-tests",
+      "title": "Write the greet() unit test",
+      "summary": "Section 4: a unittest module under tests/. Done when the test file exists.",
+      "dependencies": ["2-scaffold"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["tests/test_greet.py"],
+      "commands": ["cat > tests/test_greet.py <<'EOF'\nimport unittest\nfrom greetpkg import greet\n\n\nclass GreetTest(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet('Ada'), 'Hello, Ada!')\n\n\nif __name__ == '__main__':\n    unittest.main()\nEOF"],
+      "verification": {
+        "type": "file_exists",
+        "path": "tests/test_greet.py"
+      }
+    },
+    {
+      "id": "5-test",
+      "title": "Run the unit tests",
+      "summary": "Section 5: run unittest discovery with src on the path. Joins the pyproject and test branches. Done when the suite prints OK.",
+      "dependencies": ["3-pyproject", "4-greet-tests"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["PYTHONPATH=src python3 -m unittest discover -s tests"],
+      "verification": {
+        "type": "command",
+        "command": "PYTHONPATH=src python3 -m unittest discover -s tests",
+        "pattern": "OK",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "6-main",
+      "title": "Add the __main__ entry point (optional branch)",
+      "summary": "Section 6: optional. Adds src/greetpkg/__main__.py with main(). Sibling of the release note; it does not block it.",
+      "dependencies": ["5-test"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["src/greetpkg/__main__.py"],
+      "commands": ["cat > src/greetpkg/__main__.py <<'EOF'\nimport sys\nfrom greetpkg import greet\n\n\ndef main(argv=None):\n    args = sys.argv[1:] if argv is None else argv\n    print(greet(args[0]))\n    return 0\n\n\nif __name__ == '__main__':\n    raise SystemExit(main())\nEOF"],
+      "verification": {
+        "type": "file_contains",
+        "path": "src/greetpkg/__main__.py",
+        "pattern": "def main(",
+        "regex": false
+      }
+    },
+    {
+      "id": "7-run-module",
+      "title": "Run the package as a module (optional branch)",
+      "summary": "Section 7: python3 -m greetpkg Ada prints the greeting. Done when the output contains Hello, Ada.",
+      "dependencies": ["6-main"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["PYTHONPATH=src python3 -m greetpkg Ada"],
+      "verification": {
+        "type": "command",
+        "command": "PYTHONPATH=src python3 -m greetpkg Ada",
+        "pattern": "Hello, Ada",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "8-release-note",
+      "title": "Record the release note",
+      "summary": "Section 8: a manual step outside the workspace. Done when you have written the 0.1.0 note in your own changelog.",
+      "dependencies": ["5-test"],
+      "action_type": "instruct",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm the 0.1.0 release note is written in your own changelog."
+      }
+    }
+  ]
+}

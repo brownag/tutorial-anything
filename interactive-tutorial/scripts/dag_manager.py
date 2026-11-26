@@ -20,23 +20,73 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
+import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILENAME = ".tutorial-dag.json"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 MODES = ("guided", "assisted", "hands-off")
 PERSISTENCE_MODES = ("file", "in-context")
 ACTION_TYPES = ("read-only", "instruct", "mutate", "execute")
 CHECKPOINTED_ACTIONS = ("mutate", "execute")
 STATUSES = ("pending", "completed", "skipped")
-VERIFICATION_TYPES = ("command", "file_exists", "file_contains", "confirm")
+VERIFICATION_TYPES = (
+    "command",
+    "file_exists",
+    "file_contains",
+    "confirm",
+    "http",
+    "port_listening",
+)
+SIDE_EFFECT_SCOPES = ("repo", "user", "system", "remote")
+RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
+RISK_TIERS = ("low", "elevated", "high")
+RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
+LOG_DIR_NAME = ".tutorial-logs"
+LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
+SERVICE_STOP_GRACE = 5
+SERVICE_POLL = 0.5
+SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
+SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
+INTERACTIVE_FIELDS = ("answers", "human")
+PREFLIGHT_OS = ("linux", "darwin", "windows")
+REQUIRES_FIELDS = ("tools", "os")
+TOOL_SPEC_FIELDS = ("min", "version_command")
+VERSION_SPEC_RE = re.compile(r"^\d+(?:\.\d+){0,2}$")
+VERSION_FIND_RE = re.compile(r"\d+(?:\.\d+)+")
+DOCTOR_TIMEOUT = 10
+INTERACTIVE_PATTERNS = (
+    re.compile(r"^\s*(npm|yarn|pnpm) init\b(?!.*(-y|--yes))"),
+    re.compile(r"\bnpx create-\S+(?!.*(--yes|-y))"),
+    re.compile(r"^\s*(vi|vim|nano|emacs)\b"),
+    re.compile(r"^\s*(python3?|node|irb|psql|sqlite3|mysql)\s*$"),
+    re.compile(r"\bgit (rebase|add) -i\b"),
+    re.compile(r"\bssh-keygen\b(?!.*-N)"),
+    re.compile(r"^\s*passwd\b"),
+    re.compile(r"\bread\s+(-r\s+)?\w+"),
+)
+HIGH_RISK_PATTERNS = (
+    (re.compile(r"\bsudo\b"), "sudo"),
+    (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "pipe-to-shell"),
+    (re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(/|~|\$HOME)"), "recursive-delete"),
+    (re.compile(r"\bchmod\s+(-R\s+)?777\b"), "chmod-777"),
+    (re.compile(r"(>|\btee\b\s+(-a\s+)?)\s*/(etc|usr|opt|boot|var)/"), "system-path-write"),
+    (re.compile(r"\bmkfs\b"), "mkfs"),
+    (re.compile(r"\bdd\s+if="), "dd"),
+)
 GIT_ROLLBACK_MODES = ("none", "branch", "hard")
 DERIVED_ORDER = ("ACTIVE", "READY", "PENDING", "COMPLETED", "SKIPPED")
 
@@ -77,12 +127,16 @@ VERIFICATION_REQUIRED = {
     "file_exists": ("path",),
     "file_contains": ("path", "pattern"),
     "confirm": ("prompt",),
+    "http": ("url",),
+    "port_listening": ("port",),
 }
 VERIFICATION_ALLOWED = {
-    "command": ("type", "command", "pattern", "expect_exit"),
+    "command": ("type", "command", "pattern", "expect_exit", "stdin", "timeout"),
     "file_exists": ("type", "path"),
     "file_contains": ("type", "path", "pattern", "regex"),
     "confirm": ("type", "prompt"),
+    "http": ("type", "url", "expect_status", "pattern", "timeout"),
+    "port_listening": ("type", "port", "host", "timeout"),
 }
 
 
@@ -336,6 +390,15 @@ def validate_document(state: dict) -> tuple:
 
     problems.extend(validate_git_block(state.get("git")))
 
+    if "residue" in state:
+        problems.extend(validate_residue(state.get("residue")))
+    if "services" in state:
+        problems.extend(validate_services(state.get("services")))
+    if "requires" in state:
+        problems.extend(validate_requires(state.get("requires")))
+    if "preflight" in state:
+        problems.extend(validate_preflight(state.get("preflight")))
+
     nodes = state.get("nodes")
     if not isinstance(nodes, list):
         problems.append("root field 'nodes' must be an array")
@@ -393,6 +456,26 @@ def collect_warnings(state: dict) -> list:
         if node.get("action_type") == "mutate" and not node.get("artifacts"):
             warnings.append(
                 "node '{}' is a mutate node but lists no artifacts".format(nid)
+            )
+        block = node.get("interactive")
+        if isinstance(block, dict) and block.get("human"):
+            if (node.get("verification") or {}).get("type") != "confirm":
+                warnings.append(
+                    "node '{}' is human: true but its verification is not confirm".format(nid)
+                )
+        if "interactive" not in node:
+            for command in node.get("commands") or []:
+                if any(pattern.search(command) for pattern in INTERACTIVE_PATTERNS):
+                    warnings.append(
+                        "node '{}' command looks interactive: {}".format(nid, command)
+                    )
+                    break
+        scopes = [s for s in node.get("side_effects", []) if s != "repo"]
+        if isinstance(node.get("side_effects"), list) and scopes and not node.get("undo"):
+            warnings.append(
+                "node '{}' has {} side effects but no undo (rewinds cannot revert it)".format(
+                    nid, ", ".join(scopes)
+                )
             )
     return warnings
 
@@ -492,7 +575,426 @@ def validate_node(node, position: int, seen: dict) -> list:
 
     if "verification" in node:
         problems.extend(validate_verification(node["verification"], label))
+
+    if "side_effects" in node:
+        value = node.get("side_effects")
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(set(value)) != len(value)
+            or any(scope not in SIDE_EFFECT_SCOPES for scope in value)
+        ):
+            problems.append(
+                "{} field 'side_effects' must be a non-empty unique array of {}".format(
+                    label, list(SIDE_EFFECT_SCOPES)
+                )
+            )
+    if "undo" in node:
+        value = node.get("undo")
+        if not isinstance(value, list) or any(
+            not isinstance(cmd, str) or not cmd.strip() for cmd in value
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(label)
+            )
+    if "service" in node:
+        problems.extend(validate_service(node["service"], label))
+    if "interactive" in node:
+        problems.extend(validate_interactive(node["interactive"], label))
+    if "risk" in node and node.get("risk") not in RISK_TIERS:
+        problems.append(
+            "{} field 'risk' must be one of {}, got {!r}".format(
+                label, list(RISK_TIERS), node.get("risk")
+            )
+        )
+    if "approved" in node:
+        value = node.get("approved")
+        if (
+            not isinstance(value, dict)
+            or value.get("tier") not in RISK_TIERS
+            or not isinstance(value.get("at"), str)
+        ):
+            problems.append(
+                "{} field 'approved' must be an object with 'tier' and 'at' (C-G6)".format(label)
+            )
     return problems
+
+
+def inspected_commands(node: dict) -> list:
+    """Commands the risk classifier reads: commands, undo, and a command check (C-G6)."""
+    commands = list(node.get("commands") or []) + list(node.get("undo") or [])
+    verification = node.get("verification") or {}
+    if verification.get("type") == "command" and isinstance(verification.get("command"), str):
+        commands.append(verification["command"])
+    service = node.get("service") or {}
+    if isinstance(service.get("command"), str):
+        commands.append(service["command"])
+    return commands
+
+
+def risk_tier(node: dict) -> tuple:
+    """Effective (tier, labels) for a node: max(computed, declared) (C-G6)."""
+    labels = []
+    for command in inspected_commands(node):
+        for pattern, label in HIGH_RISK_PATTERNS:
+            if pattern.search(command) and label not in labels:
+                labels.append(label)
+    if labels:
+        computed = "high"
+    elif set(node_scopes(node)) - {"repo"}:
+        computed = "elevated"
+    else:
+        computed = "low"
+    declared = node.get("risk") if node.get("risk") in RISK_TIERS else "low"
+    tier = max(computed, declared, key=RISK_TIERS.index)
+    return tier, labels
+
+
+def approval_covers(node: dict, tier: str) -> bool:
+    """An approval covers a node while its effective tier is at or below the recorded one."""
+    approved = node.get("approved")
+    if not isinstance(approved, dict) or approved.get("tier") not in RISK_TIERS:
+        return False
+    return RISK_TIERS.index(tier) <= RISK_TIERS.index(approved["tier"])
+
+
+def risk_blocked(state: dict, node: dict) -> bool:
+    """True when hands-off mode forbids acting on a high-risk, unapproved node."""
+    tier, _ = risk_tier(node)
+    return (
+        state.get("mode") == "hands-off"
+        and tier == "high"
+        and not approval_covers(node, tier)
+    )
+
+
+def validate_service(service, label: str) -> list:
+    """Validate a node's ``service`` block (C-G3)."""
+    if not isinstance(service, dict):
+        return ["{} field 'service' must be an object".format(label)]
+    problems = []
+    for field in service:
+        if field not in SERVICE_FIELDS:
+            problems.append("{} service does not accept {!r}".format(label, field))
+    command = service.get("command")
+    if not isinstance(command, str) or not command.strip():
+        problems.append("{} service requires a non-empty 'command'".format(label))
+    if "ready" not in service:
+        problems.append("{} service requires 'ready'".format(label))
+    else:
+        ready = service["ready"]
+        if not isinstance(ready, dict) or ready.get("type") == "confirm":
+            problems.append(
+                "{} service.ready must be a verification other than confirm".format(label)
+            )
+        else:
+            problems.extend(validate_verification(ready, label + " service"))
+    if "ready_timeout" in service and not is_positive_int(service["ready_timeout"]):
+        problems.append("{} service.ready_timeout must be a positive integer".format(label))
+    if "stop_signal" in service and service["stop_signal"] not in SERVICE_SIGNALS:
+        problems.append(
+            "{} service.stop_signal must be one of {}".format(label, list(SERVICE_SIGNALS))
+        )
+    return problems
+
+
+def validate_services(services) -> list:
+    """Validate the root ``services`` map of live processes (C-G3)."""
+    if not isinstance(services, dict):
+        return ["root field 'services' must be an object"]
+    problems = []
+    for nid, record in services.items():
+        label = "services[{!r}]".format(nid)
+        if not isinstance(record, dict):
+            problems.append("{} must be an object".format(label))
+            continue
+        for field in ("pid", "pgid"):
+            if not is_positive_int(record.get(field)):
+                problems.append("{} field {!r} must be a positive integer".format(label, field))
+        for field in ("command", "log", "started_at"):
+            value = record.get(field)
+            if not isinstance(value, str) or not value.strip():
+                problems.append("{} field {!r} must be a non-empty string".format(label, field))
+    return problems
+
+
+def validate_residue(residue) -> list:
+    """Validate the root ``residue`` array (C-G2)."""
+    if not isinstance(residue, list):
+        return ["root field 'residue' must be an array"]
+    problems = []
+    for position, entry in enumerate(residue):
+        label = "residue[{}]".format(position)
+        if not isinstance(entry, dict):
+            problems.append("{} must be an object".format(label))
+            continue
+        node_id = entry.get("node_id")
+        if not isinstance(node_id, str) or not ID_RE.match(node_id):
+            problems.append("{} field 'node_id' must be a valid id".format(label))
+        scopes = entry.get("scopes")
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or any(scope not in SIDE_EFFECT_SCOPES for scope in scopes)
+        ):
+            problems.append(
+                "{} field 'scopes' must be an array of {}".format(label, list(SIDE_EFFECT_SCOPES))
+            )
+        undo = entry.get("undo")
+        if not isinstance(undo, list) or any(
+            not isinstance(cmd, str) or not cmd.strip() for cmd in undo
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(label)
+            )
+        if entry.get("reason") not in RESIDUE_REASONS:
+            problems.append(
+                "{} field 'reason' must be one of {}, got {!r}".format(
+                    label, list(RESIDUE_REASONS), entry.get("reason")
+                )
+            )
+        recorded = entry.get("recorded_at")
+        if not isinstance(recorded, str) or not recorded.strip():
+            problems.append("{} field 'recorded_at' must be a non-empty string".format(label))
+    return problems
+
+
+def is_positive_int(value) -> bool:
+    """True for ints >= 1 (bools excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def is_port(value) -> bool:
+    """True for TCP port numbers 1-65535 (C-G3)."""
+    return is_positive_int(value) and value <= 65535
+
+
+def validate_interactive(block, label: str) -> list:
+    """Validate a node's ``interactive`` block (C-G11)."""
+    if not isinstance(block, dict):
+        return ["{} field 'interactive' must be an object".format(label)]
+    problems = []
+    for field in block:
+        if field not in INTERACTIVE_FIELDS:
+            problems.append("{} interactive does not accept {!r}".format(label, field))
+    if "answers" in block:
+        answers = block["answers"]
+        if not isinstance(answers, list) or any(not isinstance(a, str) for a in answers):
+            problems.append("{} interactive.answers must be an array of strings".format(label))
+    if "human" in block and not isinstance(block["human"], bool):
+        problems.append("{} interactive.human must be a boolean".format(label))
+    return problems
+
+
+def interactive_hints(node: dict) -> list:
+    """Lines telling the agent how to run an interactive node (C-G11)."""
+    block = node.get("interactive")
+    if not isinstance(block, dict):
+        return []
+    lines = []
+    answers = block.get("answers") or []
+    if answers:
+        command = (node.get("commands") or ["<command>"])[0]
+        lines.append(
+            "feed answers: printf '%s\\n' {} | {}".format(
+                " ".join(shlex.quote(answer) for answer in answers), command
+            )
+        )
+    if block.get("human"):
+        lines.append("a person must run this step (interactive)")
+    return lines
+
+
+def validate_requires(requires) -> list:
+    """Validate the root ``requires`` block: tools and OS preconditions (C-G4)."""
+    if not isinstance(requires, dict):
+        return ["root field 'requires' must be an object"]
+    problems = []
+    for field in requires:
+        if field not in REQUIRES_FIELDS:
+            problems.append("requires does not accept {!r}".format(field))
+    tools = requires.get("tools", {})
+    if not isinstance(tools, dict):
+        problems.append("requires.tools must be an object of name -> version spec")
+        tools = {}
+    for name, spec in tools.items():
+        if not re.match(r"^[A-Za-z0-9._+-]+$", name):
+            problems.append("requires.tools name {!r} is not a plain command name".format(name))
+        problems.extend(validate_tool_spec(spec, name))
+    if "os" in requires:
+        value = requires["os"]
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(set(value)) != len(value)
+            or any(item not in PREFLIGHT_OS for item in value)
+        ):
+            problems.append("requires.os must be a unique array of {}".format(list(PREFLIGHT_OS)))
+    return problems
+
+
+def validate_tool_spec(spec, name: str) -> list:
+    """A spec is ``"*"``, ``">=X[.Y[.Z]]"``, or ``{"min": "X.Y", "version_command": str}``."""
+    label = "requires.tools[{!r}]".format(name)
+    if isinstance(spec, str):
+        if spec == "*" or re.match(r"^>=\d+(?:\.\d+){0,2}$", spec):
+            return []
+        return ["{} must be \"*\", \">=X[.Y[.Z]]\", or an object, got {!r}".format(label, spec)]
+    if isinstance(spec, dict):
+        problems = []
+        for field in spec:
+            if field not in TOOL_SPEC_FIELDS:
+                problems.append("{} does not accept {!r}".format(label, field))
+        if not isinstance(spec.get("min"), str) or not VERSION_SPEC_RE.match(spec.get("min")):
+            problems.append("{} needs 'min' as X[.Y[.Z]]".format(label))
+        command = spec.get("version_command")
+        if "version_command" in spec and (not isinstance(command, str) or not command.strip()):
+            problems.append("{} version_command must be a non-empty string".format(label))
+        return problems
+    return ["{} must be a string or an object".format(label)]
+
+
+def validate_preflight(record) -> list:
+    """The root ``preflight`` record written by ``doctor`` (C-G4)."""
+    if not isinstance(record, dict):
+        return ["root field 'preflight' must be an object"]
+    problems = []
+    if not isinstance(record.get("passed"), bool):
+        problems.append("preflight.passed must be a boolean")
+    if not isinstance(record.get("at"), str):
+        problems.append("preflight.at must be a timestamp string")
+    missing = record.get("missing")
+    if not isinstance(missing, list) or any(not isinstance(item, str) for item in missing):
+        problems.append("preflight.missing must be an array of strings")
+    return problems
+
+
+def version_tuple(text: str) -> tuple:
+    """'24.0.7' -> (24, 0, 7), padded to three parts for comparison."""
+    parts = tuple(int(piece) for piece in text.split("."))
+    return parts + (0,) * (3 - len(parts))
+
+
+def spec_parts(spec) -> tuple:
+    """(minimum tuple or None, version command or None) for a validated spec."""
+    if spec == "*":
+        return None, None
+    if isinstance(spec, str):
+        return version_tuple(spec[2:]), None
+    return version_tuple(spec["min"]), spec.get("version_command")
+
+
+def probe_tool(name: str, command) -> tuple:
+    """Run the version command. Returns (kind, text): kind is missing, found, or unknown."""
+    shell_command = command or "{} --version".format(shlex.quote(name))
+    try:
+        proc = subprocess.run(
+            shell_command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=DOCTOR_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "timed out"
+    except OSError:
+        return "missing", ""
+    if proc.returncode == 127:
+        return "missing", ""
+    match = VERSION_FIND_RE.search(proc.stdout or "")
+    if match:
+        return "found", match.group(0)
+    return "unknown", ""
+
+
+def check_tool(name: str, spec) -> dict:
+    """One ``doctor`` row for a tool (C-G4)."""
+    minimum, command = spec_parts(spec)
+    need = spec if isinstance(spec, str) else "min {}".format(spec["min"])
+    kind, text = probe_tool(name, command)
+    row = {"name": name, "found": text or "-", "need": need}
+    if kind == "missing":
+        row.update(status="missing", ok=False)
+    elif minimum is None:
+        # "*" accepts any tool that runs, even when its version cannot be read.
+        row.update(status="ok" if kind == "found" else "unknown-version", ok=True)
+    elif kind != "found":
+        row.update(status="unknown-version", ok=False)
+    elif version_tuple(text) < minimum:
+        row.update(status="too-old", ok=False)
+    else:
+        row.update(status="ok", ok=True)
+    return row
+
+
+def run_checks(requires: dict) -> tuple:
+    """Check every declared tool and the OS. Returns (passed, rows, missing names)."""
+    rows = [check_tool(name, spec) for name, spec in (requires.get("tools") or {}).items()]
+    missing = [row["name"] for row in rows if not row["ok"]]
+    passed = not missing
+    if "os" in requires:
+        current = platform.system().lower()
+        ok = current in requires["os"]
+        rows.append({
+            "name": "os",
+            "status": "ok" if ok else "mismatch",
+            "found": current,
+            "need": ", ".join(requires["os"]),
+            "ok": ok,
+        })
+        passed = passed and ok
+    return passed, rows, missing
+
+
+def format_check(row: dict) -> str:
+    return "{:<16} {:<22} {} (need {})".format(row["status"], row["name"], row["found"], row["need"])
+
+
+def cmd_doctor(args, state_path: Path, workspace: Path) -> int:
+    """Check declared tools and OS; record the result as ``preflight`` (C-G4)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    if "requires" not in state:
+        say("no requires block; nothing to check")
+        return EXIT_OK
+    passed, rows, missing = run_checks(state["requires"])
+    state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
+    save_state(state_path, state)
+    if args.json:
+        say(json.dumps({"passed": passed, "checks": rows}, indent=2))
+    else:
+        for row in rows:
+            say(format_check(row))
+        say("preflight passed" if passed else "preflight failed: {}".format(
+            ", ".join(missing) or "os mismatch"))
+    return EXIT_OK if passed else EXIT_FAIL
+
+
+def preflight_gate(state: dict, state_path: Path, skip: bool) -> None:
+    """Run doctor before the first node when the DAG declares ``requires`` (C-G4)."""
+    if skip or "requires" not in state:
+        return
+    if any(node.get("status") in ("completed", "skipped") for node in state.get("nodes") or []):
+        return
+    if (state.get("preflight") or {}).get("passed") is True:
+        return
+    passed, rows, missing = run_checks(state["requires"])
+    state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
+    save_state(state_path, state)
+    if passed:
+        return
+    failing = ", ".join(missing) or "os mismatch"
+    raise CliError(
+        "preflight failed ({}): run doctor, or pass --skip-doctor to continue anyway".format(
+            failing
+        )
+    )
 
 
 def validate_verification(verification, label: str) -> list:
@@ -508,6 +1010,8 @@ def validate_verification(verification, label: str) -> list:
         ]
     problems = []
     for field in VERIFICATION_REQUIRED[kind]:
+        if field == "port":
+            continue  # integer, checked with the other port_listening fields below
         value = verification.get(field)
         if not isinstance(value, str) or not value.strip():
             problems.append(
@@ -522,6 +1026,28 @@ def validate_verification(verification, label: str) -> list:
                     label, kind, field
                 )
             )
+    if kind == "port_listening":
+        if not is_port(verification.get("port")):
+            problems.append("{} verification.port must be an integer 1-65535".format(label))
+        if "host" in verification and (
+            not isinstance(verification["host"], str) or not verification["host"].strip()
+        ):
+            problems.append("{} verification.host must be a non-empty string".format(label))
+        if "timeout" in verification and not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
+    if kind == "http":
+        url = verification.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            problems.append("{} verification.url must start with http:// or https://".format(label))
+        if "expect_status" in verification and not (
+            is_positive_int(verification["expect_status"])
+            and 100 <= verification["expect_status"] <= 599
+        ):
+            problems.append("{} verification.expect_status must be an HTTP status code".format(label))
+        if "timeout" in verification and not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
+        if "pattern" in verification:
+            problems.extend(bad_regex(verification["pattern"], label, "verification.pattern"))
     if kind == "command" and "expect_exit" in verification:
         expect = verification.get("expect_exit")
         if not isinstance(expect, int) or isinstance(expect, bool) or expect < 0:
@@ -531,6 +1057,12 @@ def validate_verification(verification, label: str) -> list:
     if kind == "file_contains" and "regex" in verification:
         if not isinstance(verification.get("regex"), bool):
             problems.append("{} verification.regex must be a boolean".format(label))
+    if kind == "command" and "stdin" in verification:
+        if not isinstance(verification["stdin"], str):
+            problems.append("{} verification.stdin must be a string".format(label))
+    if kind == "command" and "timeout" in verification:
+        if not is_positive_int(verification["timeout"]):
+            problems.append("{} verification.timeout must be a positive integer".format(label))
     if kind == "command" and "pattern" in verification:
         problems.extend(bad_regex(verification["pattern"], label, "verification.pattern"))
     if kind == "file_contains" and verification.get("regex") and "pattern" in verification:
@@ -598,8 +1130,8 @@ def git_common_dir(workspace: Path) -> Path:
     return path.resolve()
 
 
-def ensure_excluded(workspace: Path) -> bool:
-    """Add the state file to ``.git/info/exclude``. Returns True if it changed."""
+def ensure_excluded(workspace: Path, line: str = EXCLUDE_LINE) -> bool:
+    """Add ``line`` (default: the state file) to ``.git/info/exclude``. Returns True if it changed."""
     exclude = git_common_dir(workspace) / "info" / "exclude"
     existing = ""
     if exclude.exists():
@@ -607,14 +1139,14 @@ def ensure_excluded(workspace: Path) -> bool:
             existing = exclude.read_text(encoding="utf-8")
         except OSError as exc:
             raise CliError("cannot read {}: {}".format(exclude, exc))
-    for line in existing.splitlines():
-        if line.strip() == EXCLUDE_LINE:
+    for known in existing.splitlines():
+        if known.strip() == line:
             return False
     exclude.parent.mkdir(parents=True, exist_ok=True)
     with exclude.open("a", encoding="utf-8") as handle:
         if existing and not existing.endswith("\n"):
             handle.write("\n")
-        handle.write("{}\n".format(EXCLUDE_LINE))
+        handle.write("{}\n".format(line))
     return True
 
 
@@ -696,6 +1228,51 @@ def workspace_relative(workspace: Path, raw: str, label: str) -> Path:
     return resolved
 
 
+def check_http(verification: dict) -> tuple:
+    """GET the URL and compare the status (and optional body pattern) (C-G3).
+
+    Any HTTP status is compared to ``expect_status``; only transport failures fail
+    before a status arrives. Proxies are ignored so local checks stay local.
+    """
+    url = verification["url"]
+    expect = verification.get("expect_status", 200)
+    timeout = verification.get("timeout", 5)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(65536).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status, body = exc.code, ""
+    except (OSError, ValueError) as exc:
+        return False, ["FAIL: cannot reach {}: {}".format(url, exc)]
+    lines = ["GET {} -> {} (expected {})".format(url, status, expect)]
+    if status != expect:
+        return False, lines + ["FAIL: status {} != {}".format(status, expect)]
+    pattern = verification.get("pattern")
+    if pattern:
+        try:
+            matched = re.search(pattern, body)
+        except re.error as exc:
+            return False, lines + ["FAIL: verification.pattern is not a valid regex: {}".format(exc)]
+        if not matched:
+            return False, lines + ["FAIL: body did not match pattern {!r}".format(pattern)]
+        lines.append("matched pattern {!r}".format(pattern))
+    return True, lines + ["PASS"]
+
+
+def check_port(verification: dict) -> tuple:
+    """Succeed when a TCP connection to host:port is accepted (C-G3)."""
+    host = verification.get("host", "127.0.0.1")
+    port = verification["port"]
+    timeout = verification.get("timeout", 2)
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+    except OSError as exc:
+        return False, ["FAIL: nothing accepts connections on {}:{} ({})".format(host, port, exc)]
+    return True, ["PASS: {}:{} accepts connections".format(host, port)]
+
+
 def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     """Execute a node's gate. Returns ``(passed, lines)``."""
     verification = node.get("verification") or {}
@@ -705,6 +1282,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     if kind == "command":
         command = verification["command"]
         expect = verification.get("expect_exit", 0)
+        timeout = verification.get("timeout", COMMAND_TIMEOUT)
+        # C-G11: a declared stdin is fed as input; otherwise stdin is /dev/null (EOF).
+        stdin_kwargs = (
+            {"input": verification["stdin"]} if "stdin" in verification
+            else {"stdin": subprocess.DEVNULL}
+        )
         try:
             proc = subprocess.run(
                 command,
@@ -713,11 +1296,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
-                timeout=COMMAND_TIMEOUT,
+                timeout=timeout,
+                **stdin_kwargs
             )
         except subprocess.TimeoutExpired:
             return False, [
-                "command timed out after {}s: {}".format(COMMAND_TIMEOUT, command)
+                "command timed out after {}s: {}".format(timeout, command)
             ]
         except OSError as exc:
             return False, ["could not run command {!r}: {}".format(command, exc)]
@@ -788,6 +1372,12 @@ def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
             "  re-run with --yes once the human has confirmed.",
         ]
 
+    if kind == "http":
+        return check_http(verification)
+
+    if kind == "port_listening":
+        return check_port(verification)
+
     raise CliError(
         "{} has unsupported verification type {!r}".format(label, kind), EXIT_USAGE
     )
@@ -818,13 +1408,19 @@ def header_line(state: dict, workspace: Path) -> str:
     unlocked_text = ", ".join(unlocked[:4]) if unlocked else "none"
     if len(unlocked) > 4:
         unlocked_text += ", +{}".format(len(unlocked) - 4)
-    return "[{} | {} | {} | {} | active: {} | next: {}]".format(
+    residue_count = len(state.get("residue") or [])
+    residue_text = " | residue: {}".format(residue_count) if residue_count else ""
+    svc_count = len(state.get("services") or {})
+    svc_text = " | svc: {}".format(svc_count) if svc_count else ""
+    return "[{} | {} | {} | {} | active: {} | next: {}{}{}]".format(
         state.get("mode"),
         state.get("persistence"),
         branch,
         progress,
         active,
         unlocked_text,
+        residue_text,
+        svc_text,
     )
 
 
@@ -847,11 +1443,13 @@ def render_graph(state: dict) -> list:
         node = index[nid]
         state_label = derived_state(state, nid, index, parents)
         deps = ", ".join(parents[nid]) if parents[nid] else "-"
+        tier, _ = risk_tier(node)
         rows.append(
             (
                 "> " if state.get("active_node_id") == nid else "  ",
                 nid,
                 state_label,
+                RISK_SHORT[tier],
                 node.get("action_type", "?"),
                 deps,
                 short(node.get("commit_sha")),
@@ -861,22 +1459,23 @@ def render_graph(state: dict) -> list:
     if not rows:
         return ["  (no nodes yet - decompose the tutorial, then re-run validate)"]
 
-    headers = ("  ", "ID", "STATE", "ACTION", "DEPS", "COMMIT", "TITLE")
+    headers = ("  ", "ID", "STATE", "RISK", "ACTION", "DEPS", "COMMIT", "TITLE")
+    last = len(headers) - 1
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            if i == 6:
+            if i == last:
                 continue
             widths[i] = max(widths[i], len(str(cell)))
     lines = []
     template = "  ".join("{{:{}}}".format(w) if i else "{{:{}s}}".format(w) for i, w in enumerate(widths))
     lines.append(template.format(*headers).rstrip())
-    lines.append(template.format(*["  ", "-" * widths[1], "-" * widths[2], "-" * widths[3], "-" * widths[4], "-" * widths[5], "-"]).rstrip())
+    lines.append(template.format(*["  "] + ["-" * w for w in widths[1:last]] + ["-"]).rstrip())
     for row in rows:
-        title = row[6]
+        title = row[last]
         if len(title) > 52:
             title = title[:49] + "..."
-        lines.append((template.format(*(list(row[:6]) + [title]))).rstrip())
+        lines.append((template.format(*(list(row[:last]) + [title]))).rstrip())
     return lines
 
 
@@ -949,6 +1548,7 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
                 )
 
     excluded = ensure_excluded(workspace)
+    ensure_excluded(workspace, LOG_EXCLUDE_LINE)
     sha = head_sha(workspace)
     if not sha:
         warn(
@@ -1045,6 +1645,28 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     for line in render_graph(state):
         say(line)
     say("")
+    for entry in state.get("residue") or []:
+        undo = entry.get("undo") or []
+        say(
+            "residue  {} [{}] {}{}".format(
+                entry["node_id"],
+                ", ".join(entry.get("scopes") or []),
+                entry.get("reason"),
+                " undo: {}".format("; ".join(undo)) if undo else "",
+            )
+        )
+    if state.get("residue"):
+        say("")
+    services = state.get("services") or {}
+    for nid in sorted(services):
+        record = services[nid]
+        say(
+            "services: {} (pid {}, {})".format(
+                nid, record["pid"], "running" if pid_alive(record["pid"]) else "dead"
+            )
+        )
+    if services:
+        say("")
     index = node_index(state)
     parents, _ = relation_maps(state)
     active = state.get("active_node_id")
@@ -1056,6 +1678,8 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
             say("  $ {}".format(command))
         for artifact in node.get("artifacts") or []:
             say("  * {}".format(artifact))
+        for hint in interactive_hints(node):
+            say("  {}".format(hint))
         verification = node.get("verification") or {}
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
         unmet = [
@@ -1076,6 +1700,42 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def check_risk(state: dict, nid: str) -> None:
+    """Gate a node on its risk tier (C-G6). Only hands-off ever blocks."""
+    node = node_index(state)[nid]
+    tier, labels = risk_tier(node)
+    if tier != "high":
+        return
+    detail = ", ".join(labels) or "declared risk high"
+    if risk_blocked(state, node):
+        raise CliError(
+            "'{}' is high risk ({}) and hands-off mode will not run it until a person "
+            "approves. After they say yes, run `approve {}`.".format(nid, detail, nid)
+        )
+    say("risk: high ({})".format(detail))
+
+
+def cmd_approve(args, state_path: Path, workspace: Path) -> int:
+    """Record a person's approval of a node's current risk tier (C-G6)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    node = get_node(state, args.node_id)
+    tier, labels = risk_tier(node)
+    node["approved"] = {"tier": tier, "at": now_iso()}
+    save_state(state_path, state)
+    say(
+        "approved {} at risk {} ({})".format(
+            args.node_id, tier, ", ".join(labels) or "declared"
+        )
+    )
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
     state = load_state(state_path)
@@ -1084,6 +1744,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
         for problem in problems:
             err(problem)
         return EXIT_FAIL
+    preflight_gate(state, state_path, getattr(args, "skip_doctor", False))
 
     if args.node_id:
         node = get_node(state, args.node_id)
@@ -1108,9 +1769,12 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
                     args.node_id, ", ".join(unmet), args.node_id
                 )
             )
+        check_risk(state, args.node_id)
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
         say("active -> {}".format(summary(state, args.node_id)))
+        for hint in interactive_hints(index[args.node_id]):
+            say("  {}".format(hint))
         say(header_line(state, workspace))
         return EXIT_OK
 
@@ -1134,9 +1798,12 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
             "`next <id>`.".format(len(ready), ", ".join(ready)),
             EXIT_FAIL,
         )
+    check_risk(state, ready[0])
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
     say("active -> {}".format(summary(state, ready[0])))
+    for hint in interactive_hints(index[ready[0]]):
+        say("  {}".format(hint))
     say(header_line(state, workspace))
     return EXIT_OK
 
@@ -1267,8 +1934,69 @@ def nearest_ancestor_sha(state: dict, ancestors: list, workspace: Path, target: 
     return resolve_sha(workspace, initial)
 
 
+def node_scopes(node: dict) -> list:
+    """Side-effect scopes for a node; an absent ``side_effects`` means repo-only (C-G2)."""
+    return list(node.get("side_effects") or ["repo"])
+
+
+def side_effect_line(node: dict) -> str:
+    """One listing line for a rewound node with non-repo side effects (C-G2)."""
+    undo = node.get("undo") or []
+    tail = "undo: {}".format("; ".join(undo)) if undo else "undo: (none) | irreversible"
+    return "side effects: {} [{}] {}".format(
+        node["id"], ", ".join(node_scopes(node)), tail
+    )
+
+
+def residue_entry(node: dict, reason: str) -> dict:
+    """A root ``residue`` record for one node (C-G2)."""
+    return {
+        "node_id": node["id"],
+        "scopes": node_scopes(node),
+        "undo": list(node.get("undo") or []),
+        "reason": reason,
+        "recorded_at": now_iso(),
+    }
+
+
+def record_residue(state: dict, entries: list) -> None:
+    """Store entries, replacing any earlier residue for the same nodes."""
+    replaced = {entry["node_id"] for entry in entries}
+    kept = [e for e in state.get("residue") or [] if e.get("node_id") not in replaced]
+    state["residue"] = kept + entries
+
+
+def run_undo(node: dict, workspace: Path) -> tuple:
+    """Run a node's undo commands in order. Returns (ok, message)."""
+    for command in node.get("undo") or []:
+        say("  undo {}: {}".format(node["id"], command))
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(workspace),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=COMMAND_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "timed out after {}s: {}".format(COMMAND_TIMEOUT, command)
+        if proc.returncode != 0:
+            return False, "exit {}: {}\n{}".format(
+                proc.returncode, command, tail(proc.stdout or "")
+            )
+    return True, ""
+
+
 def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     """Move the active pointer, optionally fast-forwarding and reverting work."""
+    if args.undo and not args.reset_descendants:
+        raise CliError(
+            "--undo runs the undo commands of rewound nodes, so it must be paired "
+            "with --reset-descendants",
+            EXIT_USAGE,
+        )
     state = load_state(state_path)
     problems, _ = validate_document(state)
     if problems:
@@ -1361,16 +2089,58 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     if args.git_rollback != "none" and args.reset_descendants:
         # The target's own artifacts were just reverted, so it is redoable too.
         reset_from = [target] + reset_from
+    rewound = []
     if args.reset_descendants:
         order, _ = topological_order(state)
         pos = {nid: i for i, nid in enumerate(order)}
         reset_from = sorted(set(reset_from), key=lambda nid: pos.get(nid, 0))
+        rewound = [nid for nid in reset_from if index[nid].get("status") == "completed"]
         for nid in reset_from:
             index[nid]["status"] = "pending"
             index[nid]["commit_sha"] = None
         say(
             "reset to pending: {}".format(", ".join(reset_from) if reset_from else "(none)")
         )
+        for nid in [target] + list(descendants):
+            record = (state.get("services") or {}).get(nid)
+            if record:
+                was_running = stop_record(record, node_stop_signal(state, nid))
+                say(
+                    "stopped service {} (pid {}{})".format(
+                        nid, record["pid"], "" if was_running else ", was not running"
+                    )
+                )
+                drop_service(state, nid)
+
+    # Rewound nodes with non-repo side effects, newest first (C-G2).
+    listed = [nid for nid in reversed(rewound) if set(node_scopes(index[nid])) - {"repo"}]
+    for nid in listed:
+        say(side_effect_line(index[nid]))
+
+    undo_failed = False
+    if args.undo:
+        for nid in listed:
+            node = index[nid]
+            scopes = node_scopes(node)
+            if undo_failed:
+                record_residue(state, [residue_entry(node, "not-run")])
+            elif "remote" in scopes:
+                record_residue(state, [residue_entry(node, "remote")])
+            elif risk_blocked(state, node):
+                say("skipped undo of {} (hands-off: high risk, not approved)".format(nid))
+                record_residue(state, [residue_entry(node, "not-run")])
+            elif not node.get("undo"):
+                record_residue(state, [residue_entry(node, "irreversible")])
+            else:
+                ok, message = run_undo(node, workspace)
+                if ok:
+                    say("undone: {}".format(nid))
+                else:
+                    undo_failed = True
+                    err("undo failed for {}: {}".format(nid, message))
+                    record_residue(state, [residue_entry(node, "failed")])
+    elif listed:
+        record_residue(state, [residue_entry(index[nid], "not-run") for nid in listed])
 
     state["active_node_id"] = target
     save_state(state_path, state)
@@ -1380,6 +2150,227 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             "  ({} is {}; jump to its parent, or re-jump with --reset-descendants, "
             "to redo its work)".format(target, index[target]["status"])
         )
+    say(header_line(state, workspace))
+    return EXIT_FAIL if undo_failed else EXIT_OK
+
+
+def require_posix() -> None:
+    """Services need process groups and signals; refuse cleanly elsewhere (C-G3)."""
+    if os.name != "posix":
+        raise CliError("services require a POSIX system", EXIT_USAGE)
+
+
+def pid_alive(pid: int) -> bool:
+    """True when ``pid`` exists. Always False off POSIX, where services never run."""
+    if os.name != "posix":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def signal_group(pgid: int, name: str) -> None:
+    """Send a named signal to a process group; a group that is already gone is fine."""
+    try:
+        os.killpg(pgid, getattr(signal, SERVICE_SIGNALS[name]))
+    except ProcessLookupError:
+        pass
+
+
+def node_stop_signal(state: dict, nid: str) -> str:
+    """The node's declared ``stop_signal``, defaulting to TERM."""
+    node = node_index(state).get(nid) or {}
+    return (node.get("service") or {}).get("stop_signal", "TERM")
+
+
+def stop_record(record: dict, stop_signal: str = "TERM", proc=None) -> bool:
+    """Stop one recorded service group: signal, wait up to the grace period, then KILL.
+
+    ``proc`` is the live Popen handle when this process started the service, so the
+    exit can be reaped; otherwise liveness is probed by pid. Returns True if it ran.
+    """
+    def alive() -> bool:
+        return proc.poll() is None if proc is not None else pid_alive(record["pid"])
+
+    if not alive():
+        return False
+    signal_group(record["pgid"], stop_signal)
+    deadline = time.monotonic() + SERVICE_STOP_GRACE
+    while alive() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if alive():
+        signal_group(record["pgid"], "KILL")
+        if proc is not None:
+            proc.wait()
+    return True
+
+
+def drop_service(state: dict, nid: str) -> None:
+    """Remove a service record and the ``services`` key when it is empty."""
+    services = state.get("services") or {}
+    services.pop(nid, None)
+    if services:
+        state["services"] = services
+    else:
+        state.pop("services", None)
+
+
+def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
+    """Start a node's service detached and wait for its ``ready`` check (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+
+    nid = args.node_id or require_active_node(state)
+    node = get_node(state, nid)
+    service = node.get("service")
+    if not service:
+        raise CliError("node '{}' has no service block".format(nid), EXIT_USAGE)
+    check_risk(state, nid)
+
+    services = state.setdefault("services", {})
+    previous = services.get(nid)
+    if previous and pid_alive(previous["pid"]):
+        raise CliError(
+            "service for {} is already running (pid {}); run `service stop {}` "
+            "first".format(nid, previous["pid"], nid)
+        )
+    drop_service(state, nid)
+    ensure_excluded(workspace, LOG_EXCLUDE_LINE)
+
+    log_rel = "{}/{}.log".format(LOG_DIR_NAME, nid)
+    log_path = workspace / log_rel
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            service["command"],
+            shell=True,
+            cwd=str(workspace),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    record = {
+        "pid": proc.pid,
+        "pgid": proc.pid,
+        "command": service["command"],
+        "log": log_rel,
+        "started_at": now_iso(),
+    }
+    state.setdefault("services", {})[nid] = record
+    save_state(state_path, state)
+    say("starting {} (pid {}), waiting for ready".format(nid, proc.pid))
+
+    ready = service["ready"]
+    timeout = service.get("ready_timeout", 30)
+    deadline = time.monotonic() + timeout
+    while True:
+        if proc.poll() is not None:
+            reason = "exited with code {}".format(proc.returncode)
+            break
+        passed, _ = run_verification({"id": nid, "verification": ready}, workspace, False)
+        if passed:
+            save_state(state_path, state)
+            say("service {} ready (pid {}, log {})".format(nid, proc.pid, log_rel))
+            say(header_line(state, workspace))
+            return EXIT_OK
+        if time.monotonic() >= deadline:
+            reason = "ready check did not pass within {}s".format(timeout)
+            break
+        time.sleep(SERVICE_POLL)
+
+    stop_record(record, service.get("stop_signal", "TERM"), proc)
+    drop_service(state, nid)
+    save_state(state_path, state)
+    err("service {} failed: {}".format(nid, reason))
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if log_text.strip():
+        err("--- log tail ({}) ---".format(log_rel))
+        err(tail(log_text))
+    return EXIT_FAIL
+
+
+def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
+    """Stop a recorded service; a process that already exited is not an error (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    nid = args.node_id or require_active_node(state)
+    record = (state.get("services") or {}).get(nid)
+    if not record:
+        say("no service recorded for {}".format(nid))
+        return EXIT_OK
+    was_running = stop_record(record, node_stop_signal(state, nid))
+    drop_service(state, nid)
+    save_state(state_path, state)
+    if was_running:
+        say("stopped {} (pid {})".format(nid, record["pid"]))
+    else:
+        say("{} was not running (pid {}); record removed".format(nid, record["pid"]))
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
+def cmd_teardown(args, state_path: Path, workspace: Path) -> int:
+    """Stop every recorded service (C-G3)."""
+    require_posix()
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+    services = dict(state.get("services") or {})
+    if not services:
+        say("no services recorded")
+        return EXIT_OK
+    for nid in sorted(services):
+        record = services[nid]
+        was_running = stop_record(record, node_stop_signal(state, nid))
+        say(
+            "stopped {} (pid {})".format(nid, record["pid"])
+            if was_running
+            else "{} was not running (pid {})".format(nid, record["pid"])
+        )
+        drop_service(state, nid)
+    save_state(state_path, state)
+    say(header_line(state, workspace))
+    return EXIT_OK
+
+
+def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
+    """Remove residue entries once the user has handled them (C-G2)."""
+    state = load_state(state_path)
+    if bool(args.node_id) == bool(args.all):
+        raise CliError(
+            "residue clear takes exactly one of <node_id> or --all", EXIT_USAGE
+        )
+    entries = state.get("residue") or []
+    if args.all:
+        removed = entries
+        kept = []
+    else:
+        removed = [e for e in entries if e.get("node_id") == args.node_id]
+        kept = [e for e in entries if e.get("node_id") != args.node_id]
+    if not removed:
+        say("no residue recorded for {}".format(args.node_id or "any node"))
+        return EXIT_OK
+    state["residue"] = kept
+    save_state(state_path, state)
+    say("cleared residue: {}".format(", ".join(e["node_id"] for e in removed)))
     say(header_line(state, workspace))
     return EXIT_OK
 
@@ -1448,7 +2439,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     nxt = sub.add_parser("next", help="advance the active pointer")
     nxt.add_argument("node_id", nargs="?", default=None, help="ready node to activate")
+    nxt.add_argument(
+        "--skip-doctor",
+        action="store_true",
+        help="continue past a failed preflight (requires block) without running doctor",
+    )
     nxt.set_defaults(func=cmd_next)
+
+    doctor = sub.add_parser("doctor", help="check the tools and OS declared in requires")
+    doctor.add_argument("--json", action="store_true", help="print the checks as JSON")
+    doctor.set_defaults(func=cmd_doctor)
 
     verify = sub.add_parser("verify", help="run a node's verification gate")
     verify.add_argument("node_id", nargs="?", default=None)
@@ -1500,7 +2500,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow --git-rollback hard to discard uncommitted changes",
     )
+    jump.add_argument(
+        "--undo",
+        action="store_true",
+        help="run undo commands of rewound user/system nodes (needs --reset-descendants)",
+    )
     jump.set_defaults(func=cmd_jump)
+
+    service = sub.add_parser("service", help="start, stop, or check background services")
+    service_sub = service.add_subparsers(dest="service_command", metavar="ACTION")
+    service_sub.required = True
+    svc_start = service_sub.add_parser("start", help="start a node's service and wait for ready")
+    svc_start.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    svc_start.set_defaults(func=cmd_service_start)
+    svc_stop = service_sub.add_parser("stop", help="stop a node's recorded service")
+    svc_stop.add_argument("node_id", nargs="?", default=None, help="node (default: active)")
+    svc_stop.set_defaults(func=cmd_service_stop)
+
+    teardown = sub.add_parser("teardown", help="stop every recorded service")
+    teardown.set_defaults(func=cmd_teardown)
+
+    approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
+    approve.add_argument("node_id", help="node whose current risk tier to approve")
+    approve.set_defaults(func=cmd_approve)
+
+    residue = sub.add_parser("residue", help="manage residue left by jump")
+    residue_sub = residue.add_subparsers(dest="residue_command", metavar="ACTION")
+    residue_sub.required = True
+    residue_clear = residue_sub.add_parser("clear", help="remove residue entries")
+    residue_clear.add_argument("node_id", nargs="?", default=None, help="node to clear")
+    residue_clear.add_argument("--all", action="store_true", help="clear every entry")
+    residue_clear.set_defaults(func=cmd_residue_clear)
 
     return parser
 

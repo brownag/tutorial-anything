@@ -1,0 +1,114 @@
+{
+  "schema_version": "1.0",
+  "title": "Load a CSV into SQLite",
+  "source_doc": "tests/corpus/sqlite-data/tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-01-31T09:00:00Z",
+  "updated_at": "2026-01-31T09:00:00Z",
+  "git": {
+    "branch": "tutorial/sqlite-data",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "nodes": [
+    {
+      "id": "1-design",
+      "title": "Read the data flow",
+      "summary": "Section 1: CSV in, SQLite table out, one query to check. No files change. Done when you can name the table the loader creates.",
+      "dependencies": [],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Name the table the loader creates and the file it reads."
+      }
+    },
+    {
+      "id": "2-write-csv",
+      "title": "Write the CSV",
+      "summary": "Section 2: write data.csv with three rows. Done when the file exists.",
+      "dependencies": ["1-design"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["data.csv"],
+      "commands": ["cat > data.csv <<'EOF'\nname,qty\napple,3\npear,5\nplum,7\nEOF"],
+      "verification": {
+        "type": "file_exists",
+        "path": "data.csv"
+      }
+    },
+    {
+      "id": "3-load-script",
+      "title": "Write the loader script",
+      "summary": "Section 3: load.py reads data.csv into data.db. Sibling of 2-write-csv.",
+      "dependencies": ["1-design"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["load.py"],
+      "commands": ["cat > load.py <<'EOF'\nimport csv\nimport sqlite3\n\nconn = sqlite3.connect('data.db')\nconn.execute('DROP TABLE IF EXISTS items')\nconn.execute('CREATE TABLE items (name TEXT, qty INTEGER)')\nwith open('data.csv') as f:\n    rows = [(r['name'], int(r['qty'])) for r in csv.DictReader(f)]\nconn.executemany('INSERT INTO items VALUES (?, ?)', rows)\nconn.commit()\nconn.close()\nEOF"],
+      "verification": {
+        "type": "file_contains",
+        "path": "load.py",
+        "pattern": "sqlite3",
+        "regex": false
+      }
+    },
+    {
+      "id": "4-load",
+      "title": "Load the CSV into data.db",
+      "summary": "Section 4: run load.py, then count the rows. Joins the CSV and script branches. Done when the count prints 3.",
+      "dependencies": ["2-write-csv", "3-load-script"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["data.db"],
+      "commands": ["python3 load.py"],
+      "verification": {
+        "type": "command",
+        "command": "python3 -c \"import sqlite3; print(sqlite3.connect('data.db').execute('select count(*) from items').fetchone()[0])\"",
+        "pattern": "^3$",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "5-query",
+      "title": "Query the table",
+      "summary": "Section 5: list the names in order. Done when the output has apple, pear, plum on separate lines.",
+      "dependencies": ["4-load"],
+      "action_type": "execute",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": ["python3 -c \"import sqlite3; [print(r[0]) for r in sqlite3.connect('data.db').execute('select name from items order by name')]\""],
+      "verification": {
+        "type": "command",
+        "command": "python3 -c \"import sqlite3; [print(r[0]) for r in sqlite3.connect('data.db').execute('select name from items order by name')]\"",
+        "pattern": "apple\\npear\\nplum",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "6-backup-note",
+      "title": "Note where the backup lives",
+      "summary": "Section 6: a manual step outside the workspace. Done when you have recorded where you keep copies of data.db.",
+      "dependencies": ["4-load"],
+      "action_type": "instruct",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm you noted where a copy of data.db is kept."
+      }
+    }
+  ]
+}

@@ -3,7 +3,7 @@ name: interactive-tutorial
 description: Turn a static coding tutorial, README, workshop doc, or technical walkthrough into an interactive graph you step through one step at a time, jump ahead into, and rewind out of. Use when the user asks to follow, work through, run, or execute a tutorial or walkthrough, wants to resume a half-finished tutorial, asks to convert documentation into a checkable step-by-step plan, or mentions a tutorial DAG, nodes, fast-forward, jump ahead, or rewind. Decomposes the document into verifiable nodes with real dependencies, tracks progress in .tutorial-dag.json, gates every step behind its own verification command, and checkpoints each file-changing step as a git commit so steps can be replayed or reverted. Supports guided, assisted, and hands-off autonomy plus file and in-context state persistence.
 license: MIT
 author: Andrew Gene Brown
-version: 1.0.0
+version: 1.1.0
 compatibility: python>=3.9, git>=2.25
 ---
 
@@ -38,7 +38,8 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
    ```
 
    `init` appends `.tutorial-dag.json` to `.git/info/exclude`. Git will not track this file, protecting your progress records across checkouts and resets.
-3. Select autonomy and persistence modes:
+3. If the DAG declares `requires`, run `doctor` before the first `next`. It checks the declared tools and OS. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
+4. Select autonomy and persistence modes:
 
    | Mode | Command execution | `confirm` check handler |
    |---|---|---|
@@ -77,10 +78,10 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" status
 ```
 
 ```text
-[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render]
+[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1 | svc: 1]
 ```
 
-This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. Use `--json` when you need full raw state.
+This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. `svc: N` appears only when N > 0 services are recorded. Use `--json` when you need full raw state.
 
 ## Step 4 — Execution loop
 
@@ -96,8 +97,24 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - `--commit` stages workspace changes and commits as `tutorial(<node-id>): <title>`. Use this for `mutate` and stateful `execute` nodes. Write files only for the current node.
 - Complete `read-only` and `instruct` nodes without `--commit`.
 - Use `--yes` to pass `confirm` checks after user confirmation.
+- For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
 - If multiple paths are ready, `next` stops and lists them. Ask the user which path to take.
 - If a check fails, fix the code or update the test. Do not bypass checks by editing the state file directly.
+
+### Services
+
+A node that starts a long-running process (a dev server, a watcher) declares a `service` block instead of a foreground command:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" service start    # active node, or pass <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" service stop <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" teardown         # stop all services
+```
+
+- `service start` runs the command detached, waits for the node's `ready` check, and writes the log to `.tutorial-logs/<id>.log`. If `ready` never passes, it prints the log tail and exits 1.
+- Complete the node after `service start`. Its `verification` (often `port_listening` or `http`) confirms the service works.
+- Run `teardown` when the session ends. `jump --reset-descendants` also stops the services it rewinds.
+- Services are POSIX only.
 
 ## Step 5 — Navigation and rewinds
 
@@ -120,10 +137,16 @@ Only use `--skip-ancestors` if prerequisite steps are already satisfied in the e
 | Review earlier step | `jump <target>` | Moves active pointer. Working files remain unchanged. |
 | Redo step from clean state | `jump <target> --reset-descendants --git-rollback hard` | Runs `git reset --hard` to target checkpoint. Resets downstream nodes to `pending`. |
 | Branch to test an alternative | `jump <target> --reset-descendants --git-rollback branch [--new-branch tutorial/alt]` | Creates a new branch at target checkpoint. Keeps current work intact. |
+| Redo and revert non-repo side effects | `jump <target> --reset-descendants --git-rollback hard --force --undo` | Resets as above, then runs each rewound node's `undo` commands. Failures and unrevertable nodes become `residue`. |
 
 - Rollback targets the nearest completed parent commit.
 - `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
 - Confirm with the user before rolling back completed `mutate` or `execute` nodes.
+- `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed as `side effects: <id> [<scopes>] undo: <cmd> | irreversible` and recorded as `residue`.
+- Confirm with the user before `--undo` on `system` scope.
+- `residue clear [<node_id> | --all]` removes residue entries once they are handled.
+- `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until it is approved.
+- Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
 
 ## In-context persistence
 
@@ -143,6 +166,9 @@ Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2
 ## Safety rules
 
 - Do not execute node `commands` directly in `guided` mode.
+- The CLI never runs node `commands`. It runs only a declared `service` command (`service start`) and declared `undo` commands (`jump --undo`).
+- Run `teardown` before you end a session that started services.
+- In `hands-off` mode, run `approve <node_id>` for a high-risk node only after a person says yes.
 - Do not complete a node without running its verification check.
 - Never run `git reset --hard` or `git clean` without user approval.
 - Do not commit `.tutorial-dag.json`.
