@@ -22,6 +22,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 CLI = SKILL_DIR / "scripts" / "dag_manager.py"
@@ -2061,6 +2062,41 @@ class ScaffoldTest(unittest.TestCase):
         (target / "keep.txt").write_text("mine", encoding="utf-8")
         code, out = self.scaffold("demo")
         self.assertEqual(code, 1, out)
+        self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_symlink_target_exits_1_and_is_untouched(self):
+        real = self.tmp / "real"
+        real.mkdir()
+        self.dest.mkdir(parents=True)
+        link = self.dest / "demo"
+        os.symlink(str(real), str(link), target_is_directory=True)
+        code, out = self.scaffold("demo", "--force")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(os.path.islink(str(link)))
+        self.assertTrue(real.is_dir())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_failed_swap_restores_old_target(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("mine", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("dag_manager_swap", str(self.cli_path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_rename = os.rename
+
+        def fake_rename(src, dst):
+            if (os.path.basename(str(src)).startswith(".demo.tmp-")
+                    and str(dst) == str(target)):
+                raise OSError("injected rename failure")
+            return real_rename(src, dst)
+
+        argv = ["--cwd", str(self.ws), "scaffold", "demo",
+                "--from", str(EXAMPLE_DAG), "--dest", str(self.dest), "--force"]
+        with mock.patch.object(os, "rename", side_effect=fake_rename):
+            code = module.main(argv)
+        self.assertEqual(code, 1)
         self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
         self.assertEqual(self.leftovers(), [])
 
