@@ -1652,6 +1652,9 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
                 record_residue(state, [residue_entry(node, "not-run")])
             elif "remote" in scopes:
                 record_residue(state, [residue_entry(node, "remote")])
+            elif risk_blocked(state, node):
+                say("skipped undo of {} (hands-off: high risk, not approved)".format(nid))
+                record_residue(state, [residue_entry(node, "not-run")])
             elif not node.get("undo"):
                 record_residue(state, [residue_entry(node, "irreversible")])
             else:

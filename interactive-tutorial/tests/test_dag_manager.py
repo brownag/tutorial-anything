@@ -754,6 +754,20 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(reasons, {"4-store": "remote", "3-smoke": "irreversible"})
         self.assertIn("residue: 2", self.cli("status", check=0)[1])
 
+    def test_hands_off_skips_undo_of_unapproved_high_risk_node(self):
+        self.run_to_store()
+        self._set_side_effects("4-store", ["user"], ["sudo rm -f undone.flag"])
+        state = self.state()
+        state["mode"] = "hands-off"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("jump", "3-smoke", "--reset-descendants", "--undo")
+        self.assertEqual(code, 0, output)
+        self.assertIn("skipped undo of 4-store", output)
+        self.assertEqual(
+            [("4-store", "not-run")],
+            [(e["node_id"], e["reason"]) for e in self.state().get("residue") or []],
+        )
+
     def test_undo_requires_reset_descendants(self):
         self.run_to_store()
         code, output = self.cli("jump", "3-smoke", "--undo")
