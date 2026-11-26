@@ -56,6 +56,9 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 | `approve <id>` | Record a person's approval of a node's current risk tier; clears the `hands-off` gate for that node while its tier does not rise | 1 if the state is invalid |
+| `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
+| `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
+| `teardown` | Stop every recorded service | 0 |
 
 `verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
 

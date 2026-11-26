@@ -77,10 +77,10 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" status
 ```
 
 ```text
-[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1]
+[assisted | file | main | 3/7 (1 skip) | active: 3-smoke | next: 4-store, 5-render | residue: 1 | svc: 1]
 ```
 
-This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. Use `--json` when you need full raw state.
+This line displays current mode, persistence type, branch, progress count, active node, and unlocked next steps. `residue: N` appears only when N > 0 unrevertable side effects are recorded. `svc: N` appears only when N > 0 services are recorded. Use `--json` when you need full raw state.
 
 ## Step 4 — Execution loop
 
@@ -98,6 +98,21 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - Use `--yes` to pass `confirm` checks after user confirmation.
 - If multiple paths are ready, `next` stops and lists them. Ask the user which path to take.
 - If a check fails, fix the code or update the test. Do not bypass checks by editing the state file directly.
+
+### Services
+
+A node that starts a long-running process (a dev server, a watcher) declares a `service` block instead of a foreground command:
+
+```bash
+python3 "$SKILL_DIR/scripts/dag_manager.py" service start    # active node, or pass <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" service stop <id>
+python3 "$SKILL_DIR/scripts/dag_manager.py" teardown         # stop all services
+```
+
+- `service start` runs the command detached, waits for the node's `ready` check, and writes the log to `.tutorial-logs/<id>.log`. If `ready` never passes, it prints the log tail and exits 1.
+- Complete the node after `service start`. Its `verification` (often `port_listening` or `http`) confirms the service works.
+- Run `teardown` when the session ends. `jump --reset-descendants` also stops the services it rewinds.
+- Services are POSIX only.
 
 ## Step 5 — Navigation and rewinds
 
@@ -149,6 +164,8 @@ Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2
 ## Safety rules
 
 - Do not execute node `commands` directly in `guided` mode.
+- The CLI never runs node `commands`. It runs only a declared `service` command (`service start`) and declared `undo` commands (`jump --undo`).
+- Run `teardown` before you end a session that started services.
 - In `hands-off` mode, run `approve <node_id>` for a high-risk node only after a person says yes.
 - Do not complete a node without running its verification check.
 - Never run `git reset --hard` or `git clean` without user approval.

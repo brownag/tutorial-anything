@@ -92,6 +92,22 @@
         "$ref": "#/$defs/residueEntry"
       },
       "description": "Side effects that `jump --undo` could not revert. Cleared with `residue clear`."
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["pid", "pgid", "command", "log", "started_at"],
+        "additionalProperties": false,
+        "properties": {
+          "pid": {"type": "integer", "minimum": 1},
+          "pgid": {"type": "integer", "minimum": 1},
+          "command": {"type": "string", "minLength": 1},
+          "log": {"type": "string", "pattern": "^\\.tutorial-logs/"},
+          "started_at": {"$ref": "#/$defs/timestamp"}
+        }
+      },
+      "description": "Running background services, keyed by node id. Written by `service start`, removed by `service stop`, `teardown`, and `jump --reset-descendants`."
     }
   },
   "$defs": {
@@ -222,6 +238,21 @@
           },
           "description": "Commands that revert the node's non-repo side effects, run by `jump --undo`."
         },
+        "service": {
+          "type": "object",
+          "required": ["command", "ready"],
+          "additionalProperties": false,
+          "properties": {
+            "command": {"type": "string", "minLength": 1},
+            "ready": {
+              "$ref": "#/$defs/verification",
+              "not": {"properties": {"type": {"const": "confirm"}}, "required": ["type"]}
+            },
+            "ready_timeout": {"type": "integer", "minimum": 1, "default": 30},
+            "stop_signal": {"type": "string", "enum": ["TERM", "INT", "KILL"], "default": "TERM"}
+          },
+          "description": "A background process the CLI starts and stops. `ready` gates startup. The node's `verification` is checked on complete."
+        },
         "risk": {
           "type": "string",
           "enum": ["low", "elevated", "high"],
@@ -251,7 +282,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["command", "file_exists", "file_contains", "confirm"]
+          "enum": ["command", "file_exists", "file_contains", "confirm", "http", "port_listening"]
         }
       },
       "allOf": [
@@ -358,6 +389,77 @@
               "prompt": {
                 "type": "string",
                 "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "http"
+              }
+            }
+          },
+          "then": {
+            "required": ["url"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "http"
+              },
+              "url": {
+                "type": "string",
+                "pattern": "^https?://"
+              },
+              "expect_status": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 599,
+                "default": 200
+              },
+              "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Python regex matched against the response body."
+              },
+              "timeout": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 5
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "port_listening"
+              }
+            }
+          },
+          "then": {
+            "required": ["port"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "port_listening"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "host": {
+                "type": "string",
+                "minLength": 1,
+                "default": "127.0.0.1"
+              },
+              "timeout": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 2
               }
             }
           }

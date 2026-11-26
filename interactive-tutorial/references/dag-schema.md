@@ -221,3 +221,32 @@ Tiers are ordered `low < elevated < high`. The effective tier is the higher of t
 ```
 
 This graph uses a diamond pattern (`1 → 2 → {3a, 3b} → 4`). Steps `3a` and `3b` are sibling nodes that depend on `2`. Both must complete before step `4`.
+
+## Background services and http/port checks (C-G3)
+
+Verification types `http` and `port_listening` can gate any node.
+
+| Type | Fields | Passes when |
+|---|---|---|
+| `http` | `url` (`http://` or `https://`), `expect_status` (default 200), `pattern` (optional regex on the body), `timeout` (seconds, default 5) | The response status equals `expect_status`, and the body matches `pattern` if given. Proxies are ignored. |
+| `port_listening` | `port` (integer 1-65535), `host` (default `127.0.0.1`), `timeout` (seconds, default 2) | A TCP connection to `host:port` is accepted. |
+
+Node field `service` (optional) declares a background process the CLI starts and stops:
+
+| Field | Type | Notes |
+|---|---|---|
+| `command` | string | Run through the shell in the workspace. |
+| `ready` | verification | Any type except `confirm`. Polled until it passes. |
+| `ready_timeout` | integer | Seconds to wait for `ready`. Default 30. |
+| `stop_signal` | `TERM` \| `INT` \| `KILL` | Sent first on stop. Default `TERM`. |
+
+Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "log", "started_at"}`. Logs go to `.tutorial-logs/<id>.log`.
+
+- `service start [<id>]` (default: the active node) starts the command detached in its own process group with stdin from `/dev/null` and output to the log. It polls `ready` until it passes or `ready_timeout` elapses. On failure it stops the process, drops the record, prints the log tail, and exits 1. It refuses if the recorded process is still alive.
+- `service stop [<id>]` signals the process group, waits up to 5 seconds, then sends `KILL`. An already-dead process is not an error.
+- `teardown` stops every recorded service. Run it at the end of a session.
+- `jump <id> --reset-descendants` stops the services of every node it resets, including the target when it is reset.
+- `status` lists `services: <id> (pid N, running|dead)`. The header appends ` | svc: N` when N > 0.
+- `service` commands are POSIX only. Elsewhere they exit 2 with `services require a POSIX system`.
+- `service.command` counts as an inspected command for risk tiers (C-G6).
+- The CLI adds `.tutorial-logs/` to `.git/info/exclude`. It never edits a learner's `.gitignore`.
