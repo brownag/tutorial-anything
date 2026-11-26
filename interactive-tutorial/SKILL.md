@@ -120,7 +120,9 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - The `next:` header lists ready nodes other than the active one.
 - Use `--yes` to pass `confirm` checks only after the user confirms (see Step 1 for hands-off).
 - For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
-- If a check fails, fix the code or update the test. Do not bypass checks by editing the state file.
+- If a check fails, fix your work first. Do not bypass checks by editing the state file.
+- If the tutorial itself is wrong (it contradicts itself, or the tool changed), not your work, record the fix: `deviate [<id>] (--command N | --check) --to "<cmd>" --reason "<why the tutorial is wrong>"`, then `verify` again. Use `deviate` only for a stale tutorial. Never invent behavior to make a stale check pass.
+- Run `export` at the end of the session. It writes `.tutorial-export/deviations.md` and, for a local source, `tutorial.corrected.md`.
 
 ### Services
 
@@ -167,6 +169,7 @@ Use `--skip-ancestors` only if the prerequisites are already satisfied in the en
 - `residue clear [<node_id> | --all]` removes residue entries once handled.
 - `next` prints `risk: high (<labels>)` for a high-risk node. In `hands-off` mode it refuses that node until approved.
 - Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
+- In `hands-off` mode, `complete` also refuses an unapproved high-risk node, and a node with deviations until `approve <node_id>` covers them. Ask the user first; the approval covers the recorded deviations.
 
 ## In-context persistence
 
@@ -193,6 +196,7 @@ Copy `interactive-tutorial/` to `.agents/skills/<your-tutorial>/`. Update Step 2
 - Never run `git reset --hard` or `git clean` without user approval.
 - Do not commit `.tutorial-dag.json`.
 - Do not invent nodes omitted from the source document.
+- Do not edit `.tutorial-dag.json` to record a deviation. Use `deviate`.
 
 ## Reference files
 

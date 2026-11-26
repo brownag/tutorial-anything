@@ -261,6 +261,22 @@
         "verification": {
           "$ref": "#/$defs/verification"
         },
+        "deviations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target", "original", "replacement", "reason", "recorded_at"],
+            "properties": {
+              "target": {"type": "string", "pattern": "^(check|command:[0-9]+)$"},
+              "original": {"type": "string"},
+              "replacement": {"type": "string", "minLength": 1},
+              "reason": {"type": "string", "minLength": 1},
+              "recorded_at": {"type": "string", "format": "date-time"}
+            }
+          },
+          "description": "Records written by `deviate`. Each replaces a check's or command's text and keeps the original."
+        },
         "side_effects": {
           "type": "array",
           "minItems": 1,
@@ -328,6 +344,11 @@
             "at": {
               "type": "string",
               "format": "date-time"
+            },
+            "deviations": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Count of the node's deviations covered by this approval."
             }
           },
           "description": "Written by `approve <node_id>`. Covers the node while its effective tier is at or below `tier`."

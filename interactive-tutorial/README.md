@@ -56,7 +56,9 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
-| `approve <id>` | Record a person's approval of a node's current risk tier; clears the `hands-off` gate for that node while its tier does not rise | 1 if the state is invalid |
+| `approve <id>` | Record a person's approval of a node's current risk tier and its deviations; clears the `hands-off` gate for that node while its tier does not rise and no new deviation is recorded | 1 if the state is invalid |
+| `deviate [<id>] (--command N \| --check) --to CMD --reason TEXT` | Replace a stale check or command (default: active node) and record the original, replacement, and reason. Use only when the tutorial is wrong | 0 on success; 1 if the node is completed (`jump <id> --reset-descendants` first); 2 on bad target, same or empty text, or a non-command check |
+| `export [--out DIR]` | Write `deviations.md` and, for a readable local `source_doc`, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
 | `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
 | `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
 | `teardown` | Stop every recorded service | 0 |
@@ -76,6 +78,7 @@ Node states:
 |---|---|---|---|
 | Command runner | User | Agent after user approval | Agent |
 | `confirm` checks | User | User | Agent (if pre-approved) |
+| High-risk nodes and deviations | Not gated | Not gated | `next` refuses high-risk nodes; `complete` refuses deviated nodes; both until `approve <id>` |
 | Git commit | Agent | Agent | Agent |
 | Best used for | Missing toolchains, learning | Standard local development | Long automated tutorials |
 
@@ -99,6 +102,8 @@ Persistence modes:
 | A command check hangs or reads nothing | Command checks no longer inherit the CLI's stdin. Their stdin is `/dev/null` unless the check sets `"stdin"`, so prompts see EOF. Add `"stdin": "answer\n"` to feed input, and `"timeout"` (seconds) to bound the run. |
 | `command looks interactive` warning | The command may wait for input. Add `"interactive": {"answers": [...]}`, or `"human": true` for a step a person must run, or use the non-interactive flag (for example `npm init -y`). |
 | `services require a POSIX system` | `service` commands are POSIX only. Run the service step on Linux or macOS. |
+| `has deviated and hands-off mode needs a person` | A hands-off node has deviations that `approve` does not cover. After a person says yes, run `approve <id>`. |
+| `is already completed. Jump back` | `deviate` refuses completed nodes. Run `jump <id> --reset-descendants` first. |
 | `service start` fails with `ready check did not pass` | The printed log tail shows why. Raise `ready_timeout` if the server is slow to start. |
 
 ## Development
