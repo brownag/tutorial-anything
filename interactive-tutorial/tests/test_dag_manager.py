@@ -1165,6 +1165,104 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("validate")
         self.assertEqual(code, 1, output)
 
+    # -- export (C-G8, 6.1) ----------------------------------------------
+
+    def _export_node(self, source_doc, commands=None):
+        nid = self._node_with(commands=commands or ["echo a"])
+        state = self.state()
+        state["source_doc"] = source_doc
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return nid
+
+    def test_export_writes_corrected_tutorial_and_report(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run ./greet --name Ada\nDone\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["./greet --name Ada"])
+        self.cli("deviate", nid, "--command", "0", "--to", "./greet --who Ada",
+                 "--reason", "v2 renamed --name", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        corrected = (out / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("./greet --who Ada", corrected)
+        self.assertNotIn("./greet --name Ada", corrected)
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("v2 renamed --name", report)
+        self.assertIn(nid, report)
+        self.assertIn("tutorial.corrected.md", output)
+        self.assertIn("deviations.md", output)
+
+    def test_export_without_deviations_reports_none_and_no_corrected_file(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run echo a\n", encoding="utf-8")
+        self._export_node(str(source))
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        self.assertIn("No deviations recorded.",
+                      (out / "deviations.md").read_text(encoding="utf-8"))
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+
+    def test_export_with_url_source_writes_report_only(self):
+        nid = self._export_node("https://example.invalid/tutorial.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        self.assertTrue((out / "deviations.md").exists())
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+
+    def test_export_lists_unmatched_originals_under_not_applied(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Step two runs echo c\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["echo a", "echo c"])
+        self.cli("deviate", nid, "--command", "0", "--to", "echo x", "--reason", "r1", check=0)
+        self.cli("deviate", nid, "--command", "1", "--to", "echo d", "--reason", "r2", check=0)
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        out = self.workspace / ".tutorial-export"
+        corrected = (out / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("echo d", corrected)
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("## Not applied", report)
+        self.assertIn("echo a", report.split("## Not applied", 1)[1])
+
+    def test_export_honours_out_dir_relative_and_absolute(self):
+        nid = self._export_node("https://example.invalid/t.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        self.cli("export", "--out", "rel/dir", check=0)
+        self.assertTrue((self.workspace / "rel" / "dir" / "deviations.md").exists())
+        absolute = self.workspace / "abs-out"
+        self.cli("export", "--out", str(absolute), check=0)
+        self.assertTrue((absolute / "deviations.md").exists())
+        self.assertFalse((self.workspace / ".tutorial-export").exists())
+
+    def test_export_default_dir_is_git_excluded(self):
+        nid = self._export_node("https://example.invalid/t.md")
+        self.cli("deviate", nid, "--command", "0", "--to", "echo b", "--reason", "fix", check=0)
+        self.cli("export", check=0)
+        exclude = (self.workspace / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        self.assertIn(".tutorial-export/", exclude.splitlines())
+        self.assertNotIn(".tutorial-export", self.git("status", "--porcelain"))
+
+    def test_hands_off_high_risk_active_node_needs_approval_to_complete(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        state = self.state()
+        state["active_node_id"] = root
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        before_state = self.state_path.read_text(encoding="utf-8")
+        before_head = self.git("rev-parse", "HEAD")
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIn("is high risk", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before_head)
+
+        self.cli("approve", root, check=0)
+        self.cli("complete", root, "--no-verify", check=0)
+        self.assertEqual(self.node(root)["status"], "completed")
+
     def test_validate_rejects_bad_deviation_target(self):
         self._node_with(commands=["echo a"], deviations=[{
             "target": "check2", "original": "a", "replacement": "b",

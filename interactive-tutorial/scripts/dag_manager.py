@@ -56,6 +56,7 @@ RESIDUE_REASONS = ("not-run", "failed", "irreversible", "remote")
 RISK_TIERS = ("low", "elevated", "high")
 RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
 LOG_DIR_NAME = ".tutorial-logs"
+EXPORT_DIR_NAME = ".tutorial-export"
 LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
 SERVICE_STOP_GRACE = 5
 SERVICE_POLL = 0.5
@@ -2516,6 +2517,91 @@ def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
 # argument parsing
 
 
+def cmd_export(args, state_path: Path, workspace: Path) -> int:
+    """Write deviations.md and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
+    state = load_state(state_path)
+    problems, _ = validate_document(state)
+    if problems:
+        for problem in problems:
+            err(problem)
+        return EXIT_FAIL
+
+    if args.out:
+        out = Path(args.out)
+        if not out.is_absolute():
+            out = workspace / out
+    else:
+        out = workspace / EXPORT_DIR_NAME
+        ensure_excluded(workspace, EXPORT_DIR_NAME + "/")
+    out = Path(os.path.normpath(str(out)))
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CliError("cannot create {}: {}".format(out, exc))
+
+    records = []
+    for node in state.get("nodes") or []:
+        for record in node.get("deviations") or []:
+            records.append((node, record))
+    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+
+    source_doc = state.get("source_doc") or ""
+    source_text = None
+    if source_doc and records:
+        candidate = Path(source_doc)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            source_text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            source_text = None
+
+    not_applied = []
+    corrected = source_text
+    if corrected is not None:
+        for _, record in records:
+            original = record.get("original", "")
+            if original and original in corrected:
+                corrected = corrected.replace(original, record.get("replacement", ""), 1)
+            else:
+                not_applied.append(record)
+
+    lines = ["# Tutorial deviations", "", "Source: `{}`".format(source_doc or "(none)"), ""]
+    if not records:
+        lines.append("No deviations recorded.")
+    for node, record in records:
+        lines.extend([
+            "## {}: {}".format(node["id"], node.get("title", "")),
+            "",
+            "- target: `{}`".format(record.get("target", "")),
+            "- original: `{}`".format(record.get("original", "")),
+            "- replacement: `{}`".format(record.get("replacement", "")),
+            "- reason: {}".format(record.get("reason", "")),
+            "- recorded_at: {}".format(record.get("recorded_at", "")),
+            "",
+        ])
+    if not_applied:
+        lines.extend(["## Not applied", ""])
+        for record in not_applied:
+            lines.append("- `{}` ({})".format(record.get("original", ""), record.get("target", "")))
+        lines.append("")
+
+    written = []
+    try:
+        report_path = out / "deviations.md"
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        written.append(report_path)
+        if corrected is not None:
+            corrected_path = out / "tutorial.corrected.md"
+            corrected_path.write_text(corrected, encoding="utf-8")
+            written.append(corrected_path)
+    except OSError as exc:
+        raise CliError("cannot write export to {}: {}".format(out, exc))
+    for path in written:
+        say("wrote {}".format(path))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
     parser = argparse.ArgumentParser(
@@ -2656,6 +2742,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     teardown = sub.add_parser("teardown", help="stop every recorded service")
     teardown.set_defaults(func=cmd_teardown)
+
+    export = sub.add_parser("export", help="write a corrected tutorial and deviation report")
+    export.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="output directory (default: {}/ under the workspace)".format(EXPORT_DIR_NAME),
+    )
+    export.set_defaults(func=cmd_export)
 
     approve = sub.add_parser("approve", help="record a person's approval of a high-risk node")
     approve.add_argument("node_id", help="node whose current risk tier to approve")
