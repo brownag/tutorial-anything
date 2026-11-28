@@ -1,23 +1,27 @@
-# interactive-tutorial
+# tutorial-anything
 
-An [Agent Skills](https://agentskills.io) package that turns a coding
-tutorial into an interactive graph. The agent breaks the document into
+Repository for the `interactive-tutorial` [Agent Skills](https://agentskills.io)
+package (`https://github.com/brownag/tutorial-anything`). It turns a coding
+tutorial into an interactive graph: the agent breaks the document into
 verifiable nodes, runs one node per turn, checks each step, and commits
 every file change to Git. You can pause, resume, jump ahead, or rewind
-to an earlier checkpoint.
+to an earlier checkpoint. The bundled Agent Skill name and directory
+remain `interactive-tutorial/`.
 
 State lives in `.tutorial-dag.json` in the target workspace. The tool
 adds this file to `.git/info/exclude`. Git will not track it, and
 `git reset` will not wipe your progress record.
 
-- **Autonomy**: `guided` (user runs commands), `assisted` (agent proposes, user approves), `hands-off` (agent runs unattended).
+- **Autonomy**: `guided` (user runs commands), `assisted` (agent proposes, user approves), `hands-off` (agent runs unattended with `approve` gates for high-risk or deviated nodes).
 - **Persistence**: `file` (writes `.tutorial-dag.json`) or `in-context` (keeps state in the conversation).
-- **Navigation**: jump ahead by completing prerequisites or skipping them; rewind by moving the active pointer, branching, or running a hard reset.
+- **Authoring & export**: `draft` infers `requires.tools`, per-OS `variants`, and server hints from Markdown; `export` writes `report.md`, `deviations.md`, and `tutorial.corrected.md`.
+- **Cross-OS & services**: per-OS `variants` (`linux`, `darwin`, `windows`) for `commands`, `verification`, and `undo` alongside `requires.os` / `doctor`, plus POSIX background `service` management.
+- **Navigation & rewind safety**: jump ahead by completing or skipping prerequisites; rewind by moving the pointer, branching, or resetting while guarding sibling checkpoints and scoping `--cwd` subdirectory rollbacks.
 - **Runtime**: Python ≥ 3.9 standard library and Git ≥ 2.25. No dependencies.
 
 ## Repository layout
 
-This repository is a container for the skill. Source files live in `interactive-tutorial/`. The `.agents/skills/interactive-tutorial/` directory contains relative symlinks to them. The root `Makefile` forwards all commands to the skill directory.
+This `tutorial-anything` repository is a container for the `interactive-tutorial` Agent Skill (both the bundled skill name and directory remain `interactive-tutorial/`). Source files live in `interactive-tutorial/`. The `.agents/skills/interactive-tutorial/` directory contains relative symlinks to them. The root `Makefile` forwards all commands to the skill directory.
 
 ```text
 .
@@ -90,14 +94,14 @@ Update step 2 in `SKILL.md` with your tutorial's nodes, files, and verification 
 ## Testing
 
 ```bash
-make lint               # byte-compile scripts and tests
+make lint               # check skill cleanliness (check-clean) and byte-compile scripts and tests
 make validate-examples  # validate and print sample DAG
 make test               # run test suite in temporary git repos
 make test-corpus        # run corpus fixture tests (tests/corpus/)
 make all                # run lint, validate-examples, test-corpus, and test
 ```
 
-CI tests on Python 3.9 and 3.12. Tests isolate Git by pointing `HOME` and `GIT_CONFIG_GLOBAL` to a temporary directory.
+CI tests on Ubuntu (Python 3.9 and 3.12) and macOS (Python 3.12). Tests isolate Git by pointing `HOME` and `GIT_CONFIG_GLOBAL` to a temporary directory.
 
 ## Constraints
 

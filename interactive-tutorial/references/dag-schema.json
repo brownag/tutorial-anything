@@ -362,6 +362,41 @@
             }
           },
           "description": "Written by `approve <node_id>`. Covers the node while its effective tier is at or below `tier`."
+        },
+        "variants": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "linux": {"$ref": "#/$defs/nodeVariant"},
+            "darwin": {"$ref": "#/$defs/nodeVariant"},
+            "windows": {"$ref": "#/$defs/nodeVariant"}
+          },
+          "description": "Optional per-OS overrides keyed by platform.system().lower(). Missing OS keys or fields fall back to the node's top-level values."
+        }
+      }
+    },
+    "nodeVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        },
+        "undo": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },

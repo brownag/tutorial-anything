@@ -58,6 +58,7 @@ RISK_TIERS = ("low", "elevated", "high")
 RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
 LOG_DIR_NAME = ".tutorial-logs"
 EXPORT_DIR_NAME = ".tutorial-export"
+IMAGE_EXTENSIONS = (".png", ".svg", ".jpg", ".jpeg")
 LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
 SERVICE_STOP_GRACE = 5
 SERVICE_POLL = 0.5
@@ -65,6 +66,7 @@ SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
 SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
 INTERACTIVE_FIELDS = ("answers", "human")
 PREFLIGHT_OS = ("linux", "darwin", "windows")
+VARIANT_FIELDS = ("commands", "verification", "undo")
 REQUIRES_FIELDS = ("tools", "os")
 TOOL_SPEC_FIELDS = ("min", "version_command")
 VERSION_SPEC_RE = re.compile(r"^\d+(?:\.\d+){0,2}$")
@@ -205,6 +207,32 @@ def load_state(path: Path) -> dict:
         )
     if not isinstance(state, dict):
         raise CliError("{} must contain a JSON object".format(path))
+    return state
+
+
+def load_validated_state(
+    path: Path, *, emit_warnings: bool = False, summary_err: str = ""
+) -> dict:
+    """Load state and validate it, raising CliError on validation failure."""
+    state = load_state(path)
+    problems, warnings = validate_document(state)
+    if problems:
+        if summary_err:
+            for problem in problems:
+                err(problem)
+            if emit_warnings:
+                for message in warnings:
+                    warn(message)
+            raise CliError(summary_err.format(len(problems)))
+        if emit_warnings:
+            for message in warnings:
+                warn(message)
+        for problem in problems[:-1]:
+            err(problem)
+        raise CliError(problems[-1])
+    if emit_warnings:
+        for message in warnings:
+            warn(message)
     return state
 
 
@@ -458,7 +486,7 @@ def collect_warnings(state: dict) -> list:
     index = node_index(state)
     for nid in node_order(state):
         node = index[nid]
-        check = node.get("verification") or {}
+        check = effective_verification(node)
         if (
             check.get("type") == "confirm"
             and str(check.get("prompt", "")).startswith("DRAFT:")
@@ -474,19 +502,19 @@ def collect_warnings(state: dict) -> list:
             )
         block = node.get("interactive")
         if isinstance(block, dict) and block.get("human"):
-            if (node.get("verification") or {}).get("type") != "confirm":
+            if effective_verification(node).get("type") != "confirm":
                 warnings.append(
                     "node '{}' is human: true but its verification is not confirm".format(nid)
                 )
         if "interactive" not in node:
-            for command in node.get("commands") or []:
+            for command in effective_commands(node):
                 if any(pattern.search(command) for pattern in INTERACTIVE_PATTERNS):
                     warnings.append(
                         "node '{}' command looks interactive: {}".format(nid, command)
                     )
                     break
         scopes = [s for s in node.get("side_effects", []) if s != "repo"]
-        if isinstance(node.get("side_effects"), list) and scopes and not node.get("undo"):
+        if isinstance(node.get("side_effects"), list) and scopes and not effective_undo(node):
             warnings.append(
                 "node '{}' has {} side effects but no undo (rewinds cannot revert it)".format(
                     nid, ", ".join(scopes)
@@ -596,11 +624,7 @@ def validate_node(node, position: int, seen: dict) -> list:
             )
 
     for field in ("artifacts", "commands"):
-        value = node.get(field)
-        if field in node and (
-            not isinstance(value, list)
-            or any(not isinstance(item, str) or not item for item in value)
-        ):
+        if field in node and not is_nonempty_str_list(node.get(field)):
             problems.append(
                 "{} field {!r} must be an array of non-empty strings".format(label, field)
             )
@@ -624,14 +648,12 @@ def validate_node(node, position: int, seen: dict) -> list:
                     label, list(SIDE_EFFECT_SCOPES)
                 )
             )
-    if "undo" in node:
-        value = node.get("undo")
-        if not isinstance(value, list) or any(
-            not isinstance(cmd, str) or not cmd.strip() for cmd in value
-        ):
-            problems.append(
-                "{} field 'undo' must be an array of non-empty command strings".format(label)
-            )
+    if "undo" in node and not is_nonempty_str_list(node.get("undo"), require_nonblank=True):
+        problems.append(
+            "{} field 'undo' must be an array of non-empty command strings".format(label)
+        )
+    if "variants" in node:
+        problems.extend(validate_variants(node["variants"], label))
     if "service" in node:
         problems.extend(validate_service(node["service"], label))
     if "interactive" in node:
@@ -665,10 +687,58 @@ def validate_node(node, position: int, seen: dict) -> list:
     return problems
 
 
+def is_nonempty_str_list(value, require_nonblank: bool = False) -> bool:
+    """True when ``value`` is a list of non-empty (and optionally non-blank) strings."""
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, str) and (bool(item.strip()) if require_nonblank else bool(item))
+        for item in value
+    )
+
+
+def current_os() -> str:
+    """Normalized operating system name matching ``PREFLIGHT_OS`` (C-G5)."""
+    return platform.system().lower()
+
+
+def active_variant(node: dict) -> dict:
+    """Return the matching OS variant dict for ``node``, or ``{}`` if absent (C-G5)."""
+    variants = node.get("variants")
+    if not isinstance(variants, dict):
+        return {}
+    variant = variants.get(current_os())
+    return variant if isinstance(variant, dict) else {}
+
+
+def _effective_field(node: dict, field: str, expected_type: type, default):
+    """Resolve one field from the active OS variant with fallback to the base node."""
+    variant = active_variant(node)
+    if field in variant and isinstance(variant[field], expected_type):
+        return variant[field]
+    base = node.get(field)
+    return base if isinstance(base, expected_type) else default
+
+
+def effective_commands(node: dict) -> list:
+    """Return OS-resolved ``commands`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "commands", list, [])
+
+
+def effective_verification(node: dict) -> dict:
+    """Return OS-resolved ``verification`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "verification", dict, {})
+
+
+def effective_undo(node: dict) -> list:
+    """Return OS-resolved ``undo`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "undo", list, [])
+
+
 def inspected_commands(node: dict) -> list:
     """Commands the risk classifier reads: commands, undo, and a command check (C-G6)."""
-    commands = list(node.get("commands") or []) + list(node.get("undo") or [])
-    verification = node.get("verification") or {}
+    commands = list(effective_commands(node)) + list(effective_undo(node))
+    verification = effective_verification(node)
     if verification.get("type") == "command" and isinstance(verification.get("command"), str):
         commands.append(verification["command"])
     service = node.get("service") or {}
@@ -870,7 +940,7 @@ def interactive_hints(node: dict) -> list:
     lines = []
     answers = block.get("answers") or []
     if answers:
-        command = (node.get("commands") or ["<command>"])[0]
+        command = (effective_commands(node) or ["<command>"])[0]
         lines.append(
             "feed answers: printf '%s\\n' {} | {}".format(
                 " ".join(shlex.quote(answer) for answer in answers), command
@@ -906,6 +976,41 @@ def validate_requires(requires) -> list:
             or any(item not in PREFLIGHT_OS for item in value)
         ):
             problems.append("requires.os must be a unique array of {}".format(list(PREFLIGHT_OS)))
+    return problems
+
+
+def validate_variants(variants, label: str) -> list:
+    """Validate a node's per-OS ``variants`` block (C-G5)."""
+    if not isinstance(variants, dict) or not variants:
+        return ["{} field 'variants' must be a non-empty object".format(label)]
+    problems = []
+    for os_key, variant in variants.items():
+        if os_key not in PREFLIGHT_OS:
+            problems.append(
+                "{} variants key {!r} must be one of {}".format(
+                    label, os_key, list(PREFLIGHT_OS)
+                )
+            )
+            continue
+        vlabel = "{} variants.{}".format(label, os_key)
+        if not isinstance(variant, dict) or not variant:
+            problems.append("{} must be a non-empty object".format(vlabel))
+            continue
+        for field in variant:
+            if field not in VARIANT_FIELDS:
+                problems.append("{} does not accept {!r}".format(vlabel, field))
+        if "commands" in variant and not is_nonempty_str_list(variant["commands"]):
+            problems.append(
+                "{} field 'commands' must be an array of non-empty strings".format(vlabel)
+            )
+        if "undo" in variant and not is_nonempty_str_list(
+            variant["undo"], require_nonblank=True
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(vlabel)
+            )
+        if "verification" in variant:
+            problems.extend(validate_verification(variant["verification"], vlabel))
     return problems
 
 
@@ -1011,7 +1116,7 @@ def run_checks(requires: dict) -> tuple:
     missing = [row["name"] for row in rows if not row["ok"]]
     passed = not missing
     if "os" in requires:
-        current = platform.system().lower()
+        current = current_os()
         ok = current in requires["os"]
         rows.append({
             "name": "os",
@@ -1030,20 +1135,30 @@ def format_check(row: dict) -> str:
 
 def cmd_doctor(args, state_path: Path, workspace: Path) -> int:
     """Check declared tools and OS; record the result as ``preflight`` (C-G4)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     if "requires" not in state:
-        say("no requires block; nothing to check")
+        if args.json:
+            say(
+                json.dumps(
+                    {"ok": True, "os": current_os(), "checks": [], "missing": []},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            say("no requires block; nothing to check")
         return EXIT_OK
     passed, rows, missing = run_checks(state["requires"])
     state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
     save_state(state_path, state)
     if args.json:
-        say(json.dumps({"passed": passed, "checks": rows}, indent=2))
+        say(
+            json.dumps(
+                {"ok": passed, "os": current_os(), "checks": rows, "missing": missing},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
     else:
         for row in rows:
             say(format_check(row))
@@ -1246,9 +1361,21 @@ def head_sha(workspace: Path) -> str:
 
 
 def is_dirty(workspace: Path) -> bool:
-    """True when tracked or untracked (non-excluded) changes exist."""
-    code, out, _ = run_git(["status", "--porcelain"], workspace)
+    """True when tracked or untracked (non-excluded) changes exist in the workspace.
+
+    Limited to the workspace path, so changes elsewhere in a larger repository
+    never count.
+    """
+    code, out, _ = run_git(["status", "--porcelain", "--", "."], workspace)
     return bool(out)
+
+
+def workspace_prefix(workspace: Path) -> str:
+    """Path of the workspace inside its repository (``""`` at the top level)."""
+    code, out, stderr = run_git(["rev-parse", "--show-prefix"], workspace)
+    if code != 0:
+        raise CliError("cannot locate the workspace in its repository: {}".format(stderr))
+    return out
 
 
 def resolve_sha(workspace: Path, ref: str) -> str:
@@ -1260,11 +1387,15 @@ def resolve_sha(workspace: Path, ref: str) -> str:
 
 
 def commit_all(workspace: Path, message: str) -> str:
-    """Stage everything, commit, and return the new ``HEAD`` sha."""
-    code, _, stderr = run_git(["add", "-A"], workspace)
+    """Stage and commit everything under the workspace; return the new ``HEAD`` sha.
+
+    Both steps are limited to the workspace path, so files elsewhere in a larger
+    repository are never staged or committed.
+    """
+    code, _, stderr = run_git(["add", "-A", "--", "."], workspace)
     if code != 0:
         raise CliError("git add -A failed: {}".format(stderr))
-    code, _, stderr = run_git(["commit", "--no-verify", "-m", message], workspace)
+    code, _, stderr = run_git(["commit", "--no-verify", "-m", message, "--", "."], workspace)
     if code != 0:
         raise CliError(
             "git commit failed: {}".format(stderr or "nothing to commit or commit rejected")
@@ -1284,6 +1415,45 @@ def reset_hard(workspace: Path, sha: str) -> None:
     code, _, stderr = run_git(["reset", "--hard", sha], workspace)
     if code != 0:
         raise CliError("git reset --hard {} failed: {}".format(sha[:12], stderr))
+
+
+def git_paths(args: list, workspace: Path) -> set:
+    """NUL-separated path listing from ``git <command> -z <rest>``, workspace-relative."""
+    code, out, stderr = run_git(args[:1] + ["-z"] + args[1:], workspace)
+    if code != 0:
+        raise CliError("git {} failed: {}".format(" ".join(args), stderr))
+    return {path for path in out.split("\0") if path}
+
+
+def restore_workspace(workspace: Path, sha: str, prefix: str) -> bool:
+    """Make the workspace subdirectory match ``sha`` without moving ``HEAD``.
+
+    Used instead of ``git reset --hard`` when the workspace is a subdirectory, so
+    commits and uncommitted changes outside it survive. Tracked files are restored
+    and files tracked since ``sha`` are removed; untracked files stay, as with
+    ``reset --hard``. The result is committed as a rewind commit limited to the
+    workspace. Returns True when a commit was made.
+    """
+    wanted = git_paths(["ls-tree", "-r", "--name-only", sha, "--", "."], workspace)
+    if wanted:
+        code, _, stderr = run_git(["checkout", sha, "--", "."], workspace)
+        if code != 0:
+            raise CliError("git checkout {} -- . failed: {}".format(sha[:12], stderr))
+    extra = sorted(git_paths(["ls-files", "--", "."], workspace) - wanted)
+    if extra:
+        code, _, stderr = run_git(
+            ["--literal-pathspecs", "rm", "-q", "-f", "--"] + extra, workspace
+        )
+        if code != 0:
+            raise CliError("git rm failed: {}".format(stderr))
+    code, _, _ = run_git(["diff", "--cached", "--quiet", "HEAD", "--", "."], workspace)
+    if code == 0:
+        return False
+    message = "tutorial(rewind): restore {} to {}".format(prefix.rstrip("/"), sha[:12])
+    code, _, stderr = run_git(["commit", "--no-verify", "-q", "-m", message, "--", "."], workspace)
+    if code != 0:
+        raise CliError("git commit of the rewind failed: {}".format(stderr))
+    return True
 
 
 def branch_exists(workspace: Path, branch: str) -> bool:
@@ -1358,7 +1528,7 @@ def check_port(verification: dict) -> tuple:
 
 def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     """Execute a node's gate. Returns ``(passed, lines)``."""
-    verification = node.get("verification") or {}
+    verification = effective_verification(node)
     kind = verification.get("type")
     label = "node '{}'".format(node.get("id"))
 
@@ -1771,11 +1941,41 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
 # draft: skeleton nodes from a Markdown tutorial (C-G10)
 
 DRAFT_SHELL_INFO = ("sh", "bash", "shell", "console", "zsh")
+DRAFT_WINDOWS_SHELL_INFO = ("powershell", "pwsh", "cmd", "bat")
 DRAFT_SUMMARY_MAX = 200
 DRAFT_SLUG_MAX = 40
 DRAFT_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$")
 DRAFT_SECTION_RE = re.compile(r"^#{2,3}[ \t]+(.+?)\s*$")
 DRAFT_ITEM_RE = re.compile(r"^\d+\.\s+(.*?)\s*$")
+DRAFT_SUBSECTION_RE = re.compile(r"^#{4,6}[ \t]+(.+?)\s*$")
+DRAFT_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+DRAFT_TOOLS = frozenset(
+    {
+        "python3",
+        "git",
+        "docker",
+        "sqlite3",
+        "node",
+        "npm",
+        "curl",
+        "cargo",
+        "go",
+        "Rscript",
+        "make",
+    }
+)
+DRAFT_OS_LABEL_RE = re.compile(
+    r"^(?:(?:on|for|in)\s+)?(linux|macos|mac\s+os|darwin|windows)(?:\s*\([^)]*\))?\s*:?$",
+    re.IGNORECASE,
+)
+DRAFT_SERVER_PATTERNS = (
+    re.compile(r"\bhttp\.server\b"),
+    re.compile(r"\buvicorn\b"),
+    re.compile(r"\bflask\s+run\b"),
+    re.compile(r"\bnpm\s+run\s+dev\b"),
+    re.compile(r"\bvite\b"),
+    re.compile(r"\brails\s+server\b"),
+)
 
 
 def slugify(text: str) -> str:
@@ -1842,13 +2042,145 @@ def draft_sections(lines, kinds):
     return title_hint, (headed if headed else items)
 
 
+def normalize_draft_os(token: str):
+    """Map an OS label token to a ``PREFLIGHT_OS`` key, or ``None``."""
+    key = token.strip().lower().replace(" ", "")
+    if key == "linux":
+        return "linux"
+    if key in ("macos", "darwin"):
+        return "darwin"
+    if key == "windows":
+        return "windows"
+    return None
+
+
+def detect_os_label(line: str):
+    """Return ``(os_key, is_heading)`` if ``line`` is an explicit OS label."""
+    stripped = line.strip()
+    if not stripped:
+        return None, False
+    sub_match = DRAFT_SUBSECTION_RE.match(stripped)
+    is_heading = sub_match is not None
+    candidate = sub_match.group(1) if sub_match else stripped
+    if not is_heading:
+        candidate = re.sub(r"^(?:[-*]\s+)", "", candidate)
+    candidate = candidate.replace("`", "").replace("*", "").replace("_", "").strip()
+    match = DRAFT_OS_LABEL_RE.match(candidate)
+    if match:
+        return normalize_draft_os(match.group(1)), is_heading
+    return None, is_heading
+
+
+def detect_fence_os(info: str):
+    """Return a ``PREFLIGHT_OS`` key if a fenced-block info string carries an OS label."""
+    for token in re.split(r"[\s:,()\[\]]+", info.strip()):
+        if not token:
+            continue
+        os_key = normalize_draft_os(token)
+        if os_key is not None:
+            return os_key
+    return None
+
+
+def _tokenize_shell_line(line: str) -> list:
+    """Split one shell line into tokens while preserving ``; | &`` operators."""
+    try:
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";|&")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return line.split()
+
+
+def detect_draft_tools(commands) -> set:
+    """Detect known CLI tools in command positions across shell command strings."""
+    detected = set()
+    for command in commands:
+        for raw_line in command.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            at_cmd_pos = True
+            for token in _tokenize_shell_line(stripped):
+                if token in (";", "&&", "||", "|", "&", "|&"):
+                    at_cmd_pos = True
+                    continue
+                if not at_cmd_pos:
+                    continue
+                if DRAFT_ENV_ASSIGN_RE.match(token) or token in ("sudo", "env", "nohup", "command"):
+                    continue
+                cmd_name = token.rsplit("/", 1)[-1] if token.startswith("/") else token
+                if cmd_name in DRAFT_TOOLS:
+                    detected.add(cmd_name)
+                at_cmd_pos = False
+    return detected
+
+
+def detect_draft_server(commands, texts=()) -> bool:
+    """True when drafted commands or inline code mention a long-running server."""
+    candidates = list(commands)
+    for text in texts:
+        for match in re.finditer(r"`([^`]+)`", text):
+            candidates.append(match.group(1))
+    return any(
+        pattern.search(candidate)
+        for candidate in candidates
+        for pattern in DRAFT_SERVER_PATTERNS
+    )
+
+
 def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
     """Build one skeleton node from the body lines in ``[start, end)``."""
     summary = None
     commands = []
+    variants = {}
     kinds_seen = []
+    fence_by_open = {
+        fence["open"]: fence for fence in fences if start <= fence["open"] < end
+    }
+    active_os = None
+    active_os_is_heading = False
+    inline_texts = [title]
+
     for i in range(start, end):
-        if kinds[i] == "text" and lines[i].strip() and summary is None:
+        if i in fence_by_open:
+            fence = fence_by_open[i]
+            info_tokens = fence["info"].split()
+            info_word = info_tokens[0].lower() if info_tokens else ""
+            fence_os = detect_fence_os(fence["info"])
+            target_os = fence_os or active_os
+            close = fence["close"] if fence["close"] is not None else len(lines)
+            body = []
+            for line in lines[fence["open"] + 1 : close]:
+                cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
+                body.append(line[cut:])
+            is_prompt = any(row.startswith("$ ") for row in body)
+            is_shell = (
+                info_word in DRAFT_SHELL_INFO
+                or (not info_word and is_prompt)
+                or (target_os == "windows" and info_word in DRAFT_WINDOWS_SHELL_INFO)
+            )
+            if is_shell:
+                kinds_seen.append("execute")
+                cmd_text = "\n".join(
+                    row[2:] if row.startswith("$ ") else row for row in body
+                )
+                if target_os:
+                    if cmd_text:
+                        variants.setdefault(target_os, []).append(cmd_text)
+                else:
+                    commands.append(cmd_text)
+            else:
+                kinds_seen.append("mutate")
+            continue
+
+        if kinds[i] != "text":
+            continue
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        inline_texts.append(lines[i])
+        if summary is None:
             block = []
             j = i
             while j < end and kinds[j] == "text" and lines[j].strip():
@@ -1858,21 +2190,14 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
             if len(text) > DRAFT_SUMMARY_MAX:
                 text = text[: DRAFT_SUMMARY_MAX - 3] + "..."
             summary = text
-    for fence in fences:
-        if not start <= fence["open"] < end:
-            continue
-        info_word = fence["info"].split()[0] if fence["info"] else ""
-        close = fence["close"] if fence["close"] is not None else len(lines)
-        body = []
-        for line in lines[fence["open"] + 1 : close]:
-            cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
-            body.append(line[cut:])
-        is_prompt = any(row.startswith("$ ") for row in body)
-        if info_word in DRAFT_SHELL_INFO or (not info_word and is_prompt):
-            kinds_seen.append("execute")
-            commands.append("\n".join(row[2:] if row.startswith("$ ") else row for row in body))
-        else:
-            kinds_seen.append("mutate")
+        os_key, is_heading = detect_os_label(lines[i])
+        if os_key is not None:
+            active_os = os_key
+            active_os_is_heading = is_heading
+        elif is_heading or not active_os_is_heading:
+            active_os = None
+            active_os_is_heading = False
+
     if "execute" in kinds_seen:
         action = "execute"
     elif kinds_seen:
@@ -1882,7 +2207,13 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
     if summary is None:
         summary = title
     node_id = "{}-{}".format(n, slugify(title))
-    return {
+    all_commands = list(commands)
+    for os_cmds in variants.values():
+        all_commands.extend(os_cmds)
+    prompt = "DRAFT: replace with a real check for {}".format(title)
+    if detect_draft_server(all_commands, inline_texts):
+        prompt += "; DRAFT: consider a service block"
+    node = {
         "id": node_id,
         "title": title,
         "summary": summary,
@@ -1892,19 +2223,25 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
         "artifacts": [],
         "verification": {
             "type": "confirm",
-            "prompt": "DRAFT: replace with a real check for {}".format(title),
+            "prompt": prompt,
         },
         "status": "pending",
         "commit_sha": None,
         "source_ref": {"line": line_no, "heading": title},
     }
+    if variants:
+        node["variants"] = {
+            os_key: {"commands": os_cmds} for os_key, os_cmds in variants.items()
+        }
+    return node
 
 
 def build_draft(lines, stem):
-    """Return the ``draft`` document ``{"title", "nodes"}`` for ``lines``."""
+    """Return the ``draft`` document ``{"title", "nodes"}`` (and optional ``requires``)."""
     kinds, fences = scan_fences(lines)
     title_hint, sections = draft_sections(lines, kinds)
     nodes = []
+    all_commands = []
     previous = None
     for index, (line_index, heading) in enumerate(sections):
         end = sections[index + 1][0] if index + 1 < len(sections) else len(lines)
@@ -1912,8 +2249,17 @@ def build_draft(lines, stem):
             lines, kinds, fences, line_index + 1, end, index + 1, previous, heading, line_index + 1
         )
         nodes.append(node)
+        all_commands.extend(node.get("commands", []))
+        for variant in (node.get("variants") or {}).values():
+            all_commands.extend(variant.get("commands", []))
         previous = node["id"]
-    return {"title": title_hint or stem, "nodes": nodes}
+    document = {"title": title_hint or stem, "nodes": nodes}
+    detected_tools = detect_draft_tools(all_commands)
+    if detected_tools:
+        document["requires"] = {
+            "tools": {tool: "*" for tool in sorted(detected_tools)}
+        }
+    return document
 
 
 def cmd_draft(args, state_path: Path, workspace: Path) -> int:
@@ -1937,6 +2283,8 @@ def cmd_draft(args, state_path: Path, workspace: Path) -> int:
             )
         )
     state["nodes"] = document["nodes"]
+    if document.get("requires") and not state.get("requires"):
+        state["requires"] = document["requires"]
     problems, warnings = validate_document(state)
     if problems:
         for problem in problems:
@@ -1996,6 +2344,8 @@ def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
     if not dest.is_absolute():
         dest = workspace / dest
     target = dest / name
+    if target.is_symlink():
+        raise CliError("{} is a symlink; remove it or pass a different name".format(target))
     if target.exists() and not args.force:
         raise CliError(
             "{} already exists; pass --force to replace it".format(target)
@@ -2020,9 +2370,28 @@ def cmd_scaffold(args, state_path: Path, workspace: Path) -> int:
         ):
             text = text.replace(key, value)
         (build / "SKILL.md").write_text(text, encoding="utf-8")
-        if target.exists():
-            shutil.rmtree(str(target))
-        os.rename(str(build), str(target))
+        old = None
+        try:
+            if target.exists():
+                old = Path(tempfile.mkdtemp(prefix=".{}.old-".format(name), dir=str(dest)))
+                old.rmdir()
+                os.rename(str(target), str(old))
+        except OSError as exc:
+            raise CliError("could not move aside existing {}: {}".format(target, exc))
+        try:
+            os.rename(str(build), str(target))
+        except OSError as exc:
+            if old is None:
+                raise CliError("could not place {}: {}".format(target, exc))
+            try:
+                os.rename(str(old), str(target))
+            except OSError as back:
+                raise CliError(
+                    "could not replace {} ({}); previous copy left at {} ({})".format(
+                        target, exc, old, back))
+            raise CliError("could not replace {}: {}; previous copy restored".format(target, exc))
+        if old is not None:
+            shutil.rmtree(str(old), ignore_errors=True)
     except BaseException:
         shutil.rmtree(str(build), ignore_errors=True)
         raise
@@ -2058,15 +2427,11 @@ def cmd_validate(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_status(args, state_path: Path, workspace: Path) -> int:
     """Print the turn header, the graph, and (with --json) the raw document."""
-    state = load_state(state_path)
-    problems, warnings = validate_document(state)
-    for problem in problems:
-        err(problem)
-    for message in warnings:
-        warn(message)
-    if problems:
-        err("{} problem(s); run `validate` for detail".format(len(problems)))
-        return EXIT_FAIL
+    state = load_validated_state(
+        state_path,
+        emit_warnings=True,
+        summary_err="{} problem(s); run `validate` for detail",
+    )
 
     if args.json:
         say(json.dumps(state, indent=2, ensure_ascii=False))
@@ -2111,13 +2476,13 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
         node = index[active]
         say("active  {}".format(summary(state, active)))
         say("  {} {}".format(">", node.get("summary", "")))
-        for command in node.get("commands") or []:
+        for command in effective_commands(node):
             say("  $ {}".format(command))
         for artifact in node.get("artifacts") or []:
             say("  * {}".format(artifact))
         for hint in interactive_hints(node):
             say("  {}".format(hint))
-        verification = node.get("verification") or {}
+        verification = effective_verification(node)
         if node.get("deviations"):
             say("  deviations: {}".format(len(node["deviations"])))
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
@@ -2139,7 +2504,7 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
-def check_risk(state: dict, nid: str) -> None:
+def check_risk(state: dict, nid: str, quiet: bool = False) -> None:
     """Gate a node on its risk tier (C-G6). Only hands-off ever blocks."""
     node = node_index(state)[nid]
     tier, labels = risk_tier(node)
@@ -2151,17 +2516,13 @@ def check_risk(state: dict, nid: str) -> None:
             "'{}' is high risk ({}) and hands-off mode will not run it until a person "
             "approves. After they say yes, run `approve {}`.".format(nid, detail, nid)
         )
-    say("risk: high ({})".format(detail))
+    if not quiet:
+        say("risk: high ({})".format(detail))
 
 
 def cmd_approve(args, state_path: Path, workspace: Path) -> int:
     """Record a person's approval of a node's current risk tier (C-G6)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     node = get_node(state, args.node_id)
     tier, labels = risk_tier(node)
     node["approved"] = {
@@ -2181,12 +2542,7 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     """Replace a node's check or one of its commands and record why (C-G8)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
     if node.get("status") == "completed":
@@ -2200,7 +2556,7 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
         raise CliError("--reason must be non-empty", EXIT_USAGE)
 
     if args.check:
-        verification = node.get("verification") or {}
+        verification = effective_verification(node)
         if verification.get("type") != "command":
             raise CliError(
                 "'{}' check is not a command check; --check needs a 'command' "
@@ -2210,7 +2566,7 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
         target = "check"
         original = verification.get("command")
     else:
-        commands = node.get("commands") or []
+        commands = effective_commands(node)
         if args.index < 0 or args.index >= len(commands):
             raise CliError(
                 "'{}' has {} command(s); --command {} is out of range".format(
@@ -2223,10 +2579,17 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     if original == args.to:
         raise CliError("--to is the same as the current text of {}".format(target), EXIT_USAGE)
 
+    variant = active_variant(node)
     if args.check:
-        node["verification"]["command"] = args.to
+        target_verification = (
+            variant["verification"] if "verification" in variant else node["verification"]
+        )
+        target_verification["command"] = args.to
     else:
-        node["commands"][args.index] = args.to
+        target_commands = (
+            variant["commands"] if "commands" in variant else node["commands"]
+        )
+        target_commands[args.index] = args.to
     node.setdefault("deviations", []).append(
         {
             "target": target,
@@ -2244,15 +2607,66 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def _format_variant_verification(verification: dict) -> str:
+    """Format a variant's verification gate as ``<type> <target>``."""
+    kind = verification.get("type", "")
+    required = VERIFICATION_REQUIRED.get(kind, ())
+    target_key = required[0] if required else None
+    target = verification.get(target_key) if target_key else None
+    if target not in (None, ""):
+        return "{} {}".format(kind, target)
+    return kind
+
+
+def _print_active_node(state: dict, index: dict, nid: str, workspace: Path) -> None:
+    """Print the active-node summary, variant overrides, interactive hints, and status header."""
+    node = index[nid]
+    say("active -> {}".format(summary(state, nid)))
+    variant = active_variant(node)
+    if variant:
+        say("  variant: {} (overrides: {})".format(current_os(), ", ".join(sorted(variant))))
+        if "commands" in variant:
+            commands = variant["commands"]
+            say("  commands: {}".format("; ".join(commands) if commands else "(none)"))
+        if "verification" in variant:
+            say("  verification: {}".format(_format_variant_verification(variant["verification"])))
+    for hint in interactive_hints(node):
+        say("  {}".format(hint))
+    say(header_line(state, workspace))
+
+
+def _emit_next_node(
+    state: dict, index: dict, nid: str, workspace: Path, as_json: bool
+) -> None:
+    """Print the activated node either as JSON or human-readable lines."""
+    if not as_json:
+        _print_active_node(state, index, nid, workspace)
+        return
+    node = index[nid]
+    os_name = current_os()
+    tier, labels = risk_tier(node)
+    payload = {
+        "node": node,
+        "os": os_name,
+        "variant": os_name if active_variant(node) else None,
+        "commands": effective_commands(node),
+        "verification": effective_verification(node),
+        "undo": effective_undo(node),
+        "risk": {
+            "tier": tier,
+            "labels": labels,
+            "approved": approval_covers(node, tier),
+        },
+        "ready": ready_nodes(state),
+    }
+    say(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     preflight_gate(state, state_path, getattr(args, "skip_doctor", False))
+    as_json = getattr(args, "json", False)
 
     if args.node_id:
         node = get_node(state, args.node_id)
@@ -2277,22 +2691,18 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
                     args.node_id, ", ".join(unmet), args.node_id
                 )
             )
-        check_risk(state, args.node_id)
+        check_risk(state, args.node_id, quiet=as_json)
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
-        say("active -> {}".format(summary(state, args.node_id)))
-        for hint in interactive_hints(index[args.node_id]):
-            say("  {}".format(hint))
-        say(header_line(state, workspace))
+        _emit_next_node(state, index, args.node_id, workspace, as_json)
         return EXIT_OK
 
     active = state.get("active_node_id")
     index = node_index(state)
     if active and index.get(active, {}).get("status") == "pending":
-        raise CliError(
-            "'{}' is still in progress. Finish it with `complete` (or move the "
-            "pointer with `jump <other>`).".format(active)
-        )
+        check_risk(state, active, quiet=as_json)
+        _emit_next_node(state, index, active, workspace, as_json)
+        return EXIT_OK
     ready = ready_nodes(state)
     if not ready:
         completed, skipped, total = counts(state)
@@ -2306,28 +2716,32 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
             "`next <id>`.".format(len(ready), ", ".join(ready)),
             EXIT_FAIL,
         )
-    check_risk(state, ready[0])
+    check_risk(state, ready[0], quiet=as_json)
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
-    say("active -> {}".format(summary(state, ready[0])))
-    for hint in interactive_hints(index[ready[0]]):
-        say("  {}".format(hint))
-    say(header_line(state, workspace))
+    _emit_next_node(state, index, ready[0], workspace, as_json)
     return EXIT_OK
 
 
 def cmd_verify(args, state_path: Path, workspace: Path) -> int:
     """Run a node's verification gate and report the outcome."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
-    say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
+    as_json = getattr(args, "json", False)
+    check_risk(state, nid, quiet=as_json)
+    if not as_json:
+        say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
     passed, lines = run_verification(node, workspace, args.yes)
+    if as_json:
+        payload = {
+            "node_id": node["id"],
+            "ok": passed,
+            "message": "\n".join(lines),
+            "verification": effective_verification(node),
+        }
+        say(json.dumps(payload, indent=2, ensure_ascii=False))
+        return EXIT_OK if passed else EXIT_FAIL
     for line in lines:
         say("  {}".format(line))
     if not passed:
@@ -2339,12 +2753,8 @@ def cmd_verify(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     """Verify, optionally checkpoint, mark completed, and recompute readiness."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
+    as_json = getattr(args, "json", False)
 
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
@@ -2372,7 +2782,7 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
 
     if state.get("mode") == "hands-off":
         if risk_blocked(state, node):
-            check_risk(state, nid)
+            check_risk(state, nid, quiet=as_json)
         if not deviations_covered(node):
             raise CliError(
                 "'{}' has deviated and hands-off mode needs a person to review it first. "
@@ -2381,13 +2791,20 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
 
     if not args.no_verify:
         passed, lines = run_verification(node, workspace, args.yes)
-        for line in lines:
-            say("  {}".format(line))
+        if not as_json:
+            for line in lines:
+                say("  {}".format(line))
         if not passed:
-            err(
-                "verification failed for {} - state unchanged. Fix the work, or "
-                "pass --no-verify to record it anyway.".format(nid)
-            )
+            if state.get("mode") == "hands-off":
+                err(
+                    "verification failed for {} - state unchanged. "
+                    "Fix the work and re-run.".format(nid)
+                )
+            else:
+                err(
+                    "verification failed for {} - state unchanged. Fix the work, or "
+                    "pass --no-verify to record it anyway.".format(nid)
+                )
             return EXIT_FAIL
     else:
         warn("--no-verify: skipping the verification gate for {}".format(nid))
@@ -2396,12 +2813,14 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     if args.commit:
         require_git(workspace)
         if not is_dirty(workspace):
-            say("nothing to commit; completed {} without a checkpoint".format(nid))
+            if not as_json:
+                say("nothing to commit; completed {} without a checkpoint".format(nid))
         else:
             message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
             commit_sha = commit_all(workspace, message)
-            say("checkpoint {}".format(commit_sha))
-            say("  message {}".format(message))
+            if not as_json:
+                say("checkpoint {}".format(commit_sha))
+                say("  message {}".format(message))
 
     node["status"] = "completed"
     node["commit_sha"] = commit_sha
@@ -2411,6 +2830,17 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
         if len(ready) == 1:
             state["active_node_id"] = ready[0]
     save_state(state_path, state)
+
+    if as_json:
+        payload = {
+            "node_id": node["id"],
+            "status": "completed",
+            "commit_sha": node.get("commit_sha"),
+            "next_active": state.get("active_node_id"),
+            "ready": ready_nodes(state),
+        }
+        say(json.dumps(payload, indent=2, ensure_ascii=False))
+        return EXIT_OK
 
     say("completed {}".format(summary(state, nid)))
     say(header_line(state, workspace))
@@ -2448,6 +2878,27 @@ def nearest_ancestor_sha(state: dict, ancestors: list, workspace: Path, target: 
     return resolve_sha(workspace, initial)
 
 
+def orphaned_nodes(state: dict, sha: str, reset_set: set, workspace: Path) -> list:
+    """Completed nodes outside ``reset_set`` whose checkpoint ``sha`` would discard.
+
+    A rollback to ``sha`` drops every commit that is not an ancestor of it. A
+    completed node that keeps its status after the rewind must keep its
+    checkpoint too, or the DAG would claim work that is no longer there.
+    """
+    orphaned = []
+    order, _ = topological_order(state)
+    index = node_index(state)
+    for nid in order:
+        node = index[nid]
+        commit = node.get("commit_sha")
+        if nid in reset_set or node.get("status") != "completed" or not commit:
+            continue
+        code, _, _ = run_git(["merge-base", "--is-ancestor", commit, sha], workspace)
+        if code != 0:
+            orphaned.append(nid)
+    return orphaned
+
+
 def node_scopes(node: dict) -> list:
     """Side-effect scopes for a node; an absent ``side_effects`` means repo-only (C-G2)."""
     return list(node.get("side_effects") or ["repo"])
@@ -2455,7 +2906,7 @@ def node_scopes(node: dict) -> list:
 
 def side_effect_line(node: dict) -> str:
     """One listing line for a rewound node with non-repo side effects (C-G2)."""
-    undo = node.get("undo") or []
+    undo = effective_undo(node)
     tail = "undo: {}".format("; ".join(undo)) if undo else "undo: (none) | irreversible"
     return "side effects: {} [{}] {}".format(
         node["id"], ", ".join(node_scopes(node)), tail
@@ -2467,7 +2918,7 @@ def residue_entry(node: dict, reason: str) -> dict:
     return {
         "node_id": node["id"],
         "scopes": node_scopes(node),
-        "undo": list(node.get("undo") or []),
+        "undo": list(effective_undo(node)),
         "reason": reason,
         "recorded_at": now_iso(),
     }
@@ -2482,7 +2933,7 @@ def record_residue(state: dict, entries: list) -> None:
 
 def run_undo(node: dict, workspace: Path) -> tuple:
     """Run a node's undo commands in order. Returns (ok, message)."""
-    for command in node.get("undo") or []:
+    for command in effective_undo(node):
         say("  undo {}: {}".format(node["id"], command))
         try:
             proc = subprocess.run(
@@ -2511,15 +2962,11 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             "with --reset-descendants",
             EXIT_USAGE,
         )
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     target = args.target_id
     get_node(state, target)
+    check_risk(state, target)
     parents, children = relation_maps(state)
     index = node_index(state)
     ancestors = transitive(target, parents)
@@ -2585,6 +3032,16 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     if args.git_rollback != "none":
         require_git(workspace)
         sha = nearest_ancestor_sha(state, ancestors, workspace, target)
+        orphaned = orphaned_nodes(state, sha, {target} | set(descendants), workspace)
+        if orphaned:
+            raise CliError(
+                "refusing to roll back to {}: it would discard the checkpoints of "
+                "completed nodes that are not downstream of {}: {}. Rewind to a "
+                "common ancestor instead (`jump <ancestor> --reset-descendants "
+                "--git-rollback {}`), or use --git-rollback none.".format(
+                    short(sha), target, ", ".join(orphaned), args.git_rollback
+                )
+            )
 
     if args.git_rollback == "branch":
         branch = args.new_branch or "tutorial/rewind-{}".format(target)
@@ -2596,8 +3053,17 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
         state.setdefault("git", {})["branch"] = branch
         say("checked out new branch {} at {}".format(branch, sha))
     elif args.git_rollback == "hard":
-        reset_hard(workspace, sha)
-        say("reset --hard to {}".format(sha))
+        prefix = workspace_prefix(workspace)
+        if prefix:
+            committed = restore_workspace(workspace, sha, prefix)
+            say("restored {} to {}{}".format(
+                prefix.rstrip("/"), sha,
+                " (rewind commit {})".format(short(head_sha(workspace), 12))
+                if committed else " (no changes)",
+            ))
+        else:
+            reset_hard(workspace, sha)
+            say("reset --hard to {}".format(sha))
 
     reset_from = list(descendants)
     if args.git_rollback != "none" and args.reset_descendants:
@@ -2643,7 +3109,7 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             elif risk_blocked(state, node):
                 say("skipped undo of {} (hands-off: high risk, not approved)".format(nid))
                 record_residue(state, [residue_entry(node, "not-run")])
-            elif not node.get("undo"):
+            elif not effective_undo(node):
                 record_residue(state, [residue_entry(node, "irreversible")])
             else:
                 ok, message = run_undo(node, workspace)
@@ -2736,12 +3202,7 @@ def drop_service(state: dict, nid: str) -> None:
 def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
     """Start a node's service detached and wait for its ``ready`` check (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     nid = args.node_id or require_active_node(state)
     node = get_node(state, nid)
@@ -2816,12 +3277,7 @@ def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
 def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
     """Stop a recorded service; a process that already exited is not an error (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = args.node_id or require_active_node(state)
     record = (state.get("services") or {}).get(nid)
     if not record:
@@ -2841,12 +3297,7 @@ def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
 def cmd_teardown(args, state_path: Path, workspace: Path) -> int:
     """Stop every recorded service (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     services = dict(state.get("services") or {})
     if not services:
         say("no services recorded")
@@ -2893,14 +3344,172 @@ def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
 # argument parsing
 
 
+def _sorted_deviations(state: dict) -> list:
+    """Return ``(node, record)`` pairs for all deviations sorted by ``recorded_at``."""
+    records = []
+    for node in state.get("nodes") or []:
+        for record in node.get("deviations") or []:
+            records.append((node, record))
+    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+    return records
+
+
+def _md_cell(value) -> str:
+    """Escape pipe characters and newlines for a single Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_report(state: dict, workspace: Path, out: Path) -> str:
+    """Render a Markdown summary report (``report.md``) for the tutorial DAG."""
+    title = state.get("title") or "Tutorial Report"
+    source_doc = state.get("source_doc") or "(none)"
+    mode = state.get("mode") or ""
+    persistence = state.get("persistence") or ""
+    branch = (state.get("git") or {}).get("branch") or current_branch(workspace) or "(none)"
+    completed, skipped, total = counts(state)
+
+    lines = [
+        "# {}".format(title),
+        "",
+        "- source_doc: `{}`".format(source_doc),
+        "- mode: `{}`".format(mode),
+        "- persistence: `{}`".format(persistence),
+        "- git.branch: `{}`".format(branch),
+        "- progress: {} completed / {} skipped / {} total".format(completed, skipped, total),
+        "",
+    ]
+
+    preflight = state.get("preflight")
+    if isinstance(preflight, dict):
+        status_text = "passed" if preflight.get("passed") else "failed"
+        missing = preflight.get("missing") or []
+        lines.extend([
+            "## Preflight",
+            "",
+            "- status: {}".format(status_text),
+            "- checked_at: {}".format(preflight.get("at") or ""),
+        ])
+        if missing:
+            lines.append("- missing: {}".format(", ".join(missing)))
+        requires = state.get("requires")
+        if isinstance(requires, dict):
+            _, rows, _ = run_checks(requires)
+            if rows:
+                lines.extend([
+                    "",
+                    "| Check | Status | Found | Need |",
+                    "|---|---|---|---|",
+                ])
+                for row in rows:
+                    lines.append(
+                        "| {} | {} | {} | {} |".format(
+                            _md_cell(row.get("name", "")),
+                            _md_cell(row.get("status", "")),
+                            _md_cell(row.get("found", "")),
+                            _md_cell(row.get("need", "")),
+                        )
+                    )
+        lines.append("")
+
+    index = node_index(state)
+    parents, _ = relation_maps(state)
+    order, cycle = topological_order(state)
+    if cycle:
+        order = order + sorted(cycle)
+
+    lines.extend(["## Nodes", ""])
+    if order:
+        lines.extend([
+            "| ID | Title | Status | Commit | Artifacts | Deviations |",
+            "|---|---|---|---|---|---|",
+        ])
+        for nid in order:
+            node = index[nid]
+            status_label = derived_state(state, nid, index, parents)
+            sha = node.get("commit_sha")
+            commit_label = sha[:7] if sha else "\u2014"
+            artifacts = node.get("artifacts") or []
+            artifacts_label = ", ".join(artifacts) if artifacts else "\u2014"
+            dev_count = len(node.get("deviations") or [])
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    _md_cell(nid),
+                    _md_cell(node.get("title", "")),
+                    _md_cell(status_label),
+                    _md_cell(commit_label),
+                    _md_cell(artifacts_label),
+                    dev_count,
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    visual_embeds = []
+    seen_visuals = set()
+    out_abs = os.path.abspath(str(out))
+    for nid in order:
+        node = index[nid]
+        for artifact in node.get("artifacts") or []:
+            if Path(artifact).suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            art_path = Path(artifact)
+            full_path = art_path if art_path.is_absolute() else workspace / art_path
+            if not full_path.is_file():
+                continue
+            full_abs = os.path.normpath(os.path.abspath(str(full_path)))
+            if full_abs in seen_visuals:
+                continue
+            seen_visuals.add(full_abs)
+            rel_posix = os.path.relpath(full_abs, out_abs).replace(os.sep, "/")
+            visual_embeds.append("![{}]({})".format(artifact, rel_posix))
+    if visual_embeds:
+        lines.extend(["## Visual Artifacts", ""])
+        lines.extend(visual_embeds)
+        lines.append("")
+
+    records = _sorted_deviations(state)
+    lines.extend(["## Deviations", ""])
+    if records:
+        for node, record in records:
+            lines.append(
+                "- `{}` (`{}`): `{}` -> `{}` \u2014 {}".format(
+                    node["id"],
+                    record.get("target", ""),
+                    record.get("original", ""),
+                    record.get("replacement", ""),
+                    record.get("reason", ""),
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    residue_entries = state.get("residue") or []
+    lines.extend(["## Residue", ""])
+    if residue_entries:
+        for entry in residue_entries:
+            undo = entry.get("undo") or []
+            scopes = ", ".join(entry.get("scopes") or [])
+            undo_text = " (undo: {})".format("; ".join(undo)) if undo else ""
+            lines.append(
+                "- `{}` [{}]: {}{}".format(
+                    entry.get("node_id", ""),
+                    scopes,
+                    entry.get("reason", ""),
+                    undo_text,
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def cmd_export(args, state_path: Path, workspace: Path) -> int:
-    """Write deviations.md and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    """Write report.md, deviations.md, and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
+    state = load_validated_state(state_path)
 
     if args.out:
         out = Path(args.out)
@@ -2915,11 +3524,7 @@ def cmd_export(args, state_path: Path, workspace: Path) -> int:
     except OSError as exc:
         raise CliError("cannot create {}: {}".format(out, exc))
 
-    records = []
-    for node in state.get("nodes") or []:
-        for record in node.get("deviations") or []:
-            records.append((node, record))
-    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+    records = _sorted_deviations(state)
 
     source_doc = state.get("source_doc") or ""
     source_text = None
@@ -2964,6 +3569,12 @@ def cmd_export(args, state_path: Path, workspace: Path) -> int:
 
     written = []
     try:
+        stale_path = out / "tutorial.corrected.md"
+        if corrected is None and stale_path.exists():
+            stale_path.unlink()
+        summary_path = out / "report.md"
+        summary_path.write_text(render_report(state, workspace, out), encoding="utf-8")
+        written.append(summary_path)
         report_path = out / "deviations.md"
         report_path.write_text("\n".join(lines), encoding="utf-8")
         written.append(report_path)
@@ -3063,6 +3674,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue past a failed preflight (requires block) without running doctor",
     )
+    nxt.add_argument(
+        "--json",
+        action="store_true",
+        help="print the selected node and resolved details as JSON",
+    )
     nxt.set_defaults(func=cmd_next)
 
     doctor = sub.add_parser("doctor", help="check the tools and OS declared in requires")
@@ -3076,6 +3692,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="human confirmed this node (required for type=confirm gates)",
     )
+    verify.add_argument("--json", action="store_true", help="print verification result as JSON")
     verify.set_defaults(func=cmd_verify)
 
     complete = sub.add_parser("complete", help="verify, checkpoint, and close a node")
@@ -3088,6 +3705,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--message", default=None, help="override the commit message")
     complete.add_argument("--no-verify", action="store_true", help="skip the verification gate")
     complete.add_argument("--yes", action="store_true", help="pass-through for confirm gates")
+    complete.add_argument("--json", action="store_true", help="print completion summary as JSON")
     complete.set_defaults(func=cmd_complete)
 
     jump = sub.add_parser("jump", help="move the pointer anywhere in the graph")
@@ -3139,7 +3757,9 @@ def build_parser() -> argparse.ArgumentParser:
     teardown = sub.add_parser("teardown", help="stop every recorded service")
     teardown.set_defaults(func=cmd_teardown)
 
-    export = sub.add_parser("export", help="write a corrected tutorial and deviation report")
+    export = sub.add_parser(
+        "export", help="write summary report, deviation report, and corrected tutorial"
+    )
     export.add_argument(
         "--out", default=None, metavar="DIR",
         help="output directory (default: {}/ under the workspace)".format(EXPORT_DIR_NAME),

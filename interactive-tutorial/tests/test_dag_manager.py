@@ -9,8 +9,10 @@ hooks, or ``~/.gitconfig``. Standard library only; run with::
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -22,6 +24,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 CLI = SKILL_DIR / "scripts" / "dag_manager.py"
@@ -476,13 +479,31 @@ class DagManagerTest(unittest.TestCase):
             "a single unambiguous ready node should auto-advance",
         )
 
-    def test_next_refuses_an_in_progress_node(self):
+    def test_next_prints_already_active_pending_node(self):
         self.seed_repo()
         self.seed_state()
         self.cli("next", check=0)
+        before_state = self.state_path.read_text(encoding="utf-8")
         code, output = self.cli("next")
-        self.assertEqual(code, 1)
-        self.assertIn("1-design", output)
+        self.assertEqual(code, 0, output)
+        self.assertIn("active -> 1-design", output)
+        self.assertIn("active: 1-design", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
+
+    def test_next_after_complete_auto_activation_prints_active_with_hints(self):
+        self.seed_repo()
+        state = self.seed_state()
+        self.node("2-scaffold", state)["interactive"] = {"human": True}
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("complete", "1-design", "--yes", check=0)
+        self.assertEqual(self.state()["active_node_id"], "2-scaffold")
+        before_state = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli("next")
+        self.assertEqual(code, 0, output)
+        self.assertIn("active -> 2-scaffold", output)
+        self.assertIn("a person must run this step (interactive)", output)
+        self.assertIn("active: 2-scaffold", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
 
     def test_next_refuses_a_branch_point_and_lists_both(self):
         self.seed_repo()
@@ -560,6 +581,29 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("complete", "2-scaffold", "--yes")
         self.assertEqual(code, 1)
         self.assertIn("1-design", output)
+
+    def test_complete_verification_failure_hint_depends_on_mode(self):
+        root = self._root_with(
+            "hands-off",
+            verification={"type": "command", "command": "exit 1", "expect_exit": 0},
+        )
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn(
+            "verification failed for {} - state unchanged. Fix the work and re-run.".format(root),
+            output,
+        )
+        self.assertNotIn("--no-verify", output)
+
+        state = self.state()
+        state["mode"] = "assisted"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn(
+            "verification failed for {} - state unchanged. Fix the work, or pass --no-verify to record it anyway.".format(root),
+            output,
+        )
 
     # -- checkpoints ------------------------------------------------------
 
@@ -642,6 +686,49 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(self.node("4-store", state)["status"], "completed")
         self.assertEqual(self.head(), shas["store"], "fast-forward must not commit")
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "3")
+
+    def run_both_branches(self) -> dict:
+        """Complete both sibling branches (4-store, then 5-render) off 3-smoke."""
+        shas = self.run_to_store()
+        self.complete("5-render", "--commit", check=0)
+        shas["render"] = self.head()
+        return shas
+
+    def test_hard_rewind_refuses_to_discard_sibling_branch(self):
+        shas = self.run_both_branches()
+        before = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli(
+            "jump", "4-store", "--reset-descendants", "--git-rollback", "hard", "--force"
+        )
+        self.assertEqual(code, 1, output)
+        self.assertIn("5-render", output)
+        self.assertEqual(self.head(), shas["render"], "HEAD must not move")
+        self.assertTrue((self.workspace / "src/todo/render.py").is_file())
+        self.assertEqual(before, self.state_path.read_text(encoding="utf-8"))
+
+    def test_branch_rewind_refuses_to_discard_sibling_branch(self):
+        self.run_both_branches()
+        before = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli(
+            "jump", "4-store", "--reset-descendants", "--git-rollback", "branch"
+        )
+        self.assertEqual(code, 1, output)
+        self.assertIn("5-render", output)
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertEqual("", self.git("branch", "--list", "tutorial/rewind-*"))
+        self.assertEqual(before, self.state_path.read_text(encoding="utf-8"))
+
+    def test_hard_rewind_to_common_ancestor_resets_both_branches(self):
+        shas = self.run_both_branches()
+        self.cli(
+            "jump", "3-smoke", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual(self.head(), shas["scaffold"])
+        state = self.state()
+        for nid in ("4-store", "5-render"):
+            self.assertEqual("pending", self.node(nid, state)["status"])
+        self.assertFalse((self.workspace / "src/todo/render.py").exists())
 
     def test_soft_rewind_moves_only_the_pointer(self):
         shas = self.run_to_store()
@@ -881,6 +968,38 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("next", root)
         self.assertEqual(code, 1, output)
         self.assertIn("approve {}".format(root), output)
+
+    def _risky_check(self):
+        """A command check that is high risk (sudo) and leaves a marker when run."""
+        return {"type": "command", "command": "sudo -n true 2>/dev/null; touch ran.marker"}
+
+    def test_hands_off_verify_refuses_unapproved_high_risk(self):
+        root = self._root_with("hands-off", verification=self._risky_check())
+        code, output = self.cli("verify", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertFalse((self.workspace / "ran.marker").exists(), "check must not run")
+
+        self.cli("approve", root, check=0)
+        self.cli("verify", root)
+        self.assertTrue((self.workspace / "ran.marker").exists())
+
+    def test_hands_off_jump_refuses_unapproved_high_risk(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        code, output = self.cli("jump", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIsNone(self.state().get("active_node_id"))
+
+        self.cli("approve", root, check=0)
+        self.cli("jump", root, check=0)
+        self.assertEqual(self.state()["active_node_id"], root)
+
+    def test_assisted_verify_runs_high_risk_with_notice(self):
+        root = self._root_with("assisted", verification=self._risky_check())
+        code, output = self.cli("verify", root)
+        self.assertIn("risk: high (sudo)", output)
+        self.assertTrue((self.workspace / "ran.marker").exists())
 
     def _free_port(self):
         with socket.socket() as probe:
@@ -1193,6 +1312,22 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn("tutorial.corrected.md", output)
         self.assertIn("deviations.md", output)
 
+    def test_export_removes_stale_corrected_file_when_source_unreadable(self):
+        source = self.workspace / "tutorial.md"
+        source.write_text("Run ./greet --name Ada\n", encoding="utf-8")
+        nid = self._export_node(str(source), commands=["./greet --name Ada"])
+        self.cli("deviate", nid, "--command", "0", "--to", "./greet --who Ada",
+                 "--reason", "v2 renamed --name", check=0)
+        self.cli("export", check=0)
+        out = self.workspace / ".tutorial-export"
+        self.assertTrue((out / "tutorial.corrected.md").exists())
+        source.unlink()
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        self.assertFalse((out / "tutorial.corrected.md").exists())
+        report = (out / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("v2 renamed --name", report)
+
     def test_export_without_deviations_reports_none_and_no_corrected_file(self):
         source = self.workspace / "tutorial.md"
         source.write_text("Run echo a\n", encoding="utf-8")
@@ -1246,6 +1381,187 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn(".tutorial-export/", exclude.splitlines())
         self.assertNotIn(".tutorial-export", self.git("status", "--porcelain"))
 
+    def test_export_report_metadata_topological_nodes_and_empty_sections(self):
+        self.cli("init", "--title", "Report Demo", "--source", "guide.md",
+                 "--mode", "assisted", "--persistence", "file", check=0)
+        state = self.state()
+        state["nodes"] = [
+            {
+                "id": "2-second",
+                "title": "Second step",
+                "summary": "Depends on first.",
+                "dependencies": ["1-first"],
+                "action_type": "read-only",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": [],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "3-third",
+                "title": "Third step",
+                "summary": "Depends on second.",
+                "dependencies": ["2-second"],
+                "action_type": "read-only",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": [],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "1-first",
+                "title": "First step",
+                "summary": "Creates out.txt.",
+                "dependencies": [],
+                "action_type": "mutate",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["out.txt"],
+                "commands": ["touch out.txt"],
+                "verification": {"type": "file_exists", "path": "out.txt"},
+            },
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("next", "1-first", check=0)
+        (self.workspace / "out.txt").write_text("hi\n", encoding="utf-8")
+        self.cli("complete", "1-first", "--commit", check=0)
+        sha = self.node("1-first")["commit_sha"]
+        self.assertIsNotNone(sha)
+        self.cli("jump", "3-third", "--skip-ancestors", check=0)
+
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        self.assertIn("report.md", output)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+
+        self.assertIn("# Report Demo", report)
+        self.assertIn("source_doc: `guide.md`", report)
+        self.assertIn("mode: `assisted`", report)
+        self.assertIn("persistence: `file`", report)
+        self.assertIn("git.branch: `main`", report)
+        self.assertIn("1 completed / 1 skipped / 3 total", report)
+        self.assertNotIn("## Preflight", report)
+        self.assertNotIn("## Visual Artifacts", report)
+
+        nodes_section = report.split("## Nodes", 1)[1].split("## Deviations", 1)[0]
+        pos1 = nodes_section.index("| 1-first |")
+        pos2 = nodes_section.index("| 2-second |")
+        pos3 = nodes_section.index("| 3-third |")
+        self.assertLess(pos1, pos2)
+        self.assertLess(pos2, pos3)
+        self.assertIn(
+            "| 1-first | First step | COMPLETED | {} | out.txt | 0 |".format(sha[:7]),
+            nodes_section,
+        )
+        self.assertIn("| 2-second | Second step | SKIPPED | \u2014 | \u2014 | 0 |", nodes_section)
+        self.assertIn("| 3-third | Third step | ACTIVE | \u2014 | \u2014 | 0 |", nodes_section)
+
+        deviations_section = report.split("## Deviations", 1)[1].split("## Residue", 1)[0]
+        residue_section = report.split("## Residue", 1)[1]
+        self.assertIn("None.", deviations_section)
+        self.assertIn("None.", residue_section)
+
+    def test_export_report_visual_artifacts_relative_embeds(self):
+        self.cli("init", "--title", "Visuals", "--source", "v.md", check=0)
+        (self.workspace / "docs").mkdir()
+        (self.workspace / "notes").mkdir()
+        for rel in ("docs/arch.png", "docs/diagram.SVG", "notes/photo.jpg", "notes/pic.jpeg", "README.txt"):
+            (self.workspace / rel).write_bytes(b"data")
+        state = self.state()
+        state["nodes"] = [
+            {
+                "id": "1-draw",
+                "title": "Draw",
+                "summary": "Create images.",
+                "dependencies": [],
+                "action_type": "mutate",
+                "status": "completed",
+                "commit_sha": None,
+                "artifacts": ["docs/arch.png", "docs/diagram.SVG", "docs/missing.png", "README.txt"],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "2-more",
+                "title": "More",
+                "summary": "Add photos.",
+                "dependencies": ["1-draw"],
+                "action_type": "mutate",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["docs/arch.png", "notes/photo.jpg", "notes/pic.jpeg"],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        self.cli("export", check=0)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## Visual Artifacts", report)
+        visual_section = report.split("## Visual Artifacts", 1)[1].split("## Deviations", 1)[0]
+        self.assertIn("![docs/arch.png](../docs/arch.png)", visual_section)
+        self.assertIn("![docs/diagram.SVG](../docs/diagram.SVG)", visual_section)
+        self.assertIn("![notes/photo.jpg](../notes/photo.jpg)", visual_section)
+        self.assertIn("![notes/pic.jpeg](../notes/pic.jpeg)", visual_section)
+        self.assertEqual(visual_section.count("docs/arch.png"), 2)  # alt + link once
+        self.assertNotIn("missing.png", visual_section)
+        self.assertNotIn("README.txt", visual_section)
+
+        self.cli("export", "--out", "custom/nested", check=0)
+        nested_report = (self.workspace / "custom" / "nested" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("![docs/arch.png](../../docs/arch.png)", nested_report)
+
+    def test_export_report_preflight_deviations_and_residue(self):
+        nid = self._export_node("https://example.invalid/t.md", commands=["echo old"])
+        state = self.state()
+        state["requires"] = {
+            "tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"},
+            "os": ["linux", "darwin", "windows"],
+        }
+        state["residue"] = [
+            {
+                "node_id": nid,
+                "scopes": ["user"],
+                "undo": ["rm ~/.demo"],
+                "reason": "not-run",
+                "recorded_at": "2026-11-27T00:00:00Z",
+            }
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, _ = self.cli("doctor")
+        self.assertEqual(code, 1)
+        self.cli("deviate", nid, "--command", "0", "--to", "echo new", "--reason", "updated", check=0)
+
+        self.cli("export", check=0)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+
+        self.assertIn("## Preflight", report)
+        preflight_section = report.split("## Preflight", 1)[1].split("## Nodes", 1)[0]
+        self.assertIn("status: failed", preflight_section)
+        self.assertIn("missing: zz-missing-tool-9", preflight_section)
+        self.assertIn("| python3 | ok |", preflight_section)
+        self.assertIn("| zz-missing-tool-9 | missing |", preflight_section)
+        self.assertIn("| os | ok |", preflight_section)
+
+        nodes_section = report.split("## Nodes", 1)[1].split("## Deviations", 1)[0]
+        self.assertIn("| {} |".format(nid), nodes_section)
+        self.assertTrue(any(
+            line.startswith("| {} |".format(nid)) and line.endswith("| 1 |")
+            for line in nodes_section.splitlines()
+        ))
+
+        deviations_section = report.split("## Deviations", 1)[1].split("## Residue", 1)[0]
+        self.assertNotIn("None.", deviations_section)
+        self.assertIn("`{}` (`command:0`): `echo old` -> `echo new`".format(nid), deviations_section)
+        self.assertIn("updated", deviations_section)
+
+        residue_section = report.split("## Residue", 1)[1]
+        self.assertNotIn("None.", residue_section)
+        self.assertIn("`{}` [user]: not-run (undo: rm ~/.demo)".format(nid), residue_section)
+
     def test_hands_off_high_risk_active_node_needs_approval_to_complete(self):
         root = self._root_with("hands-off", commands=["sudo true"])
         state = self.state()
@@ -1272,6 +1588,190 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("validate")
         self.assertEqual(code, 1, output)
         self.assertIn("deviations", output)
+
+    def test_doctor_json_pass_fail_and_no_requires(self):
+        import platform
+
+        self.seed_repo()
+        self.seed_state()
+        expected_os = platform.system().lower()
+
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {"ok": True, "os": expected_os, "checks": [], "missing": []}, data
+        )
+
+        state = self.state()
+        state["requires"] = {
+            "tools": {"python3": ">=3.0"},
+            "os": [expected_os],
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["ok"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertEqual([], data["missing"])
+        self.assertEqual(["python3", "os"], [row["name"] for row in data["checks"]])
+        self.assertTrue(all(row["ok"] for row in data["checks"]))
+
+        state["requires"] = {
+            "tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"},
+            "os": [expected_os],
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 1, output)
+        data = json.loads(output)
+        self.assertFalse(data["ok"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertEqual(["zz-missing-tool-9"], data["missing"])
+        by_name = {row["name"]: row for row in data["checks"]}
+        self.assertEqual("missing", by_name["zz-missing-tool-9"]["status"])
+        self.assertFalse(by_name["zz-missing-tool-9"]["ok"])
+
+    def test_next_json_normal_and_risk(self):
+        import platform
+
+        expected_os = platform.system().lower()
+        self.seed_repo()
+        state = self.seed_state()
+        first = state["nodes"][0]
+        code, output = self.cli("next", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node"]["id"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertIsNone(data["variant"])
+        self.assertEqual(first["commands"], data["commands"])
+        self.assertEqual(first["verification"], data["verification"])
+        self.assertEqual([], data["undo"])
+        self.assertEqual(
+            {"tier": "low", "labels": [], "approved": False}, data["risk"]
+        )
+        self.assertEqual([], data["ready"])
+
+        # High-risk node in assisted mode emits clean JSON (no stdout risk banner).
+        state = self.state()
+        state["active_node_id"] = None
+        state["nodes"][0]["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        root = first["id"]
+        code, output = self.cli("next", root, "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(root, data["node"]["id"])
+        self.assertEqual(
+            {"tier": "high", "labels": ["sudo"], "approved": False}, data["risk"]
+        )
+
+        self.cli("approve", root, check=0)
+        code, output = self.cli("next", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["risk"]["approved"])
+
+        # Hands-off still blocks unapproved high-risk nodes even with --json.
+        state = self.state()
+        state["mode"] = "hands-off"
+        state["active_node_id"] = None
+        state["nodes"][0].pop("approved", None)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("next", root, "--json")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
+    def test_verify_json_pass_fail_and_risk(self):
+        self.seed_repo()
+        state = self.seed_state()
+        first = state["nodes"][0]
+        second = state["nodes"][1]
+
+        code, output = self.cli("verify", first["id"], "--yes", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node_id"])
+        self.assertTrue(data["ok"])
+        self.assertIn("PASS", data["message"])
+        self.assertEqual(first["verification"], data["verification"])
+
+        code, output = self.cli("verify", second["id"], "--json")
+        self.assertEqual(code, 1, output)
+        data = json.loads(output)
+        self.assertEqual(second["id"], data["node_id"])
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["message"])
+        self.assertEqual(second["verification"], data["verification"])
+
+        self.materialize(second["id"])
+        code, output = self.cli("verify", second["id"], "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["ok"])
+
+        # Assisted high-risk node with --json suppresses stdout risk banner.
+        state = self.state()
+        state["nodes"][0]["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("verify", first["id"], "--yes", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node_id"])
+        self.assertTrue(data["ok"])
+
+    def test_complete_json_commit_clean_and_branch_ready(self):
+        self.seed_repo()
+        self.seed_state()
+        self.cli("next", check=0)
+
+        # Clean tree with --commit yields commit_sha=None and next_active=2-scaffold.
+        code, output = self.cli("complete", "--yes", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "1-design",
+                "status": "completed",
+                "commit_sha": None,
+                "next_active": "2-scaffold",
+                "ready": [],
+            },
+            data,
+        )
+
+        # Dirty workspace with --commit creates a checkpoint and advances to 3-smoke.
+        self.materialize("2-scaffold")
+        code, output = self.cli("complete", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "2-scaffold",
+                "status": "completed",
+                "commit_sha": self.head(),
+                "next_active": "3-smoke",
+                "ready": [],
+            },
+            data,
+        )
+
+        # Completing 3-smoke reaches a branch point: next_active=None, ready=[4-store, 5-render].
+        code, output = self.cli("complete", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "3-smoke",
+                "status": "completed",
+                "commit_sha": None,
+                "next_active": None,
+                "ready": ["4-store", "5-render"],
+            },
+            data,
+        )
 
 
 def load_cli_module():
@@ -1685,6 +2185,138 @@ class DraftTest(unittest.TestCase):
     def test_summary_falls_back_to_title_without_paragraph(self):
         self.assertEqual(self.draft("## Bare\n\n```sh\nls\n```\n")["nodes"][0]["summary"], "Bare")
 
+    def test_detects_tools_in_command_positions_only(self):
+        self.assertNotIn("requires", self.draft("## Plain\n\n```sh\nls -la\necho \"git docker\"\n# make test\n```\n"))
+        text = (
+            "## Build\n\n"
+            "```bash\n"
+            "FOO=bar /usr/bin/python3 -m venv .venv && npm install\n"
+            "curl -s https://example.invalid | sqlite3 app.db\n"
+            "sudo docker build . ; git status\n"
+            "node index.js\n"
+            "cargo check && go test ./...\n"
+            "Rscript analyze.R && make check\n"
+            "```\n"
+        )
+        doc = self.draft(text)
+        expected = {
+            "Rscript": "*",
+            "cargo": "*",
+            "curl": "*",
+            "docker": "*",
+            "git": "*",
+            "go": "*",
+            "make": "*",
+            "node": "*",
+            "npm": "*",
+            "python3": "*",
+            "sqlite3": "*",
+        }
+        self.assertEqual(doc["requires"], {"tools": expected})
+
+    def test_detects_os_variants_from_lines_subsections_and_fences(self):
+        lines_md = (
+            "## Install\n\n"
+            "Install the tool.\n\n"
+            "On Linux:\n\n"
+            "```sh\n"
+            "curl -fsSL https://example.invalid/linux.sh\n"
+            "```\n\n"
+            "On macOS (`darwin`):\n\n"
+            "```sh\n"
+            "git clone https://example.invalid/repo\n"
+            "```\n\n"
+            "**Windows**:\n\n"
+            "```powershell\n"
+            "winget install example\n"
+            "```\n"
+        )
+        doc = self.draft(lines_md)
+        node = doc["nodes"][0]
+        self.assertEqual(node["action_type"], "execute")
+        self.assertEqual(node["commands"], [])
+        self.assertEqual(
+            node["variants"],
+            {
+                "linux": {"commands": ["curl -fsSL https://example.invalid/linux.sh"]},
+                "darwin": {"commands": ["git clone https://example.invalid/repo"]},
+                "windows": {"commands": ["winget install example"]},
+            },
+        )
+        self.assertEqual(doc["requires"], {"tools": {"curl": "*", "git": "*"}})
+
+        sub_md = (
+            "## Setup\n\n"
+            "#### Linux\n\n"
+            "Linux instructions.\n\n"
+            "```bash\n"
+            "make linux\n"
+            "```\n\n"
+            "#### macOS (Darwin)\n\n"
+            "```bash\n"
+            "make darwin\n"
+            "```\n\n"
+            "#### Common check\n\n"
+            "```bash\n"
+            "echo ok\n"
+            "```\n"
+        )
+        sub_node = self.draft(sub_md)["nodes"][0]
+        self.assertEqual(sub_node["commands"], ["echo ok"])
+        self.assertEqual(
+            sub_node["variants"],
+            {
+                "linux": {"commands": ["make linux"]},
+                "darwin": {"commands": ["make darwin"]},
+            },
+        )
+
+        fence_md = (
+            "## Run\n\n"
+            "```bash linux\n"
+            "echo lin\n"
+            "```\n\n"
+            "```sh macOS\n"
+            "echo mac\n"
+            "```\n\n"
+            "```powershell windows\n"
+            "Write-Output win\n"
+            "```\n"
+        )
+        fence_node = self.draft(fence_md)["nodes"][0]
+        self.assertEqual(
+            fence_node["variants"],
+            {
+                "linux": {"commands": ["echo lin"]},
+                "darwin": {"commands": ["echo mac"]},
+                "windows": {"commands": ["Write-Output win"]},
+            },
+        )
+
+    def test_detects_server_commands_and_adds_service_hint(self):
+        server_cmds = (
+            "python3 -m http.server 8000",
+            "uvicorn app:main --reload",
+            "flask run --port 5000",
+            "npm run dev",
+            "npx vite --port 3000",
+            "rails server -p 3000",
+        )
+        for cmd in server_cmds:
+            with self.subTest(cmd=cmd):
+                node = self.draft("## Serve\n\n```sh\n{}\n```\n".format(cmd))["nodes"][0]
+                prompt = node["verification"]["prompt"]
+                self.assertTrue(prompt.startswith("DRAFT: replace with a real check for "))
+                self.assertIn("DRAFT: consider a service block", prompt)
+
+        inline_node = self.draft(
+            "1. Serve: start `python3 -m http.server 8000` in a terminal.\n"
+        )["nodes"][0]
+        self.assertIn("DRAFT: consider a service block", inline_node["verification"]["prompt"])
+
+        plain_node = self.draft("## Check\n\n```sh\necho ready\n```\n")["nodes"][0]
+        self.assertNotIn("DRAFT: consider a service block", plain_node["verification"]["prompt"])
+
 
 class DraftWriteTest(unittest.TestCase):
     """`draft <path> --write` fills an empty state; validate checks source_ref (C-G10)."""
@@ -1780,6 +2412,39 @@ class DraftWriteTest(unittest.TestCase):
         state["nodes"][0]["source_ref"] = good
         self.write_state(state)
         self.assertEqual(self.cli("validate")[0], 0)
+
+    def test_write_copies_requires_when_absent_and_validates(self):
+        (self.ws / "tutorial.md").write_text(
+            "# Web App\n\n"
+            "## Install\n\n"
+            "On Linux:\n\n```sh\ngit status\n```\n\n"
+            "On macOS:\n\n```sh\npython3 --version\n```\n\n"
+            "## Serve\n\n```sh\nuvicorn app:main\n```\n",
+            encoding="utf-8",
+        )
+        self.init()
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        state = self.state()
+        self.assertEqual(state["requires"], {"tools": {"git": "*", "python3": "*"}})
+        self.assertIn("variants", state["nodes"][0])
+        self.assertIn("DRAFT: consider a service block", state["nodes"][1]["verification"]["prompt"])
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+
+    def test_write_preserves_existing_requires(self):
+        (self.ws / "tutorial.md").write_text(
+            "# Build\n\n## Run\n\n```sh\npython3 -m unittest\n```\n",
+            encoding="utf-8",
+        )
+        self.init()
+        state = self.state()
+        existing_requires = {"os": ["linux"], "tools": {"python3": ">=3.9"}}
+        state["requires"] = existing_requires
+        self.write_state(state)
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.state()["requires"], existing_requires)
 
 
 def dm_id_re():
@@ -2048,6 +2713,41 @@ class ScaffoldTest(unittest.TestCase):
         self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
         self.assertEqual(self.leftovers(), [])
 
+    def test_symlink_target_exits_1_and_is_untouched(self):
+        real = self.tmp / "real"
+        real.mkdir()
+        self.dest.mkdir(parents=True)
+        link = self.dest / "demo"
+        os.symlink(str(real), str(link), target_is_directory=True)
+        code, out = self.scaffold("demo", "--force")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(os.path.islink(str(link)))
+        self.assertTrue(real.is_dir())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_failed_swap_restores_old_target(self):
+        target = self.dest / "demo"
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("mine", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("dag_manager_swap", str(self.cli_path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_rename = os.rename
+
+        def fake_rename(src, dst):
+            if (os.path.basename(str(src)).startswith(".demo.tmp-")
+                    and str(dst) == str(target)):
+                raise OSError("injected rename failure")
+            return real_rename(src, dst)
+
+        argv = ["--cwd", str(self.ws), "scaffold", "demo",
+                "--from", str(EXAMPLE_DAG), "--dest", str(self.dest), "--force"]
+        with mock.patch.object(os, "rename", side_effect=fake_rename):
+            code = module.main(argv)
+        self.assertEqual(code, 1)
+        self.assertEqual((target / "keep.txt").read_text(encoding="utf-8"), "mine")
+        self.assertEqual(self.leftovers(), [])
+
     def test_force_replaces_existing_target(self):
         target = self.dest / "demo"
         target.mkdir(parents=True)
@@ -2131,6 +2831,566 @@ class ScaffoldTest(unittest.TestCase):
                       out)
         self.assertFalse((self.dest / "demo").exists())
         self.assertEqual(self.leftovers(), [])
+
+
+class SubdirWorkspaceTest(unittest.TestCase):
+    """A workspace (--cwd) inside a larger repository: Git writes stay inside it."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="dag-manager-subdir-"))
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.workspace = self.repo / "sandbox"
+        self.workspace.mkdir()
+        self.env = dict(os.environ)
+        self.env.update(
+            {
+                "HOME": str(self.repo),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_AUTHOR_NAME": "Tutorial Test",
+                "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                "GIT_COMMITTER_NAME": "Tutorial Test",
+                "GIT_COMMITTER_EMAIL": "tutorial@example.invalid",
+                "GIT_ADVICE_ENABLED": "false",
+            }
+        )
+        self.env.pop("GIT_DIR", None)
+        self.env.pop("GIT_WORK_TREE", None)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "notes.txt").write_text("important\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "seed")
+
+        node = {
+            "summary": "s", "action_type": "mutate", "status": "pending",
+            "commit_sha": None, "commands": [],
+        }
+        nodes = [
+            dict(node, id="1-one", title="one", dependencies=[], artifacts=["x.txt"],
+                 verification={"type": "file_exists", "path": "x.txt"}),
+            dict(node, id="2-two", title="two", dependencies=["1-one"],
+                 artifacts=["new.txt"],
+                 verification={"type": "file_exists", "path": "new.txt"}),
+        ]
+        dag = self.repo / "dag.json"
+        dag.write_text(json.dumps({"title": "t", "source_doc": "t.md", "mode": "assisted",
+                                   "nodes": nodes}), encoding="utf-8")
+        self.cli("init", "--from", str(dag), check=0)
+
+    def git(self, *args, cwd=None):
+        proc = subprocess.run(
+            ["git"] + list(args), cwd=str(cwd or self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        if proc.returncode != 0:
+            self.fail("git {} failed: {}".format(" ".join(args), proc.stdout))
+        return proc.stdout.strip()
+
+    def cli(self, *args, check=None):
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "--cwd", str(self.workspace)] + list(args),
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        if check is not None:
+            self.assertEqual(check, proc.returncode, proc.stdout)
+        return proc.returncode, proc.stdout
+
+    def put(self, relative, text, base=None):
+        path = (base or self.workspace) / relative
+        path.write_text(text, encoding="utf-8")
+
+    def committed_paths(self, rev="HEAD"):
+        return sorted(self.git("show", "--name-only", "--format=", rev).split())
+
+    def complete_one_and_two(self):
+        """Node 1 writes x.txt and gone.txt; an outside commit; node 2 edits them."""
+        self.cli("next", check=0)
+        self.put("x.txt", "one\n")
+        self.put("gone.txt", "g\n")
+        self.cli("complete", "--commit", check=0)
+        one = self.git("rev-parse", "HEAD")
+        self.put("other.txt", "outside\n", base=self.repo)
+        self.git("add", "other.txt")
+        self.git("commit", "-q", "-m", "outside work")
+        self.put("x.txt", "two\n")
+        self.put("new.txt", "n\n")
+        (self.workspace / "gone.txt").unlink()
+        self.cli("complete", "--commit", check=0)
+        return one, self.git("rev-parse", "HEAD")
+
+    def test_checkpoint_commits_only_workspace_paths(self):
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli("next", check=0)
+        self.put("x.txt", "one\n")
+        self.cli("complete", "--commit", check=0)
+        self.assertEqual(["sandbox/x.txt"], self.committed_paths())
+        self.assertEqual("M notes.txt", self.git("status", "--porcelain", "--", "notes.txt"))
+
+    def test_hard_rewind_force_only_needed_for_workspace_changes(self):
+        self.complete_one_and_two()
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli("jump", "2-two", "--reset-descendants", "--git-rollback", "hard", check=0)
+
+        self.put("x.txt", "edited in workspace\n")
+        code, output = self.cli(
+            "jump", "1-one", "--reset-descendants", "--git-rollback", "hard"
+        )
+        self.assertEqual(1, code, output)
+        self.assertIn("--force", output)
+
+    def test_hard_rewind_restores_workspace_and_keeps_outside_work(self):
+        one, two = self.complete_one_and_two()
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli(
+            "jump", "2-two", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual("one\n", (self.workspace / "x.txt").read_text(encoding="utf-8"))
+        self.assertTrue((self.workspace / "gone.txt").is_file())
+        self.assertFalse((self.workspace / "new.txt").exists())
+        # Outside the workspace: the later commit and the uncommitted edit survive.
+        self.assertEqual("outside\n", (self.repo / "other.txt").read_text(encoding="utf-8"))
+        self.assertIn("user WIP", (self.repo / "notes.txt").read_text(encoding="utf-8"))
+        # HEAD moves forward with a rewind commit that touches only the workspace.
+        self.assertEqual(two, self.git("rev-parse", "HEAD~1"))
+        self.assertTrue(self.git("log", "-1", "--format=%s").startswith("tutorial(rewind):"))
+        self.assertTrue(all(p.startswith("sandbox/") for p in self.committed_paths()))
+        self.assertEqual("", self.git("status", "--porcelain", "--", "sandbox"))
+        self.assertEqual("", self.git("diff", one, "HEAD", "--", "sandbox"))
+        state = json.loads((self.workspace / STATE_NAME).read_text(encoding="utf-8"))
+        statuses = {n["id"]: n["status"] for n in state["nodes"]}
+        self.assertEqual({"1-one": "completed", "2-two": "pending"}, statuses)
+
+    def test_hard_rewind_to_init_when_workspace_absent_there(self):
+        # The seed commit predates every sandbox file.
+        self.complete_one_and_two()
+        self.cli(
+            "jump", "1-one", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual("", self.git("ls-files", "--", "sandbox"))
+        self.assertEqual("outside\n", (self.repo / "other.txt").read_text(encoding="utf-8"))
+
+
+class PlatformVariantsTest(unittest.TestCase):
+    """Per-OS node.variants validation and runtime resolution (C-G5)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+        previous = sys.modules.get("dag_manager")
+        sys.modules["dag_manager"] = cls.dm
+        cls.addClassCleanup(
+            lambda: sys.modules.__setitem__("dag_manager", previous)
+            if previous is not None
+            else sys.modules.pop("dag_manager", None)
+        )
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="dag-variants-test-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.state_path = self.workspace / STATE_NAME
+
+    def _base_node(self, **overrides):
+        node = {
+            "id": "1-step",
+            "title": "Install step",
+            "summary": "Install dependency.",
+            "dependencies": [],
+            "action_type": "execute",
+            "status": "pending",
+            "commit_sha": None,
+            "artifacts": [],
+            "commands": ["echo base-cmd"],
+            "verification": {"type": "command", "command": "echo base-check"},
+            "undo": ["echo base-undo"],
+        }
+        node.update(overrides)
+        return node
+
+    def _write_state(self, nodes, active="1-step"):
+        state = {
+            "schema_version": "1.2",
+            "title": "Variants Demo",
+            "source_doc": "README.md",
+            "mode": "assisted",
+            "persistence": "file",
+            "active_node_id": active,
+            "created_at": "2026-11-27T00:00:00Z",
+            "updated_at": "2026-11-27T00:00:00Z",
+            "git": {
+                "branch": "main",
+                "initial_commit_sha": "",
+                "initial_dirty": False,
+                "exclude_configured": True,
+            },
+            "nodes": nodes,
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    def _run_main(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = self.dm.main(["--cwd", str(self.workspace)] + list(argv))
+        return code, buf.getvalue()
+
+    def test_linux_and_darwin_variant_selection_and_field_fallback(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["echo linux-cmd"],
+                    "verification": {"type": "command", "command": "echo linux-check"},
+                    "undo": ["echo linux-undo"],
+                },
+                "darwin": {
+                    "commands": ["echo darwin-cmd"],
+                },
+            }
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            self.assertEqual("linux", self.dm.current_os())
+            self.assertEqual(["echo linux-cmd"], self.dm.effective_commands(node))
+            self.assertEqual(
+                {"type": "command", "command": "echo linux-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo linux-undo"], self.dm.effective_undo(node))
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            self.assertEqual("darwin", self.dm.current_os())
+            self.assertEqual(["echo darwin-cmd"], self.dm.effective_commands(node))
+            # Verification and undo are absent from darwin variant -> fall back to base.
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo base-undo"], self.dm.effective_undo(node))
+
+    def test_fallback_to_base_when_os_absent_from_variants(self):
+        node = self._base_node(
+            variants={"linux": {"commands": ["echo linux-cmd"]}}
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            self.assertEqual("windows", self.dm.current_os())
+            self.assertEqual(["echo base-cmd"], self.dm.effective_commands(node))
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo base-undo"], self.dm.effective_undo(node))
+
+    def test_windows_variant_schema_validation_passes(self):
+        node = self._base_node(
+            variants={
+                "windows": {
+                    "commands": ["winget install -e --id Git.Git"],
+                    "verification": {"type": "command", "command": "git --version"},
+                    "undo": ["winget uninstall --id Git.Git"],
+                }
+            }
+        )
+        self.assertEqual([], self.dm.validate_node(node, 0, {}))
+
+    def test_invalid_variants_rejected(self):
+        bad_cases = [
+            "linux",
+            {},
+            {"plan9": {"commands": ["echo hi"]}},
+            {"linux": {}},
+            {"linux": ["echo hi"]},
+            {"linux": {"artifacts": ["file.txt"]}},
+            {"linux": {"commands": [""]}},
+            {"linux": {"commands": "echo hi"}},
+            {"linux": {"undo": ["   "]}},
+            {"linux": {"verification": {"type": "bogus"}}},
+        ]
+        for bad in bad_cases:
+            node = self._base_node(variants=bad)
+            problems = self.dm.validate_node(node, 0, {})
+            self.assertTrue(problems, "expected rejection for {!r}".format(bad))
+
+    def test_risk_tier_and_interactive_hints_use_effective_variant(self):
+        node = self._base_node(
+            interactive={"answers": ["yes"]},
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get install -y jq"],
+                    "undo": ["echo undo-linux"],
+                },
+                "darwin": {
+                    "commands": ["brew install jq"],
+                },
+            },
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            tier, labels = self.dm.risk_tier(node)
+            self.assertEqual(("high", ["sudo"]), (tier, labels))
+            hints = self.dm.interactive_hints(node)
+            self.assertIn("sudo apt-get install -y jq", hints[0])
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            tier, labels = self.dm.risk_tier(node)
+            self.assertEqual(("low", []), (tier, labels))
+            hints = self.dm.interactive_hints(node)
+            self.assertIn("brew install jq", hints[0])
+
+    def test_status_verify_and_jump_undo_use_effective_variant(self):
+        marker = self.workspace / "undone.txt"
+        node = self._base_node(
+            status="completed",
+            side_effects=["user"],
+            commands=["echo base-cmd"],
+            verification={"type": "command", "command": "echo base-ok"},
+            undo=["echo base > undone.txt"],
+            variants={
+                "linux": {
+                    "commands": ["echo linux-only-cmd"],
+                    "verification": {"type": "command", "command": "echo linux-ok"},
+                    "undo": ["printf linux > undone.txt"],
+                }
+            },
+        )
+        root = self._base_node(
+            id="0-root",
+            dependencies=[],
+            status="completed",
+            side_effects=["repo"],
+            commands=["true"],
+            verification={"type": "confirm", "prompt": "ok"},
+        )
+        node["dependencies"] = ["0-root"]
+        self._write_state([root, node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("status")
+            self.assertEqual(0, code, out)
+            self.assertIn("$ echo linux-only-cmd", out)
+            self.assertIn("linux-ok", out)
+
+            live_node = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][1]
+            passed, lines = self.dm.run_verification(live_node, self.workspace, False)
+            self.assertTrue(passed, lines)
+            self.assertIn("linux-ok", "\n".join(lines))
+
+            code, out = self._run_main(
+                "jump", "0-root", "--reset-descendants", "--undo"
+            )
+            self.assertEqual(0, code, out)
+            self.assertEqual("linux", marker.read_text(encoding="utf-8"))
+
+    def test_deviate_mutates_active_variant_or_falls_back_to_base(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["apt-get install foo"],
+                    "verification": {"type": "command", "command": "which foo"},
+                },
+                "darwin": {
+                    "commands": ["brew install foo"],
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        # Linux overrides both commands and verification -> mutate linux variant only.
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "apt-get install bar",
+                "--reason", "renamed package",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "sudo which bar",
+                "--reason", "check renamed binary",
+            )
+            self.assertEqual(0, code, out)
+            self.assertIn("risk: high (sudo)", out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual(["apt-get install bar"], saved["variants"]["linux"]["commands"])
+        self.assertEqual("sudo which bar", saved["variants"]["linux"]["verification"]["command"])
+        self.assertEqual(["echo base-cmd"], saved["commands"])
+        self.assertEqual("echo base-check", saved["verification"]["command"])
+
+        # Darwin overrides commands only -> --check falls back to mutating base verification.
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "echo darwin-fallback-check",
+                "--reason", "fix base check",
+            )
+            self.assertEqual(0, code, out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual("echo darwin-fallback-check", saved["verification"]["command"])
+        self.assertEqual("sudo which bar", saved["variants"]["linux"]["verification"]["command"])
+
+        # Windows absent from variants -> mutates base commands.
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "echo windows-base-cmd",
+                "--reason", "fix base cmd",
+            )
+            self.assertEqual(0, code, out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual(["echo windows-base-cmd"], saved["commands"])
+        self.assertEqual(["brew install foo"], saved["variants"]["darwin"]["commands"])
+
+    def test_next_prints_variant_lines_on_match_and_omits_on_fallback(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get update", "sudo apt-get install -y jq"],
+                    "verification": {"type": "command", "command": "jq --version"},
+                },
+                "darwin": {
+                    "commands": [],
+                    "verification": {"type": "port_listening", "port": 8080},
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("  variant: linux (overrides: commands, verification)", out)
+            self.assertIn("  commands: sudo apt-get update; sudo apt-get install -y jq", out)
+            self.assertIn("  verification: command jq --version", out)
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("  variant: darwin (overrides: commands, verification)", out)
+            self.assertIn("  commands: (none)", out)
+            self.assertIn("  verification: port_listening 8080", out)
+
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("active -> 1-step (execute)", out)
+            self.assertNotIn("  variant:", out)
+            self.assertNotIn("  commands:", out)
+            self.assertNotIn("  verification:", out)
+
+        plain_node = self._base_node()
+        self._write_state([plain_node], active="1-step")
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("active -> 1-step (execute)", out)
+            self.assertNotIn("  variant:", out)
+
+    def test_deviate_and_export_with_active_variant(self):
+        tutorial = self.workspace / "README.md"
+        tutorial.write_text(
+            "Install foo:\n```sh\napt-get install foo\n```\nVerify:\n```sh\nwhich foo\n```\n",
+            encoding="utf-8",
+        )
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["apt-get install foo"],
+                    "verification": {"type": "command", "command": "which foo"},
+                },
+                "darwin": {
+                    "commands": ["brew install foo"],
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "apt-get install bar",
+                "--reason", "package renamed",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "which bar",
+                "--reason", "binary renamed",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main("export", "--out", "export-out")
+            self.assertEqual(0, code, out)
+
+        export_dir = self.workspace / "export-out"
+        deviations_md = (export_dir / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("- target: `command:0`", deviations_md)
+        self.assertIn("- original: `apt-get install foo`", deviations_md)
+        self.assertIn("- replacement: `apt-get install bar`", deviations_md)
+        self.assertIn("- target: `check`", deviations_md)
+        self.assertIn("- original: `which foo`", deviations_md)
+        self.assertIn("- replacement: `which bar`", deviations_md)
+        self.assertNotIn("## Not applied", deviations_md)
+
+        corrected_md = (export_dir / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("apt-get install bar", corrected_md)
+        self.assertNotIn("apt-get install foo", corrected_md)
+        self.assertIn("which bar", corrected_md)
+        self.assertNotIn("which foo", corrected_md)
+
+    def test_next_json_resolves_variant_and_falls_back(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get install -y jq"],
+                    "verification": {"type": "command", "command": "jq --version"},
+                    "undo": ["sudo apt-get remove -y jq"],
+                },
+                "darwin": {
+                    "commands": ["brew install jq"],
+                },
+            }
+        )
+        sibling = self._base_node(id="2-other", title="Other")
+        self._write_state([node, sibling], active=None)
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next", "1-step", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("1-step", data["node"]["id"])
+            self.assertEqual("linux", data["os"])
+            self.assertEqual("linux", data["variant"])
+            self.assertEqual(["sudo apt-get install -y jq"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "jq --version"}, data["verification"]
+            )
+            self.assertEqual(["sudo apt-get remove -y jq"], data["undo"])
+            self.assertEqual(
+                {"tier": "high", "labels": ["sudo"], "approved": False}, data["risk"]
+            )
+            self.assertEqual(["2-other"], data["ready"])
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main("next", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("darwin", data["os"])
+            self.assertEqual("darwin", data["variant"])
+            self.assertEqual(["brew install jq"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"}, data["verification"]
+            )
+            self.assertEqual(["echo base-undo"], data["undo"])
+            self.assertEqual(
+                {"tier": "low", "labels": [], "approved": False}, data["risk"]
+            )
+
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main("next", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("windows", data["os"])
+            self.assertIsNone(data["variant"])
+            self.assertEqual(["echo base-cmd"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"}, data["verification"]
+            )
+            self.assertEqual(["echo base-undo"], data["undo"])
 
 
 if __name__ == "__main__":

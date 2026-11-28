@@ -51,21 +51,23 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `scaffold <name> --from DAG.JSON [--dest DIR] [--force]` | Write a new skill to `<dest>/<name>/` (default `.agents/skills`): `SKILL.md` from `templates/SKILL.md.tmpl`, `dag.json` with progress stripped, `scripts/`, `references/`. The generated skill starts with `init --from` | 0 on success; 1 if the target exists without `--force`, the DAG is invalid, or the template is missing; 2 on a bad name |
 | `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
 | `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
-| `next [<id>] [--skip-doctor]` | Activate the next ready node, or pick a specific ready node. When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, the current node is incomplete, or the preflight failed |
-| `doctor [--json]` | Check the tools and OS declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
-| `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
-| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
+| `next [<id>] [--skip-doctor] [--json]` | Activate the next ready node, pick a specific ready node, or print the already-active pending node (with no `<id>`, exits 0). When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check. `--json` prints the node, OS/variant resolution, risk tier, and ready IDs as JSON | 1 if multiple nodes are ready, nothing is ready, or the preflight failed |
+| `doctor [--json]` | Check the tools and OS (`requires.os`) declared in `requires`, one row per check, and record the result as `preflight`; `--json` prints `{"ok", "os", "checks", "missing"}` | 1 if any check fails |
+| `verify [<id>] [--yes] [--json]` | Run the verification check for a node; `--json` prints `{"node_id", "ok", "message", "verification"}` | 1 on check failure |
+| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes] [--json]` | Verify, commit changes under the workspace (`git add -A -- .`), mark completed, update ready states; `--json` prints `{"node_id", "status", "commit_sha", "next_active", "ready"}` | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 | `approve <id>` | Record a person's approval of a node's current risk tier and its deviations; clears the `hands-off` gate for that node while its tier does not rise and no new deviation is recorded | 1 if the state is invalid |
 | `deviate [<id>] (--command N \| --check) --to CMD --reason TEXT` | Replace a stale check or command (default: active node) and record the original, replacement, and reason. Use only when the tutorial is wrong | 0 on success; 1 if the node is completed (`jump <id> --reset-descendants` first); 2 on bad target, same or empty text, or a non-command check |
-| `export [--out DIR]` | Write `deviations.md` and, for a readable local `source_doc` with at least one deviation, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
-| `draft <path> [--write]` | Print a skeleton DAG (JSON `{"title", "nodes"}`) from a Markdown tutorial: one node per H2/H3 heading (or numbered item), linear chain, `DRAFT:` placeholder checks. `--write` fills an empty `nodes` array, then validates | 1 with `--write` if `nodes` is not empty (`nodes already present`) |
+| `export [--out DIR]` | Write `report.md`, `deviations.md`, and, for a readable local `source_doc` with at least one deviation, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
+| `draft <path> [--write]` | Print a skeleton DAG (JSON `{"title", "nodes"}`, plus `requires.tools` when shell tools are detected) from a Markdown tutorial: one node per H2/H3 heading (or numbered item), linear chain, `DRAFT:` placeholder checks (with `; DRAFT: consider a service block` server hints), and per-OS `variants` from OS headings/labels or fence tags. `--write` fills an empty `nodes` array (and empty `requires`), then validates | 1 with `--write` if `nodes` is not empty (`nodes already present`) |
 | `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
 | `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
 | `teardown` | Stop every recorded service | 0 |
 
 `verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
+
+Nodes can also define per-OS `variants` (`linux`, `darwin`, `windows`) for `commands`, `verification`, and `undo` alongside `requires.os` / `doctor`; the CLI picks `platform.system().lower()` and falls back to the node's top-level fields.
 
 Node states:
 - `ACTIVE`: current node.
@@ -80,7 +82,7 @@ Node states:
 |---|---|---|---|
 | Command runner | User | Agent after user approval | Agent |
 | `confirm` checks | User | User | Agent (if pre-approved) |
-| High-risk nodes and deviations | Not gated | Not gated | `next` refuses high-risk nodes; `complete` refuses deviated nodes; both until `approve <id>` |
+| High-risk nodes and deviations | Not gated | Not gated | `next`, `jump`, `verify`, `complete`, and `service start` refuse high-risk nodes; `complete` refuses deviated nodes; both until `approve <id>` |
 | Git commit | Agent | Agent | Agent |
 | Best used for | Missing toolchains, learning | Standard local development | Long automated tutorials |
 
@@ -93,10 +95,12 @@ Persistence modes:
 | Problem | Cause and fix |
 |---|---|
 | `no state file at ./.tutorial-dag.json` | Run command from workspace root, or pass `--file`. |
+| Tutorial runs in a subdirectory of a larger repository | Pass `--cwd <subdir>` (or run from it). Checkpoints and dirty checks cover only that subdirectory. `--git-rollback hard` restores only the subdirectory to the checkpoint and commits that as `tutorial(rewind): restore <subdir> to <sha>`, so `HEAD` and work outside it are kept. `--git-rollback branch` still switches the whole repository. |
 | Git tracks `.tutorial-dag.json` | Re-run `init` or append `.tutorial-dag.json` to `.git/info/exclude`. |
 | `branch point: 2 nodes are ready` | Multiple paths open. Select one with `next <id>`. |
 | `refusing to jump over unmet ancestors` | Complete earlier nodes, or pass `--skip-ancestors` if already satisfied. |
 | `nothing to commit; completed <id> without a checkpoint` | The workspace was clean, so `complete --commit` completed the node with `commit_sha` null (exit 0). Expected for nodes that change no files. |
+| `refusing to roll back to <sha>: it would discard the checkpoints of completed nodes that are not downstream of <id>` | A sibling branch was checkpointed after the rollback target. Rewind to a common ancestor of both branches, or use `--git-rollback none`. |
 | `--git-rollback hard` refused | Add `--reset-descendants` and `--force` if the working tree has uncommitted changes. |
 | No ancestor checkpoint exists | Git repository had no commits at `init`. Make a baseline commit of the existing files, then re-run `init` (or use `--git-rollback none`). |
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |
@@ -112,13 +116,13 @@ Persistence modes:
 ## Development
 
 ```bash
-make lint               # compile checks
+make lint               # check-clean + byte-compile checks
 make validate-examples  # test sample DAG
 make test               # run test suite
 make test-corpus        # run corpus fixture tests
 ```
 
-Tests run in temporary Git repositories. They isolate global Git configurations.
+`make lint` runs `check-clean` first (failing if stray `.development/` or `planning/` directories exist inside `interactive-tutorial/`) before byte-compiling scripts and tests. Tests run in temporary Git repositories and isolate global Git configurations.
 
 Corpus: `make test-corpus` runs `tests/test_corpus.py` against the fixtures in `tests/corpus/`, one directory per tutorial scenario. `make test` excludes these tests (`test_dag*.py` only), and `make all` runs both.
 

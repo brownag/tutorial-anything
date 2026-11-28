@@ -18,6 +18,8 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 
 ## git block
 
+Git operations are limited to the workspace. When it is a subdirectory of the repository, `complete --commit` stages and commits only that subdirectory, dirty checks ignore changes outside it, and `jump --git-rollback hard` restores only it to the rollback commit and records the restore as a `tutorial(rewind): restore <subdir> to <sha12>` commit instead of moving `HEAD` back. At the repository root, `--git-rollback hard` runs `git reset --hard`. `--git-rollback branch` checks out a new branch for the whole repository in both cases.
+
 | Field | Type | Notes |
 |---|---|---|
 | `branch` | string \| null | Branch recorded at `init`. |
@@ -41,6 +43,11 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 | `verification` | object | Verification rule. Required on every node. |
 | `deviations` | object[] | Optional. Records written by `deviate` (schema 1.2). See "Deviations (C-G8)". |
 | `source_ref` | object | Optional. `{line, heading}`: `line` is a 1-based integer >= 1 (the source heading line), `heading` a string. Written by `draft`. See "Draft (C-G10)". |
+| `variants` | object | Optional. Per-OS overrides (`linux`, `darwin`, `windows`) for `commands`, `verification`, and `undo`. See "OS variants (C-G5)". |
+
+### OS variants (C-G5)
+
+`variants` maps one or more OS keys (`linux`, `darwin`, `windows`) to an override object with any subset of `commands`, `verification`, and `undo` (at least one property). The CLI resolves the active OS using `platform.system().lower()` and falls back field-by-field to the node's top-level `commands`, `verification`, and `undo` when no matching OS entry or field is present. Pair `node.variants` with root `requires.os` to gate unsupported platforms during preflight.
 
 ### action_type taxonomy
 
@@ -89,7 +96,7 @@ Computed on every read and never stored:
 | `skipped → completed` | Run `jump <node>` and then `complete <node>`. |
 | `completed → skipped` | Invalid transition. Reset to pending first. |
 
-Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option.
+Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option. A rollback refuses (exit 1, no changes) when a completed node outside the target and its descendants has a `commit_sha` that is not an ancestor of the rollback commit, because that node would stay `completed` without its files.
 
 ## Side effects, undo, and residue (schema 1.1)
 
@@ -135,7 +142,7 @@ Tiers are ordered `low < elevated < high`. The effective tier is the higher of t
 | `dd` | `dd if=` |
 
 - `approve <id>` records `approved` with the node's current effective tier. The approval covers the node while its effective tier is at or below the recorded tier. A later edit that raises the tier needs a new approval.
-- Gate: in `hands-off` mode only, `next` (explicit or implicit) refuses an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next` prints `risk: high (<labels>)`.
+- Gate: in `hands-off` mode only, `next` (explicit or implicit), `jump <id>`, `verify`, and `service start` refuse an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump` refuses before it changes any state or files. `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next`, `jump`, and `verify` print `risk: high (<labels>)`.
 - `status` shows a `RISK` column (`low`, `elev`, `HIGH`).
 - `validate` errors on an unknown `risk` value or a malformed `approved` object.
 - Hands-off `complete` also runs the risk gate: an effective-`high` node without covering approval is refused (exit 1, names `approve <id>`), even when `next` did not activate it.
@@ -296,7 +303,7 @@ Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "l
 Root field `requires` (optional) declares what the workspace must provide:
 
 - `tools`: object of command name to spec. A spec is `"*"` (any version, or none if the tool runs), `">=X[.Y[.Z]]"`, or `{"min": "X.Y", "version_command": "<shell command>"}`. The default version command is `<name> --version`. The version is the first dotted number in its stdout or stderr. Versions compare as tuples, padded to three parts.
-- `os` (optional): a unique array of `linux`, `darwin`, `windows`.
+- `os` (optional): a unique array of `linux`, `darwin`, `windows`. Use together with `node.variants` when a tutorial supports multiple OSes that need different `commands`, `verification`, or `undo` (matched via `platform.system().lower()` with fallback to top-level node fields).
 
 Root field `preflight` (optional) holds `{"passed", "at", "missing"}`, written by `doctor` and by the first `next`.
 

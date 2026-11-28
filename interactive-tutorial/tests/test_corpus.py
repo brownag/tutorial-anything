@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -25,6 +26,7 @@ CLI = SKILL_DIR / "scripts" / "dag_manager.py"
 CORPUS = SKILL_DIR / "tests" / "corpus"
 CORPUS_SLUGS = [
     "container",
+    "cross-os",
     "python-package",
     "shell-sysadmin",
     "sqlite-data",
@@ -160,6 +162,14 @@ def seed_workspace(dag: dict) -> Path:
     return ws
 
 
+def effective_node_field(node: dict, field: str):
+    """Resolve ``node[field]`` via the active OS variant with fallback to the base field."""
+    variant = (node.get("variants") or {}).get(platform.system().lower()) or {}
+    if field in variant:
+        return variant[field]
+    return node[field]
+
+
 def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
     """Run ``dag`` to completion (or up to ``stop_before``) in a fresh workspace.
 
@@ -179,7 +189,7 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
             proc = run_cli(ws, "service", "start", node["id"])
             if proc.returncode != 0:
                 raise RuntimeError("service start {} failed: {}".format(node["id"], proc.stdout + proc.stderr))
-        for command in node["commands"]:
+        for command in effective_node_field(node, "commands"):
             subprocess.run(
                 command, shell=True, cwd=str(ws), env=env, stdin=subprocess.DEVNULL,
                 timeout=60, check=True,
@@ -195,7 +205,7 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
         ).stdout.strip()
         if dirty:
             complete_args.append("--commit")
-        if node["verification"]["type"] == "confirm":
+        if effective_node_field(node, "verification")["type"] == "confirm":
             complete_args.append("--yes")
         proc = run_cli(ws, *complete_args)
         if proc.returncode != 0:
@@ -451,22 +461,22 @@ class FeatureTest(unittest.TestCase):
         ws = seed_workspace(dag)
         self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
         env = isolated_env(ws.parent / "home")
-        proc = subprocess.Popen(
+        with subprocess.Popen(
             [sys.executable, str(CLI), "verify", "b-input-eof"], cwd=str(ws), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True,
-        )
-        started = time.monotonic()
-        try:
-            returncode = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            self.fail("verify hung for more than 10 s with stdin held open")
-        finally:
-            proc.stdin.close()
-        elapsed = time.monotonic() - started
-        output = proc.stdout.read() + proc.stderr.read()
+        ) as proc:
+            started = time.monotonic()
+            try:
+                returncode = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                self.fail("verify hung for more than 10 s with stdin held open")
+            finally:
+                proc.stdin.close()
+            elapsed = time.monotonic() - started
+            output = proc.stdout.read() + proc.stderr.read()
         self.assertLess(elapsed, 10)
         self.assertEqual(1, returncode, output)
         self.assertIn("EOF", output)
@@ -561,6 +571,225 @@ class FeatureTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         proc = run_cli(ws, "complete", "3-run-greet")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+    def test_export_report_e2e(self):
+        """export writes report.md with metadata, topological node table, deviations, and visual embeds."""
+        case, raw = load_case("stale-tutorial")
+        expected = copy.deepcopy(raw)
+        expected["source_doc"] = str(CORPUS / "stale-tutorial" / "tutorial.md")
+        for node in expected["nodes"]:
+            if node["id"] == "3-run-greet":
+                node["artifacts"] = ["plots/diagram.svg"]
+
+        ws = run_tutorial(case, expected, stop_before="3-run-greet")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+
+        svg_path = ws / "plots" / "diagram.svg"
+        svg_path.parent.mkdir(parents=True, exist_ok=True)
+        svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>\n', encoding="utf-8")
+
+        proc = run_cli(ws, "next", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(
+            ws, "deviate", "--check", "--to", "./greet --who Ada",
+            "--reason", "v2 renamed --name to --who",
+        )
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "3-run-greet", "--commit")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        out_dir = ws / "docs" / "export"
+        proc = run_cli(ws, "export", "--out", "docs/export")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        report_path = out_dir / "report.md"
+        self.assertTrue(report_path.is_file(), "missing report.md")
+        report = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("# {}".format(expected["title"]), report)
+        self.assertIn("- source_doc: `{}`".format(expected["source_doc"]), report)
+        self.assertIn("- mode: `assisted`", report)
+        self.assertIn("- persistence: `file`", report)
+        self.assertIn("- git.branch: `main`", report)
+        self.assertIn("- progress: 4 completed / 0 skipped / 5 total", report)
+
+        self.assertIn("## Nodes", report)
+        self.assertIn("| ID | Title | Status | Commit | Artifacts | Deviations |", report)
+        expected_order = ["1-read", "2-write-greet", "2b-env-note", "3-run-greet", "4-finish"]
+        row_positions = [report.index("| {} |".format(nid)) for nid in expected_order]
+        self.assertEqual(row_positions, sorted(row_positions))
+        self.assertRegex(
+            report,
+            r"\| 3-run-greet \| [^|]+ \| COMPLETED \| [0-9a-f]{7} \| plots/diagram\.svg \| 1 \|",
+        )
+
+        self.assertIn("## Deviations", report)
+        self.assertIn(
+            "- `3-run-greet` (`check`): `./greet --name Ada` -> `./greet --who Ada`"
+            " \u2014 v2 renamed --name to --who",
+            report,
+        )
+
+        self.assertIn("## Visual Artifacts", report)
+        expected_rel = "../../plots/diagram.svg"
+        self.assertIn("![plots/diagram.svg]({})".format(expected_rel), report)
+        self.assertEqual((out_dir / expected_rel).resolve(), svg_path.resolve())
+
+    def test_cross_os_variants(self):
+        """next prints active OS variant details and verify/complete pass end-to-end."""
+        _, dag = load_case("cross-os")
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        env = isolated_env(ws.parent / "home")
+        active_os = platform.system().lower()
+
+        for node in topological_order(dag["nodes"]):
+            proc = run_cli(ws, "next", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            if node["id"] == "1-record-platform" and active_os in ("linux", "darwin"):
+                self.assertIn(
+                    "  variant: {} (overrides: commands, verification)".format(active_os),
+                    proc.stdout,
+                )
+                self.assertIn(
+                    "  commands: printf '{}\\n' > platform.txt".format(active_os),
+                    proc.stdout,
+                )
+                self.assertIn("  verification: file_contains platform.txt", proc.stdout)
+
+            for command in effective_node_field(node, "commands"):
+                subprocess.run(
+                    command, shell=True, cwd=str(ws), env=env,
+                    stdin=subprocess.DEVNULL, timeout=60, check=True,
+                )
+
+            is_confirm = effective_node_field(node, "verification")["type"] == "confirm"
+            verify_args = ["verify", node["id"]] + (["--yes"] if is_confirm else [])
+            proc = run_cli(ws, *verify_args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+            complete_args = ["complete", node["id"]]
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=str(ws), env=env,
+                stdout=subprocess.PIPE, universal_newlines=True, check=True,
+            ).stdout.strip()
+            if dirty:
+                complete_args.append("--commit")
+            if is_confirm:
+                complete_args.append("--yes")
+            proc = run_cli(ws, *complete_args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        if active_os in ("linux", "darwin"):
+            self.assertEqual(active_os, (ws / "platform.txt").read_text(encoding="utf-8").strip())
+            self.assertEqual("os=" + active_os, (ws / "note.txt").read_text(encoding="utf-8").strip())
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        self.assertEqual({n["id"]: n["status"] for n in state["nodes"]}, {
+            "1-record-platform": "completed",
+            "2-normalize-note": "completed",
+            "3-confirm-setup": "completed",
+        })
+
+    def test_in_context_persistence(self):
+        """in-context mode keeps all state in --file without creating .tutorial-dag.json."""
+        root = Path(tempfile.mkdtemp(prefix="corpus-in-context-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        ws = root / "repo"
+        home = root / "home"
+        ws.mkdir()
+        home.mkdir()
+        env = isolated_env(home)
+        state_path = root / "state.json"
+
+        for args in (["git", "init", "-q", "-b", "main"],):
+            subprocess.run(
+                args, cwd=str(ws), env=env, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        (ws / "README.md").write_text("# Scratch workspace\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=str(ws), env=env, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "seed"], cwd=str(ws), env=env, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        init = run_cli(
+            ws, "--file", str(state_path), "init",
+            "--title", "In-context persistence", "--source", "tutorial.md",
+            "--persistence", "in-context",
+        )
+        self.assertEqual(0, init.returncode, init.stdout + init.stderr)
+        self.assertTrue(state_path.is_file())
+        self.assertFalse((ws / ".tutorial-dag.json").exists())
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["nodes"] = [
+            {
+                "id": "step-1",
+                "title": "Create step one file",
+                "summary": "Write one.txt in the workspace. Done when one.txt exists.",
+                "dependencies": [],
+                "action_type": "execute",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["one.txt"],
+                "commands": ["printf 'one\\n' > one.txt"],
+                "verification": {"type": "file_exists", "path": "one.txt"},
+            },
+            {
+                "id": "step-2",
+                "title": "Create step two file",
+                "summary": "Write two.txt using one.txt. Done when two.txt contains two.",
+                "dependencies": ["step-1"],
+                "action_type": "execute",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["two.txt"],
+                "commands": ["printf 'two\\n' > two.txt"],
+                "verification": {"type": "file_contains", "path": "two.txt", "pattern": "two"},
+            },
+        ]
+        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        before = run_cli(ws, "--file", str(state_path), "status", "--json")
+        self.assertEqual(0, before.returncode, before.stdout + before.stderr)
+        before_doc = json.loads(before.stdout)
+        self.assertEqual("in-context", before_doc["persistence"])
+        self.assertEqual({n["id"]: n["status"] for n in before_doc["nodes"]}, {
+            "step-1": "pending",
+            "step-2": "pending",
+        })
+
+        for node in state["nodes"]:
+            proc = run_cli(ws, "--file", str(state_path), "next", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            for command in node["commands"]:
+                subprocess.run(
+                    command, shell=True, cwd=str(ws), env=env,
+                    stdin=subprocess.DEVNULL, timeout=60, check=True,
+                )
+            proc = run_cli(ws, "--file", str(state_path), "verify", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            proc = run_cli(ws, "--file", str(state_path), "complete", node["id"], "--commit")
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        after = run_cli(ws, "--file", str(state_path), "status", "--json")
+        self.assertEqual(0, after.returncode, after.stdout + after.stderr)
+        after_doc = json.loads(after.stdout)
+        self.assertEqual("in-context", after_doc["persistence"])
+        self.assertIsNone(after_doc["active_node_id"])
+        self.assertEqual({n["id"]: n["status"] for n in after_doc["nodes"]}, {
+            "step-1": "completed",
+            "step-2": "completed",
+        })
+        self.assertTrue(all(n["commit_sha"] for n in after_doc["nodes"]))
+        self.assertFalse((ws / ".tutorial-dag.json").exists())
 
 
 

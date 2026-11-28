@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.2",
+  "title": "Record and verify the host platform",
+  "source_doc": "tests/corpus/cross-os/tutorial.md",
+  "mode": "assisted",
+  "persistence": "file",
+  "active_node_id": null,
+  "created_at": "2026-11-27T09:00:00Z",
+  "updated_at": "2026-11-27T09:00:00Z",
+  "git": {
+    "branch": "tutorial/cross-os",
+    "initial_commit_sha": "",
+    "initial_dirty": false,
+    "exclude_configured": true
+  },
+  "requires": {
+    "os": ["linux", "darwin"],
+    "tools": {}
+  },
+  "nodes": [
+    {
+      "id": "1-record-platform",
+      "title": "Record the active platform",
+      "summary": "Write the active OS name to platform.txt using the OS-specific variant.",
+      "dependencies": [],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["platform.txt"],
+      "commands": ["printf 'unknown\\n' > platform.txt"],
+      "verification": {"type": "file_exists", "path": "platform.txt"},
+      "variants": {
+        "linux": {
+          "commands": ["printf 'linux\\n' > platform.txt"],
+          "verification": {
+            "type": "file_contains",
+            "path": "platform.txt",
+            "pattern": "linux",
+            "regex": false
+          }
+        },
+        "darwin": {
+          "commands": ["printf 'darwin\\n' > platform.txt"],
+          "verification": {
+            "type": "file_contains",
+            "path": "platform.txt",
+            "pattern": "darwin",
+            "regex": false
+          }
+        }
+      }
+    },
+    {
+      "id": "2-normalize-note",
+      "title": "Normalize the platform note",
+      "summary": "Write note.txt from platform.txt using portable Python.",
+      "dependencies": ["1-record-platform"],
+      "action_type": "mutate",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": ["note.txt"],
+      "commands": [
+        "python3 -c \"from pathlib import Path; Path('note.txt').write_text('os=' + Path('platform.txt').read_text().strip() + chr(10))\""
+      ],
+      "verification": {
+        "type": "command",
+        "command": "grep -q '^os=' note.txt",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "3-confirm-setup",
+      "title": "Confirm the platform setup",
+      "summary": "Confirm that platform.txt and note.txt reflect the active OS.",
+      "dependencies": ["2-normalize-note"],
+      "action_type": "read-only",
+      "status": "pending",
+      "commit_sha": null,
+      "artifacts": [],
+      "commands": [],
+      "verification": {
+        "type": "confirm",
+        "prompt": "Confirm platform.txt and note.txt reflect your OS."
+      }
+    }
+  ]
+}
