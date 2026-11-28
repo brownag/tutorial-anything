@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -25,6 +26,7 @@ CLI = SKILL_DIR / "scripts" / "dag_manager.py"
 CORPUS = SKILL_DIR / "tests" / "corpus"
 CORPUS_SLUGS = [
     "container",
+    "cross-os",
     "python-package",
     "shell-sysadmin",
     "sqlite-data",
@@ -160,6 +162,14 @@ def seed_workspace(dag: dict) -> Path:
     return ws
 
 
+def effective_node_field(node: dict, field: str):
+    """Resolve ``node[field]`` via the active OS variant with fallback to the base field."""
+    variant = (node.get("variants") or {}).get(platform.system().lower()) or {}
+    if field in variant:
+        return variant[field]
+    return node[field]
+
+
 def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
     """Run ``dag`` to completion (or up to ``stop_before``) in a fresh workspace.
 
@@ -179,7 +189,7 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
             proc = run_cli(ws, "service", "start", node["id"])
             if proc.returncode != 0:
                 raise RuntimeError("service start {} failed: {}".format(node["id"], proc.stdout + proc.stderr))
-        for command in node["commands"]:
+        for command in effective_node_field(node, "commands"):
             subprocess.run(
                 command, shell=True, cwd=str(ws), env=env, stdin=subprocess.DEVNULL,
                 timeout=60, check=True,
@@ -195,7 +205,7 @@ def run_tutorial(case: dict, dag: dict, stop_before=None) -> Path:
         ).stdout.strip()
         if dirty:
             complete_args.append("--commit")
-        if node["verification"]["type"] == "confirm":
+        if effective_node_field(node, "verification")["type"] == "confirm":
             complete_args.append("--yes")
         proc = run_cli(ws, *complete_args)
         if proc.returncode != 0:
@@ -561,6 +571,61 @@ class FeatureTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         proc = run_cli(ws, "complete", "3-run-greet")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+    def test_cross_os_variants(self):
+        """next prints active OS variant details and verify/complete pass end-to-end."""
+        _, dag = load_case("cross-os")
+        ws = seed_workspace(dag)
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        env = isolated_env(ws.parent / "home")
+        active_os = platform.system().lower()
+
+        for node in topological_order(dag["nodes"]):
+            proc = run_cli(ws, "next", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            if node["id"] == "1-record-platform" and active_os in ("linux", "darwin"):
+                self.assertIn(
+                    "  variant: {} (overrides: commands, verification)".format(active_os),
+                    proc.stdout,
+                )
+                self.assertIn(
+                    "  commands: printf '{}\\n' > platform.txt".format(active_os),
+                    proc.stdout,
+                )
+                self.assertIn("  verification: file_contains platform.txt", proc.stdout)
+
+            for command in effective_node_field(node, "commands"):
+                subprocess.run(
+                    command, shell=True, cwd=str(ws), env=env,
+                    stdin=subprocess.DEVNULL, timeout=60, check=True,
+                )
+
+            is_confirm = effective_node_field(node, "verification")["type"] == "confirm"
+            verify_args = ["verify", node["id"]] + (["--yes"] if is_confirm else [])
+            proc = run_cli(ws, *verify_args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+            complete_args = ["complete", node["id"]]
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=str(ws), env=env,
+                stdout=subprocess.PIPE, universal_newlines=True, check=True,
+            ).stdout.strip()
+            if dirty:
+                complete_args.append("--commit")
+            if is_confirm:
+                complete_args.append("--yes")
+            proc = run_cli(ws, *complete_args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        if active_os in ("linux", "darwin"):
+            self.assertEqual(active_os, (ws / "platform.txt").read_text(encoding="utf-8").strip())
+            self.assertEqual("os=" + active_os, (ws / "note.txt").read_text(encoding="utf-8").strip())
+        state = json.loads(run_cli(ws, "status", "--json").stdout)
+        self.assertEqual({n["id"]: n["status"] for n in state["nodes"]}, {
+            "1-record-platform": "completed",
+            "2-normalize-note": "completed",
+            "3-confirm-setup": "completed",
+        })
 
 
 
