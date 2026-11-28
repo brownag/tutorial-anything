@@ -1137,13 +1137,28 @@ def cmd_doctor(args, state_path: Path, workspace: Path) -> int:
     """Check declared tools and OS; record the result as ``preflight`` (C-G4)."""
     state = load_validated_state(state_path)
     if "requires" not in state:
-        say("no requires block; nothing to check")
+        if args.json:
+            say(
+                json.dumps(
+                    {"ok": True, "os": current_os(), "checks": [], "missing": []},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            say("no requires block; nothing to check")
         return EXIT_OK
     passed, rows, missing = run_checks(state["requires"])
     state["preflight"] = {"passed": passed, "at": now_iso(), "missing": missing}
     save_state(state_path, state)
     if args.json:
-        say(json.dumps({"passed": passed, "checks": rows}, indent=2))
+        say(
+            json.dumps(
+                {"ok": passed, "os": current_os(), "checks": rows, "missing": missing},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
     else:
         for row in rows:
             say(format_check(row))
@@ -2489,7 +2504,7 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
-def check_risk(state: dict, nid: str) -> None:
+def check_risk(state: dict, nid: str, quiet: bool = False) -> None:
     """Gate a node on its risk tier (C-G6). Only hands-off ever blocks."""
     node = node_index(state)[nid]
     tier, labels = risk_tier(node)
@@ -2501,7 +2516,8 @@ def check_risk(state: dict, nid: str) -> None:
             "'{}' is high risk ({}) and hands-off mode will not run it until a person "
             "approves. After they say yes, run `approve {}`.".format(nid, detail, nid)
         )
-    say("risk: high ({})".format(detail))
+    if not quiet:
+        say("risk: high ({})".format(detail))
 
 
 def cmd_approve(args, state_path: Path, workspace: Path) -> int:
@@ -2619,10 +2635,38 @@ def _print_active_node(state: dict, index: dict, nid: str, workspace: Path) -> N
     say(header_line(state, workspace))
 
 
+def _emit_next_node(
+    state: dict, index: dict, nid: str, workspace: Path, as_json: bool
+) -> None:
+    """Print the activated node either as JSON or human-readable lines."""
+    if not as_json:
+        _print_active_node(state, index, nid, workspace)
+        return
+    node = index[nid]
+    os_name = current_os()
+    tier, labels = risk_tier(node)
+    payload = {
+        "node": node,
+        "os": os_name,
+        "variant": os_name if active_variant(node) else None,
+        "commands": effective_commands(node),
+        "verification": effective_verification(node),
+        "undo": effective_undo(node),
+        "risk": {
+            "tier": tier,
+            "labels": labels,
+            "approved": approval_covers(node, tier),
+        },
+        "ready": ready_nodes(state),
+    }
+    say(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
     state = load_validated_state(state_path)
     preflight_gate(state, state_path, getattr(args, "skip_doctor", False))
+    as_json = getattr(args, "json", False)
 
     if args.node_id:
         node = get_node(state, args.node_id)
@@ -2647,17 +2691,17 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
                     args.node_id, ", ".join(unmet), args.node_id
                 )
             )
-        check_risk(state, args.node_id)
+        check_risk(state, args.node_id, quiet=as_json)
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
-        _print_active_node(state, index, args.node_id, workspace)
+        _emit_next_node(state, index, args.node_id, workspace, as_json)
         return EXIT_OK
 
     active = state.get("active_node_id")
     index = node_index(state)
     if active and index.get(active, {}).get("status") == "pending":
-        check_risk(state, active)
-        _print_active_node(state, index, active, workspace)
+        check_risk(state, active, quiet=as_json)
+        _emit_next_node(state, index, active, workspace, as_json)
         return EXIT_OK
     ready = ready_nodes(state)
     if not ready:
@@ -2672,10 +2716,10 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
             "`next <id>`.".format(len(ready), ", ".join(ready)),
             EXIT_FAIL,
         )
-    check_risk(state, ready[0])
+    check_risk(state, ready[0], quiet=as_json)
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
-    _print_active_node(state, index, ready[0], workspace)
+    _emit_next_node(state, index, ready[0], workspace, as_json)
     return EXIT_OK
 
 
@@ -3603,6 +3647,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-doctor",
         action="store_true",
         help="continue past a failed preflight (requires block) without running doctor",
+    )
+    nxt.add_argument(
+        "--json",
+        action="store_true",
+        help="print the selected node and resolved details as JSON",
     )
     nxt.set_defaults(func=cmd_next)
 

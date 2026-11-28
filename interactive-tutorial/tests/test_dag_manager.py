@@ -1589,6 +1589,101 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn("deviations", output)
 
+    def test_doctor_json_pass_fail_and_no_requires(self):
+        import platform
+
+        self.seed_repo()
+        self.seed_state()
+        expected_os = platform.system().lower()
+
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {"ok": True, "os": expected_os, "checks": [], "missing": []}, data
+        )
+
+        state = self.state()
+        state["requires"] = {
+            "tools": {"python3": ">=3.0"},
+            "os": [expected_os],
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["ok"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertEqual([], data["missing"])
+        self.assertEqual(["python3", "os"], [row["name"] for row in data["checks"]])
+        self.assertTrue(all(row["ok"] for row in data["checks"]))
+
+        state["requires"] = {
+            "tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"},
+            "os": [expected_os],
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("doctor", "--json")
+        self.assertEqual(code, 1, output)
+        data = json.loads(output)
+        self.assertFalse(data["ok"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertEqual(["zz-missing-tool-9"], data["missing"])
+        by_name = {row["name"]: row for row in data["checks"]}
+        self.assertEqual("missing", by_name["zz-missing-tool-9"]["status"])
+        self.assertFalse(by_name["zz-missing-tool-9"]["ok"])
+
+    def test_next_json_normal_and_risk(self):
+        import platform
+
+        expected_os = platform.system().lower()
+        self.seed_repo()
+        state = self.seed_state()
+        first = state["nodes"][0]
+        code, output = self.cli("next", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node"]["id"])
+        self.assertEqual(expected_os, data["os"])
+        self.assertIsNone(data["variant"])
+        self.assertEqual(first["commands"], data["commands"])
+        self.assertEqual(first["verification"], data["verification"])
+        self.assertEqual([], data["undo"])
+        self.assertEqual(
+            {"tier": "low", "labels": [], "approved": False}, data["risk"]
+        )
+        self.assertEqual([], data["ready"])
+
+        # High-risk node in assisted mode emits clean JSON (no stdout risk banner).
+        state = self.state()
+        state["active_node_id"] = None
+        state["nodes"][0]["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        root = first["id"]
+        code, output = self.cli("next", root, "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(root, data["node"]["id"])
+        self.assertEqual(
+            {"tier": "high", "labels": ["sudo"], "approved": False}, data["risk"]
+        )
+
+        self.cli("approve", root, check=0)
+        code, output = self.cli("next", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["risk"]["approved"])
+
+        # Hands-off still blocks unapproved high-risk nodes even with --json.
+        state = self.state()
+        state["mode"] = "hands-off"
+        state["active_node_id"] = None
+        state["nodes"][0].pop("approved", None)
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("next", root, "--json")
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+
 
 def load_cli_module():
     """Import scripts/dag_manager.py so pure helpers can be tested directly."""
@@ -3147,6 +3242,66 @@ class PlatformVariantsTest(unittest.TestCase):
         self.assertNotIn("apt-get install foo", corrected_md)
         self.assertIn("which bar", corrected_md)
         self.assertNotIn("which foo", corrected_md)
+
+    def test_next_json_resolves_variant_and_falls_back(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get install -y jq"],
+                    "verification": {"type": "command", "command": "jq --version"},
+                    "undo": ["sudo apt-get remove -y jq"],
+                },
+                "darwin": {
+                    "commands": ["brew install jq"],
+                },
+            }
+        )
+        sibling = self._base_node(id="2-other", title="Other")
+        self._write_state([node, sibling], active=None)
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next", "1-step", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("1-step", data["node"]["id"])
+            self.assertEqual("linux", data["os"])
+            self.assertEqual("linux", data["variant"])
+            self.assertEqual(["sudo apt-get install -y jq"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "jq --version"}, data["verification"]
+            )
+            self.assertEqual(["sudo apt-get remove -y jq"], data["undo"])
+            self.assertEqual(
+                {"tier": "high", "labels": ["sudo"], "approved": False}, data["risk"]
+            )
+            self.assertEqual(["2-other"], data["ready"])
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main("next", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("darwin", data["os"])
+            self.assertEqual("darwin", data["variant"])
+            self.assertEqual(["brew install jq"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"}, data["verification"]
+            )
+            self.assertEqual(["echo base-undo"], data["undo"])
+            self.assertEqual(
+                {"tier": "low", "labels": [], "approved": False}, data["risk"]
+            )
+
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main("next", "--json")
+            self.assertEqual(0, code, out)
+            data = json.loads(out)
+            self.assertEqual("windows", data["os"])
+            self.assertIsNone(data["variant"])
+            self.assertEqual(["echo base-cmd"], data["commands"])
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"}, data["verification"]
+            )
+            self.assertEqual(["echo base-undo"], data["undo"])
 
 
 if __name__ == "__main__":
