@@ -1345,9 +1345,21 @@ def head_sha(workspace: Path) -> str:
 
 
 def is_dirty(workspace: Path) -> bool:
-    """True when tracked or untracked (non-excluded) changes exist."""
-    code, out, _ = run_git(["status", "--porcelain"], workspace)
+    """True when tracked or untracked (non-excluded) changes exist in the workspace.
+
+    Limited to the workspace path, so changes elsewhere in a larger repository
+    never count.
+    """
+    code, out, _ = run_git(["status", "--porcelain", "--", "."], workspace)
     return bool(out)
+
+
+def workspace_prefix(workspace: Path) -> str:
+    """Path of the workspace inside its repository (``""`` at the top level)."""
+    code, out, stderr = run_git(["rev-parse", "--show-prefix"], workspace)
+    if code != 0:
+        raise CliError("cannot locate the workspace in its repository: {}".format(stderr))
+    return out
 
 
 def resolve_sha(workspace: Path, ref: str) -> str:
@@ -1359,11 +1371,15 @@ def resolve_sha(workspace: Path, ref: str) -> str:
 
 
 def commit_all(workspace: Path, message: str) -> str:
-    """Stage everything, commit, and return the new ``HEAD`` sha."""
-    code, _, stderr = run_git(["add", "-A"], workspace)
+    """Stage and commit everything under the workspace; return the new ``HEAD`` sha.
+
+    Both steps are limited to the workspace path, so files elsewhere in a larger
+    repository are never staged or committed.
+    """
+    code, _, stderr = run_git(["add", "-A", "--", "."], workspace)
     if code != 0:
         raise CliError("git add -A failed: {}".format(stderr))
-    code, _, stderr = run_git(["commit", "--no-verify", "-m", message], workspace)
+    code, _, stderr = run_git(["commit", "--no-verify", "-m", message, "--", "."], workspace)
     if code != 0:
         raise CliError(
             "git commit failed: {}".format(stderr or "nothing to commit or commit rejected")
@@ -1383,6 +1399,45 @@ def reset_hard(workspace: Path, sha: str) -> None:
     code, _, stderr = run_git(["reset", "--hard", sha], workspace)
     if code != 0:
         raise CliError("git reset --hard {} failed: {}".format(sha[:12], stderr))
+
+
+def git_paths(args: list, workspace: Path) -> set:
+    """NUL-separated path listing from ``git <command> -z <rest>``, workspace-relative."""
+    code, out, stderr = run_git(args[:1] + ["-z"] + args[1:], workspace)
+    if code != 0:
+        raise CliError("git {} failed: {}".format(" ".join(args), stderr))
+    return {path for path in out.split("\0") if path}
+
+
+def restore_workspace(workspace: Path, sha: str, prefix: str) -> bool:
+    """Make the workspace subdirectory match ``sha`` without moving ``HEAD``.
+
+    Used instead of ``git reset --hard`` when the workspace is a subdirectory, so
+    commits and uncommitted changes outside it survive. Tracked files are restored
+    and files tracked since ``sha`` are removed; untracked files stay, as with
+    ``reset --hard``. The result is committed as a rewind commit limited to the
+    workspace. Returns True when a commit was made.
+    """
+    wanted = git_paths(["ls-tree", "-r", "--name-only", sha, "--", "."], workspace)
+    if wanted:
+        code, _, stderr = run_git(["checkout", sha, "--", "."], workspace)
+        if code != 0:
+            raise CliError("git checkout {} -- . failed: {}".format(sha[:12], stderr))
+    extra = sorted(git_paths(["ls-files", "--", "."], workspace) - wanted)
+    if extra:
+        code, _, stderr = run_git(
+            ["--literal-pathspecs", "rm", "-q", "-f", "--"] + extra, workspace
+        )
+        if code != 0:
+            raise CliError("git rm failed: {}".format(stderr))
+    code, _, _ = run_git(["diff", "--cached", "--quiet", "HEAD", "--", "."], workspace)
+    if code == 0:
+        return False
+    message = "tutorial(rewind): restore {} to {}".format(prefix.rstrip("/"), sha[:12])
+    code, _, stderr = run_git(["commit", "--no-verify", "-q", "-m", message, "--", "."], workspace)
+    if code != 0:
+        raise CliError("git commit of the rewind failed: {}".format(stderr))
+    return True
 
 
 def branch_exists(workspace: Path, branch: str) -> bool:
@@ -2749,8 +2804,17 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
         state.setdefault("git", {})["branch"] = branch
         say("checked out new branch {} at {}".format(branch, sha))
     elif args.git_rollback == "hard":
-        reset_hard(workspace, sha)
-        say("reset --hard to {}".format(sha))
+        prefix = workspace_prefix(workspace)
+        if prefix:
+            committed = restore_workspace(workspace, sha, prefix)
+            say("restored {} to {}{}".format(
+                prefix.rstrip("/"), sha,
+                " (rewind commit {})".format(short(head_sha(workspace), 12))
+                if committed else " (no changes)",
+            ))
+        else:
+            reset_hard(workspace, sha)
+            say("reset --hard to {}".format(sha))
 
     reset_from = list(descendants)
     if args.git_rollback != "none" and args.reset_descendants:

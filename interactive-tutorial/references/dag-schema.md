@@ -18,6 +18,8 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 
 ## git block
 
+Git operations are limited to the workspace. When it is a subdirectory of the repository, `complete --commit` stages and commits only that subdirectory, dirty checks ignore changes outside it, and `jump --git-rollback hard` restores only it to the rollback commit and records the restore as a `tutorial(rewind): restore <subdir> to <sha12>` commit instead of moving `HEAD` back. At the repository root, `--git-rollback hard` runs `git reset --hard`. `--git-rollback branch` checks out a new branch for the whole repository in both cases.
+
 | Field | Type | Notes |
 |---|---|---|
 | `branch` | string \| null | Branch recorded at `init`. |

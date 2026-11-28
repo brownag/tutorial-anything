@@ -2303,6 +2303,146 @@ class ScaffoldTest(unittest.TestCase):
         self.assertEqual(self.leftovers(), [])
 
 
+class SubdirWorkspaceTest(unittest.TestCase):
+    """A workspace (--cwd) inside a larger repository: Git writes stay inside it."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="dag-manager-subdir-"))
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.workspace = self.repo / "sandbox"
+        self.workspace.mkdir()
+        self.env = dict(os.environ)
+        self.env.update(
+            {
+                "HOME": str(self.repo),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_AUTHOR_NAME": "Tutorial Test",
+                "GIT_AUTHOR_EMAIL": "tutorial@example.invalid",
+                "GIT_COMMITTER_NAME": "Tutorial Test",
+                "GIT_COMMITTER_EMAIL": "tutorial@example.invalid",
+                "GIT_ADVICE_ENABLED": "false",
+            }
+        )
+        self.env.pop("GIT_DIR", None)
+        self.env.pop("GIT_WORK_TREE", None)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "notes.txt").write_text("important\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "seed")
+
+        node = {
+            "summary": "s", "action_type": "mutate", "status": "pending",
+            "commit_sha": None, "commands": [],
+        }
+        nodes = [
+            dict(node, id="1-one", title="one", dependencies=[], artifacts=["x.txt"],
+                 verification={"type": "file_exists", "path": "x.txt"}),
+            dict(node, id="2-two", title="two", dependencies=["1-one"],
+                 artifacts=["new.txt"],
+                 verification={"type": "file_exists", "path": "new.txt"}),
+        ]
+        dag = self.repo / "dag.json"
+        dag.write_text(json.dumps({"title": "t", "source_doc": "t.md", "mode": "assisted",
+                                   "nodes": nodes}), encoding="utf-8")
+        self.cli("init", "--from", str(dag), check=0)
+
+    def git(self, *args, cwd=None):
+        proc = subprocess.run(
+            ["git"] + list(args), cwd=str(cwd or self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        if proc.returncode != 0:
+            self.fail("git {} failed: {}".format(" ".join(args), proc.stdout))
+        return proc.stdout.strip()
+
+    def cli(self, *args, check=None):
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "--cwd", str(self.workspace)] + list(args),
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+        )
+        if check is not None:
+            self.assertEqual(check, proc.returncode, proc.stdout)
+        return proc.returncode, proc.stdout
+
+    def put(self, relative, text, base=None):
+        path = (base or self.workspace) / relative
+        path.write_text(text, encoding="utf-8")
+
+    def committed_paths(self, rev="HEAD"):
+        return sorted(self.git("show", "--name-only", "--format=", rev).split())
+
+    def complete_one_and_two(self):
+        """Node 1 writes x.txt and gone.txt; an outside commit; node 2 edits them."""
+        self.cli("next", check=0)
+        self.put("x.txt", "one\n")
+        self.put("gone.txt", "g\n")
+        self.cli("complete", "--commit", check=0)
+        one = self.git("rev-parse", "HEAD")
+        self.put("other.txt", "outside\n", base=self.repo)
+        self.git("add", "other.txt")
+        self.git("commit", "-q", "-m", "outside work")
+        self.put("x.txt", "two\n")
+        self.put("new.txt", "n\n")
+        (self.workspace / "gone.txt").unlink()
+        self.cli("complete", "--commit", check=0)
+        return one, self.git("rev-parse", "HEAD")
+
+    def test_checkpoint_commits_only_workspace_paths(self):
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli("next", check=0)
+        self.put("x.txt", "one\n")
+        self.cli("complete", "--commit", check=0)
+        self.assertEqual(["sandbox/x.txt"], self.committed_paths())
+        self.assertEqual("M notes.txt", self.git("status", "--porcelain", "--", "notes.txt"))
+
+    def test_hard_rewind_force_only_needed_for_workspace_changes(self):
+        self.complete_one_and_two()
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli("jump", "2-two", "--reset-descendants", "--git-rollback", "hard", check=0)
+
+        self.put("x.txt", "edited in workspace\n")
+        code, output = self.cli(
+            "jump", "1-one", "--reset-descendants", "--git-rollback", "hard"
+        )
+        self.assertEqual(1, code, output)
+        self.assertIn("--force", output)
+
+    def test_hard_rewind_restores_workspace_and_keeps_outside_work(self):
+        one, two = self.complete_one_and_two()
+        self.put("notes.txt", "important\nuser WIP\n", base=self.repo)
+        self.cli(
+            "jump", "2-two", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual("one\n", (self.workspace / "x.txt").read_text(encoding="utf-8"))
+        self.assertTrue((self.workspace / "gone.txt").is_file())
+        self.assertFalse((self.workspace / "new.txt").exists())
+        # Outside the workspace: the later commit and the uncommitted edit survive.
+        self.assertEqual("outside\n", (self.repo / "other.txt").read_text(encoding="utf-8"))
+        self.assertIn("user WIP", (self.repo / "notes.txt").read_text(encoding="utf-8"))
+        # HEAD moves forward with a rewind commit that touches only the workspace.
+        self.assertEqual(two, self.git("rev-parse", "HEAD~1"))
+        self.assertTrue(self.git("log", "-1", "--format=%s").startswith("tutorial(rewind):"))
+        self.assertTrue(all(p.startswith("sandbox/") for p in self.committed_paths()))
+        self.assertEqual("", self.git("status", "--porcelain", "--", "sandbox"))
+        self.assertEqual("", self.git("diff", one, "HEAD", "--", "sandbox"))
+        state = json.loads((self.workspace / STATE_NAME).read_text(encoding="utf-8"))
+        statuses = {n["id"]: n["status"] for n in state["nodes"]}
+        self.assertEqual({"1-one": "completed", "2-two": "pending"}, statuses)
+
+    def test_hard_rewind_to_init_when_workspace_absent_there(self):
+        # The seed commit predates every sandbox file.
+        self.complete_one_and_two()
+        self.cli(
+            "jump", "1-one", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual("", self.git("ls-files", "--", "sandbox"))
+        self.assertEqual("outside\n", (self.repo / "other.txt").read_text(encoding="utf-8"))
+
+
 class PlatformVariantsTest(unittest.TestCase):
     """Per-OS node.variants validation and runtime resolution (C-G5)."""
 

@@ -28,6 +28,7 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
    - Add a `.gitignore` for build output the tutorial creates (for example `__pycache__/`, `node_modules/`).
    - Check `git config user.name` and `git config user.email` before committing; only set repo-local values (`git config --local ...`) if unset, and never override a configured global identity.
    - Make a baseline commit of the existing files before `init`. If the workspace is dirty, commit the sources first.
+   - The workspace (`--cwd`) may be a subdirectory of a larger repository. Checkpoints, dirty checks, and hard rollbacks then cover only that subdirectory; files elsewhere in the repository are never committed or reset.
    - Run `init` with a tutorial branch:
 
    ```bash
@@ -174,13 +175,13 @@ Use `--skip-ancestors` only if the prerequisites are already satisfied in the en
 | Goal | Command | Result |
 |---|---|---|
 | Review earlier step | `jump <target>` | Moves active pointer. Working files remain unchanged. |
-| Redo step from clean state | `jump <target> --reset-descendants --git-rollback hard` | Runs `git reset --hard` to target checkpoint. Resets downstream nodes to `pending`. |
+| Redo step from clean state | `jump <target> --reset-descendants --git-rollback hard` | Runs `git reset --hard` to the nearest ancestor checkpoint (in a subdirectory workspace, restores only that subdirectory and records a `tutorial(rewind): …` commit). Resets downstream nodes to `pending`. |
 | Branch to test an alternative | `jump <target> --reset-descendants --git-rollback branch [--new-branch tutorial/alt]` | Creates a new branch at target checkpoint. Keeps current work intact. |
 | Redo and revert non-repo side effects | `jump <target> --reset-descendants --git-rollback hard --force --undo` | Resets as above, then runs each rewound node's `undo` commands. Failures and unrevertable nodes become `residue`. |
 
 - Rollback targets the nearest completed parent commit.
 - `--git-rollback branch|hard` refuses (exit 1, nothing changed) when the rollback would discard the checkpoint of a completed node outside the target and its descendants, such as a sibling branch completed later. Rewind to a common ancestor instead.
-- `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
+- `--git-rollback hard` deletes uncommitted workspace changes and requires `--force` when the workspace has any.
 - Confirm with the user before rolling back completed `mutate` or `execute` nodes, and before `--undo` on `system` scope.
 - `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed and recorded as `residue`.
 - `residue clear [<node_id> | --all]` removes residue entries once handled.

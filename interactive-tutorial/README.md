@@ -54,7 +54,7 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `next [<id>] [--skip-doctor]` | Activate the next ready node, pick a specific ready node, or print the already-active pending node (with no `<id>`, exits 0). When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, nothing is ready, or the preflight failed |
 | `doctor [--json]` | Check the tools and OS (`requires.os`) declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
-| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
+| `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes under the workspace (`git add -A -- .`), mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
 | `residue clear [<id> \| --all]` | Remove residue entries left by `jump` once handled | 0 |
 | `approve <id>` | Record a person's approval of a node's current risk tier and its deviations; clears the `hands-off` gate for that node while its tier does not rise and no new deviation is recorded | 1 if the state is invalid |
@@ -95,6 +95,7 @@ Persistence modes:
 | Problem | Cause and fix |
 |---|---|
 | `no state file at ./.tutorial-dag.json` | Run command from workspace root, or pass `--file`. |
+| Tutorial runs in a subdirectory of a larger repository | Pass `--cwd <subdir>` (or run from it). Checkpoints and dirty checks cover only that subdirectory. `--git-rollback hard` restores only the subdirectory to the checkpoint and commits that as `tutorial(rewind): restore <subdir> to <sha>`, so `HEAD` and work outside it are kept. `--git-rollback branch` still switches the whole repository. |
 | Git tracks `.tutorial-dag.json` | Re-run `init` or append `.tutorial-dag.json` to `.git/info/exclude`. |
 | `branch point: 2 nodes are ready` | Multiple paths open. Select one with `next <id>`. |
 | `refusing to jump over unmet ancestors` | Complete earlier nodes, or pass `--skip-ancestors` if already satisfied. |
