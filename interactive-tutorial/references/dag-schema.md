@@ -140,7 +140,7 @@ Tiers are ordered `low < elevated < high`. The effective tier is the higher of t
 | `dd` | `dd if=` |
 
 - `approve <id>` records `approved` with the node's current effective tier. The approval covers the node while its effective tier is at or below the recorded tier. A later edit that raises the tier needs a new approval.
-- Gate: in `hands-off` mode only, `next` (explicit or implicit) refuses an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next` prints `risk: high (<labels>)`.
+- Gate: in `hands-off` mode only, `next` (explicit or implicit), `jump <id>`, `verify`, and `service start` refuse an effective-`high` node without covering approval (exit 1, message names `approve <id>` and the labels). `jump` refuses before it changes any state or files. `jump --undo` in `hands-off` records `not-run` residue instead of undoing such a node. In `guided` and `assisted` nothing is blocked; `next`, `jump`, and `verify` print `risk: high (<labels>)`.
 - `status` shows a `RISK` column (`low`, `elev`, `HIGH`).
 - `validate` errors on an unknown `risk` value or a malformed `approved` object.
 - Hands-off `complete` also runs the risk gate: an effective-`high` node without covering approval is refused (exit 1, names `approve <id>`), even when `next` did not activate it.

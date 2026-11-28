@@ -926,6 +926,38 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn("approve {}".format(root), output)
 
+    def _risky_check(self):
+        """A command check that is high risk (sudo) and leaves a marker when run."""
+        return {"type": "command", "command": "sudo -n true 2>/dev/null; touch ran.marker"}
+
+    def test_hands_off_verify_refuses_unapproved_high_risk(self):
+        root = self._root_with("hands-off", verification=self._risky_check())
+        code, output = self.cli("verify", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertFalse((self.workspace / "ran.marker").exists(), "check must not run")
+
+        self.cli("approve", root, check=0)
+        self.cli("verify", root)
+        self.assertTrue((self.workspace / "ran.marker").exists())
+
+    def test_hands_off_jump_refuses_unapproved_high_risk(self):
+        root = self._root_with("hands-off", commands=["sudo true"])
+        code, output = self.cli("jump", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn("approve {}".format(root), output)
+        self.assertIsNone(self.state().get("active_node_id"))
+
+        self.cli("approve", root, check=0)
+        self.cli("jump", root, check=0)
+        self.assertEqual(self.state()["active_node_id"], root)
+
+    def test_assisted_verify_runs_high_risk_with_notice(self):
+        root = self._root_with("assisted", verification=self._risky_check())
+        code, output = self.cli("verify", root)
+        self.assertIn("risk: high (sudo)", output)
+        self.assertTrue((self.workspace / "ran.marker").exists())
+
     def _free_port(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))

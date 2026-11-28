@@ -82,7 +82,7 @@ Node states:
 |---|---|---|---|
 | Command runner | User | Agent after user approval | Agent |
 | `confirm` checks | User | User | Agent (if pre-approved) |
-| High-risk nodes and deviations | Not gated | Not gated | `next` refuses high-risk nodes; `complete` refuses deviated nodes; both until `approve <id>` |
+| High-risk nodes and deviations | Not gated | Not gated | `next`, `jump`, `verify`, `complete`, and `service start` refuse high-risk nodes; `complete` refuses deviated nodes; both until `approve <id>` |
 | Git commit | Agent | Agent | Agent |
 | Best used for | Missing toolchains, learning | Standard local development | Long automated tutorials |
 

@@ -183,7 +183,7 @@ Use `--skip-ancestors` only if the prerequisites are already satisfied in the en
 - Confirm with the user before rolling back completed `mutate` or `execute` nodes, and before `--undo` on `system` scope.
 - `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed and recorded as `residue`.
 - `residue clear [<node_id> | --all]` removes residue entries once handled.
-- Risk tiers in `status` are `low` (workspace-only), `elev` (`elevated`, non-repo `side_effects` such as `user`/`system`/`remote`), and `HIGH` (`high`, matches high-risk commands or declared `risk: "high"`). Only `high` gates `hands-off` mode (`low` and `elev` are never blocked). `next` prints `risk: high (<labels>)` for a high-risk node, and in `hands-off` mode refuses it until approved.
+- Risk tiers in `status` are `low` (workspace-only), `elev` (`elevated`, non-repo `side_effects` such as `user`/`system`/`remote`), and `HIGH` (`high`, matches high-risk commands or declared `risk: "high"`). Only `high` gates `hands-off` mode (`low` and `elev` are never blocked). `next`, `jump`, and `verify` print `risk: high (<labels>)` for a high-risk node. In `hands-off` mode, `next`, `jump`, `verify`, `complete`, and `service start` refuse it until approved.
 - Run `approve <node_id>` only after the user says yes to that node's listed risk labels. Never approve on your own.
 - In `hands-off` mode, `complete` also refuses an unapproved high-risk node, and a node with deviations until `approve <node_id>` covers them. Ask the user first; the approval covers the recorded deviations.
 

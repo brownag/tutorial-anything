@@ -2450,6 +2450,7 @@ def cmd_verify(args, state_path: Path, workspace: Path) -> int:
     state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
+    check_risk(state, nid)
     say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
     passed, lines = run_verification(node, workspace, args.yes)
     for line in lines:
@@ -2640,6 +2641,7 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
 
     target = args.target_id
     get_node(state, target)
+    check_risk(state, target)
     parents, children = relation_maps(state)
     index = node_index(state)
     ancestors = transitive(target, parents)
