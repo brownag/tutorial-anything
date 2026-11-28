@@ -627,6 +627,104 @@ class FeatureTest(unittest.TestCase):
             "3-confirm-setup": "completed",
         })
 
+    def test_in_context_persistence(self):
+        """in-context mode keeps all state in --file without creating .tutorial-dag.json."""
+        root = Path(tempfile.mkdtemp(prefix="corpus-in-context-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        ws = root / "repo"
+        home = root / "home"
+        ws.mkdir()
+        home.mkdir()
+        env = isolated_env(home)
+        state_path = root / "state.json"
+
+        for args in (["git", "init", "-q", "-b", "main"],):
+            subprocess.run(
+                args, cwd=str(ws), env=env, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        (ws / "README.md").write_text("# Scratch workspace\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=str(ws), env=env, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "seed"], cwd=str(ws), env=env, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        init = run_cli(
+            ws, "--file", str(state_path), "init",
+            "--title", "In-context persistence", "--source", "tutorial.md",
+            "--persistence", "in-context",
+        )
+        self.assertEqual(0, init.returncode, init.stdout + init.stderr)
+        self.assertTrue(state_path.is_file())
+        self.assertFalse((ws / ".tutorial-dag.json").exists())
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["nodes"] = [
+            {
+                "id": "step-1",
+                "title": "Create step one file",
+                "summary": "Write one.txt in the workspace. Done when one.txt exists.",
+                "dependencies": [],
+                "action_type": "execute",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["one.txt"],
+                "commands": ["printf 'one\\n' > one.txt"],
+                "verification": {"type": "file_exists", "path": "one.txt"},
+            },
+            {
+                "id": "step-2",
+                "title": "Create step two file",
+                "summary": "Write two.txt using one.txt. Done when two.txt contains two.",
+                "dependencies": ["step-1"],
+                "action_type": "execute",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["two.txt"],
+                "commands": ["printf 'two\\n' > two.txt"],
+                "verification": {"type": "file_contains", "path": "two.txt", "pattern": "two"},
+            },
+        ]
+        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        before = run_cli(ws, "--file", str(state_path), "status", "--json")
+        self.assertEqual(0, before.returncode, before.stdout + before.stderr)
+        before_doc = json.loads(before.stdout)
+        self.assertEqual("in-context", before_doc["persistence"])
+        self.assertEqual({n["id"]: n["status"] for n in before_doc["nodes"]}, {
+            "step-1": "pending",
+            "step-2": "pending",
+        })
+
+        for node in state["nodes"]:
+            proc = run_cli(ws, "--file", str(state_path), "next", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            for command in node["commands"]:
+                subprocess.run(
+                    command, shell=True, cwd=str(ws), env=env,
+                    stdin=subprocess.DEVNULL, timeout=60, check=True,
+                )
+            proc = run_cli(ws, "--file", str(state_path), "verify", node["id"])
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            proc = run_cli(ws, "--file", str(state_path), "complete", node["id"], "--commit")
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        after = run_cli(ws, "--file", str(state_path), "status", "--json")
+        self.assertEqual(0, after.returncode, after.stdout + after.stderr)
+        after_doc = json.loads(after.stdout)
+        self.assertEqual("in-context", after_doc["persistence"])
+        self.assertIsNone(after_doc["active_node_id"])
+        self.assertEqual({n["id"]: n["status"] for n in after_doc["nodes"]}, {
+            "step-1": "completed",
+            "step-2": "completed",
+        })
+        self.assertTrue(all(n["commit_sha"] for n in after_doc["nodes"]))
+        self.assertFalse((ws / ".tutorial-dag.json").exists())
+
 
 
 def draft_workspace(slug: str) -> Path:
