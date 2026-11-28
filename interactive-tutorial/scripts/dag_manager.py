@@ -2574,6 +2574,27 @@ def nearest_ancestor_sha(state: dict, ancestors: list, workspace: Path, target: 
     return resolve_sha(workspace, initial)
 
 
+def orphaned_nodes(state: dict, sha: str, reset_set: set, workspace: Path) -> list:
+    """Completed nodes outside ``reset_set`` whose checkpoint ``sha`` would discard.
+
+    A rollback to ``sha`` drops every commit that is not an ancestor of it. A
+    completed node that keeps its status after the rewind must keep its
+    checkpoint too, or the DAG would claim work that is no longer there.
+    """
+    orphaned = []
+    order, _ = topological_order(state)
+    index = node_index(state)
+    for nid in order:
+        node = index[nid]
+        commit = node.get("commit_sha")
+        if nid in reset_set or node.get("status") != "completed" or not commit:
+            continue
+        code, _, _ = run_git(["merge-base", "--is-ancestor", commit, sha], workspace)
+        if code != 0:
+            orphaned.append(nid)
+    return orphaned
+
+
 def node_scopes(node: dict) -> list:
     """Side-effect scopes for a node; an absent ``side_effects`` means repo-only (C-G2)."""
     return list(node.get("side_effects") or ["repo"])
@@ -2707,6 +2728,16 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
     if args.git_rollback != "none":
         require_git(workspace)
         sha = nearest_ancestor_sha(state, ancestors, workspace, target)
+        orphaned = orphaned_nodes(state, sha, {target} | set(descendants), workspace)
+        if orphaned:
+            raise CliError(
+                "refusing to roll back to {}: it would discard the checkpoints of "
+                "completed nodes that are not downstream of {}: {}. Rewind to a "
+                "common ancestor instead (`jump <ancestor> --reset-descendants "
+                "--git-rollback {}`), or use --git-rollback none.".format(
+                    short(sha), target, ", ".join(orphaned), args.git_rollback
+                )
+            )
 
     if args.git_rollback == "branch":
         branch = args.new_branch or "tutorial/rewind-{}".format(target)

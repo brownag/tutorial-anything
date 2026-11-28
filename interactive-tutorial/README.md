@@ -99,6 +99,7 @@ Persistence modes:
 | `branch point: 2 nodes are ready` | Multiple paths open. Select one with `next <id>`. |
 | `refusing to jump over unmet ancestors` | Complete earlier nodes, or pass `--skip-ancestors` if already satisfied. |
 | `nothing to commit; completed <id> without a checkpoint` | The workspace was clean, so `complete --commit` completed the node with `commit_sha` null (exit 0). Expected for nodes that change no files. |
+| `refusing to roll back to <sha>: it would discard the checkpoints of completed nodes that are not downstream of <id>` | A sibling branch was checkpointed after the rollback target. Rewind to a common ancestor of both branches, or use `--git-rollback none`. |
 | `--git-rollback hard` refused | Add `--reset-descendants` and `--force` if the working tree has uncommitted changes. |
 | No ancestor checkpoint exists | Git repository had no commits at `init`. Make a baseline commit of the existing files, then re-run `init` (or use `--git-rollback none`). |
 | Verification fails | Check rule format: `file_contains` is a literal string unless `"regex": true`. Run `verify` to inspect output. |

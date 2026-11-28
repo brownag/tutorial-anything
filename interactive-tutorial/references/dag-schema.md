@@ -94,7 +94,7 @@ Computed on every read and never stored:
 | `skipped → completed` | Run `jump <node>` and then `complete <node>`. |
 | `completed → skipped` | Invalid transition. Reset to pending first. |
 
-Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option.
+Resetting descendants clears their `commit_sha`. Reverting Git files (`--git-rollback branch|hard`) is a separate option. A rollback refuses (exit 1, no changes) when a completed node outside the target and its descendants has a `commit_sha` that is not an ancestor of the rollback commit, because that node would stay `completed` without its files.
 
 ## Side effects, undo, and residue (schema 1.1)
 

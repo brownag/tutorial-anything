@@ -687,6 +687,49 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(self.head(), shas["store"], "fast-forward must not commit")
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "3")
 
+    def run_both_branches(self) -> dict:
+        """Complete both sibling branches (4-store, then 5-render) off 3-smoke."""
+        shas = self.run_to_store()
+        self.complete("5-render", "--commit", check=0)
+        shas["render"] = self.head()
+        return shas
+
+    def test_hard_rewind_refuses_to_discard_sibling_branch(self):
+        shas = self.run_both_branches()
+        before = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli(
+            "jump", "4-store", "--reset-descendants", "--git-rollback", "hard", "--force"
+        )
+        self.assertEqual(code, 1, output)
+        self.assertIn("5-render", output)
+        self.assertEqual(self.head(), shas["render"], "HEAD must not move")
+        self.assertTrue((self.workspace / "src/todo/render.py").is_file())
+        self.assertEqual(before, self.state_path.read_text(encoding="utf-8"))
+
+    def test_branch_rewind_refuses_to_discard_sibling_branch(self):
+        self.run_both_branches()
+        before = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli(
+            "jump", "4-store", "--reset-descendants", "--git-rollback", "branch"
+        )
+        self.assertEqual(code, 1, output)
+        self.assertIn("5-render", output)
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertEqual("", self.git("branch", "--list", "tutorial/rewind-*"))
+        self.assertEqual(before, self.state_path.read_text(encoding="utf-8"))
+
+    def test_hard_rewind_to_common_ancestor_resets_both_branches(self):
+        shas = self.run_both_branches()
+        self.cli(
+            "jump", "3-smoke", "--reset-descendants", "--git-rollback", "hard", "--force",
+            check=0,
+        )
+        self.assertEqual(self.head(), shas["scaffold"])
+        state = self.state()
+        for nid in ("4-store", "5-render"):
+            self.assertEqual("pending", self.node(nid, state)["status"])
+        self.assertFalse((self.workspace / "src/todo/render.py").exists())
+
     def test_soft_rewind_moves_only_the_pointer(self):
         shas = self.run_to_store()
         before = (self.head(), (self.workspace / "src/todo/store.py").read_text())

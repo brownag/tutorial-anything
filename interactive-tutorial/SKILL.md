@@ -179,6 +179,7 @@ Use `--skip-ancestors` only if the prerequisites are already satisfied in the en
 | Redo and revert non-repo side effects | `jump <target> --reset-descendants --git-rollback hard --force --undo` | Resets as above, then runs each rewound node's `undo` commands. Failures and unrevertable nodes become `residue`. |
 
 - Rollback targets the nearest completed parent commit.
+- `--git-rollback branch|hard` refuses (exit 1, nothing changed) when the rollback would discard the checkpoint of a completed node outside the target and its descendants, such as a sibling branch completed later. Rewind to a common ancestor instead.
 - `--git-rollback hard` deletes uncommitted workspace changes and requires `--force`.
 - Confirm with the user before rolling back completed `mutate` or `execute` nodes, and before `--undo` on `system` scope.
 - `--undo` requires `--reset-descendants`, otherwise exit 2. Without `--undo`, rewound nodes with non-repo `side_effects` are listed and recorded as `residue`.
