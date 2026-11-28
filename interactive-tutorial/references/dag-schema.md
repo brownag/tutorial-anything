@@ -41,6 +41,11 @@ Machine contract: `dag-schema.json` (JSON Schema Draft 2020-12). `scripts/dag_ma
 | `verification` | object | Verification rule. Required on every node. |
 | `deviations` | object[] | Optional. Records written by `deviate` (schema 1.2). See "Deviations (C-G8)". |
 | `source_ref` | object | Optional. `{line, heading}`: `line` is a 1-based integer >= 1 (the source heading line), `heading` a string. Written by `draft`. See "Draft (C-G10)". |
+| `variants` | object | Optional. Per-OS overrides (`linux`, `darwin`, `windows`) for `commands`, `verification`, and `undo`. See "OS variants (C-G5)". |
+
+### OS variants (C-G5)
+
+`variants` maps one or more OS keys (`linux`, `darwin`, `windows`) to an override object with any subset of `commands`, `verification`, and `undo` (at least one property). The CLI resolves the active OS using `platform.system().lower()` and falls back field-by-field to the node's top-level `commands`, `verification`, and `undo` when no matching OS entry or field is present. Pair `node.variants` with root `requires.os` to gate unsupported platforms during preflight.
 
 ### action_type taxonomy
 
@@ -296,7 +301,7 @@ Root field `services` (optional) maps node ids to `{"pid", "pgid", "command", "l
 Root field `requires` (optional) declares what the workspace must provide:
 
 - `tools`: object of command name to spec. A spec is `"*"` (any version, or none if the tool runs), `">=X[.Y[.Z]]"`, or `{"min": "X.Y", "version_command": "<shell command>"}`. The default version command is `<name> --version`. The version is the first dotted number in its stdout or stderr. Versions compare as tuples, padded to three parts.
-- `os` (optional): a unique array of `linux`, `darwin`, `windows`.
+- `os` (optional): a unique array of `linux`, `darwin`, `windows`. Use together with `node.variants` when a tutorial supports multiple OSes that need different `commands`, `verification`, or `undo` (matched via `platform.system().lower()` with fallback to top-level node fields).
 
 Root field `preflight` (optional) holds `{"passed", "at", "missing"}`, written by `doctor` and by the first `next`.
 

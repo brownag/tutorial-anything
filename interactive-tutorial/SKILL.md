@@ -90,7 +90,8 @@ Verification types and fields (prefer an automated check; map tutorial "confirm"
 - `side_effects` + `undo`: writes outside the workspace. See `references/dag-schema.md`, "Side effects, undo, and residue".
 - `service` + `ready`: long-running processes. See "Background services and http/port checks".
 - `interactive`, and the command check `stdin`: steps that prompt for input. See "Interactive steps and command-check stdin".
-- Root `requires`: tools the tutorial needs. See "Preflight: requires and doctor".
+- Root `requires`: tools and allowed OSes (`requires.os`: `linux`, `darwin`, `windows`) the tutorial needs. See "Preflight: requires and doctor".
+- `variants`: optional per-OS overrides (`linux`, `darwin`, `windows`) on a node for `commands`, `verification`, and `undo` when a tutorial has OS-specific steps or checks. Resolved via `platform.system().lower()`, falling back field-by-field to the node's top-level values.
 
 Compact node examples (other required fields omitted from the first; the schema requires `id`, `title`, `summary`, `dependencies`, `action_type`, `status`, `commit_sha`, `artifacts`, `commands`, `verification`):
 

@@ -52,7 +52,7 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `validate` | Check schema, duplicate IDs, missing dependencies, and cycles | 1 on any error |
 | `status [--json]` | Print status header and topologically sorted node table; `--json` prints raw state | 1 if state is invalid |
 | `next [<id>] [--skip-doctor]` | Activate the next ready node, pick a specific ready node, or print the already-active pending node (with no `<id>`, exits 0). When the DAG declares `requires`, the first `next` runs `doctor` first; `--skip-doctor` bypasses that check | 1 if multiple nodes are ready, nothing is ready, or the preflight failed |
-| `doctor [--json]` | Check the tools and OS declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
+| `doctor [--json]` | Check the tools and OS (`requires.os`) declared in `requires`, one row per check, and record the result as `preflight` | 1 if any check fails |
 | `verify [<id>] [--yes]` | Run the verification check for a node | 1 on check failure |
 | `complete [<id>] [--commit] [--message M] [--no-verify] [--yes]` | Verify, commit changes, mark completed, update ready states | 1 on check failure or missing dependencies (a clean workspace with `--commit` completes without a checkpoint) |
 | `jump <id> [--skip-ancestors] [--reset-descendants] [--git-rollback none\|branch\|hard] [--new-branch NAME] [--force] [--undo]` | Move active pointer, fast-forward, or rollback workspace. `--undo` (requires `--reset-descendants`, else exit 2) runs the `undo` commands of rewound nodes with non-repo side effects; failures and unrevertable nodes are recorded as residue | 1 if prerequisites are incomplete, rollback is unsafe, or an undo fails |
@@ -66,6 +66,8 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `teardown` | Stop every recorded service | 0 |
 
 `verify` and `complete` target the active node if you omit the node ID. Exit codes: `0` success, `1` check or command failure, `2` argument error.
+
+Nodes can also define per-OS `variants` (`linux`, `darwin`, `windows`) for `commands`, `verification`, and `undo` alongside `requires.os` / `doctor`; the CLI picks `platform.system().lower()` and falls back to the node's top-level fields.
 
 Node states:
 - `ACTIVE`: current node.
