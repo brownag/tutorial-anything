@@ -139,7 +139,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 - For a step that prompts for input, follow the `feed answers:` or `a person must run this step` hint that `next` prints. Command checks get no stdin unless the check sets `stdin`.
 - If a check fails, fix your work first. Do not bypass checks by editing the state file.
 - If the tutorial itself is wrong (a declared command is broken/outdated, it contradicts itself, or the tool changed), not your work, record the fix: `deviate [<id>] (--command N | --check) --to "<cmd>" --reason "<why the tutorial is wrong>"`, then `verify` again. Use `deviate` only for a stale tutorial. Never invent behavior to make a stale check pass.
-- Run `export` at the end of the session. It writes `.tutorial-export/deviations.md` and, for a local source with at least one deviation, `tutorial.corrected.md`.
+- Run `export` at the end of the session. It writes `.tutorial-export/report.md`, `.tutorial-export/deviations.md`, and, for a local source with at least one deviation, `tutorial.corrected.md`.
 
 ### Services
 

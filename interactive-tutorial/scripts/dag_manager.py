@@ -58,6 +58,7 @@ RISK_TIERS = ("low", "elevated", "high")
 RISK_SHORT = {"low": "low", "elevated": "elev", "high": "HIGH"}
 LOG_DIR_NAME = ".tutorial-logs"
 EXPORT_DIR_NAME = ".tutorial-export"
+IMAGE_EXTENSIONS = (".png", ".svg", ".jpg", ".jpeg")
 LOG_EXCLUDE_LINE = LOG_DIR_NAME + "/"
 SERVICE_STOP_GRACE = 5
 SERVICE_POLL = 0.5
@@ -3095,8 +3096,171 @@ def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
 # argument parsing
 
 
+def _sorted_deviations(state: dict) -> list:
+    """Return ``(node, record)`` pairs for all deviations sorted by ``recorded_at``."""
+    records = []
+    for node in state.get("nodes") or []:
+        for record in node.get("deviations") or []:
+            records.append((node, record))
+    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+    return records
+
+
+def _md_cell(value) -> str:
+    """Escape pipe characters and newlines for a single Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_report(state: dict, workspace: Path, out: Path) -> str:
+    """Render a Markdown summary report (``report.md``) for the tutorial DAG."""
+    title = state.get("title") or "Tutorial Report"
+    source_doc = state.get("source_doc") or "(none)"
+    mode = state.get("mode") or ""
+    persistence = state.get("persistence") or ""
+    branch = (state.get("git") or {}).get("branch") or current_branch(workspace) or "(none)"
+    completed, skipped, total = counts(state)
+
+    lines = [
+        "# {}".format(title),
+        "",
+        "- source_doc: `{}`".format(source_doc),
+        "- mode: `{}`".format(mode),
+        "- persistence: `{}`".format(persistence),
+        "- git.branch: `{}`".format(branch),
+        "- progress: {} completed / {} skipped / {} total".format(completed, skipped, total),
+        "",
+    ]
+
+    preflight = state.get("preflight")
+    if isinstance(preflight, dict):
+        status_text = "passed" if preflight.get("passed") else "failed"
+        missing = preflight.get("missing") or []
+        lines.extend([
+            "## Preflight",
+            "",
+            "- status: {}".format(status_text),
+            "- checked_at: {}".format(preflight.get("at") or ""),
+        ])
+        if missing:
+            lines.append("- missing: {}".format(", ".join(missing)))
+        requires = state.get("requires")
+        if isinstance(requires, dict):
+            _, rows, _ = run_checks(requires)
+            if rows:
+                lines.extend([
+                    "",
+                    "| Check | Status | Found | Need |",
+                    "|---|---|---|---|",
+                ])
+                for row in rows:
+                    lines.append(
+                        "| {} | {} | {} | {} |".format(
+                            _md_cell(row.get("name", "")),
+                            _md_cell(row.get("status", "")),
+                            _md_cell(row.get("found", "")),
+                            _md_cell(row.get("need", "")),
+                        )
+                    )
+        lines.append("")
+
+    index = node_index(state)
+    parents, _ = relation_maps(state)
+    order, cycle = topological_order(state)
+    if cycle:
+        order = order + sorted(cycle)
+
+    lines.extend(["## Nodes", ""])
+    if order:
+        lines.extend([
+            "| ID | Title | Status | Commit | Artifacts | Deviations |",
+            "|---|---|---|---|---|---|",
+        ])
+        for nid in order:
+            node = index[nid]
+            status_label = derived_state(state, nid, index, parents)
+            sha = node.get("commit_sha")
+            commit_label = sha[:7] if sha else "\u2014"
+            artifacts = node.get("artifacts") or []
+            artifacts_label = ", ".join(artifacts) if artifacts else "\u2014"
+            dev_count = len(node.get("deviations") or [])
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    _md_cell(nid),
+                    _md_cell(node.get("title", "")),
+                    _md_cell(status_label),
+                    _md_cell(commit_label),
+                    _md_cell(artifacts_label),
+                    dev_count,
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    visual_embeds = []
+    seen_visuals = set()
+    out_abs = os.path.abspath(str(out))
+    for nid in order:
+        node = index[nid]
+        for artifact in node.get("artifacts") or []:
+            if Path(artifact).suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            art_path = Path(artifact)
+            full_path = art_path if art_path.is_absolute() else workspace / art_path
+            if not full_path.is_file():
+                continue
+            full_abs = os.path.normpath(os.path.abspath(str(full_path)))
+            if full_abs in seen_visuals:
+                continue
+            seen_visuals.add(full_abs)
+            rel_posix = os.path.relpath(full_abs, out_abs).replace(os.sep, "/")
+            visual_embeds.append("![{}]({})".format(artifact, rel_posix))
+    if visual_embeds:
+        lines.extend(["## Visual Artifacts", ""])
+        lines.extend(visual_embeds)
+        lines.append("")
+
+    records = _sorted_deviations(state)
+    lines.extend(["## Deviations", ""])
+    if records:
+        for node, record in records:
+            lines.append(
+                "- `{}` (`{}`): `{}` -> `{}` \u2014 {}".format(
+                    node["id"],
+                    record.get("target", ""),
+                    record.get("original", ""),
+                    record.get("replacement", ""),
+                    record.get("reason", ""),
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    residue_entries = state.get("residue") or []
+    lines.extend(["## Residue", ""])
+    if residue_entries:
+        for entry in residue_entries:
+            undo = entry.get("undo") or []
+            scopes = ", ".join(entry.get("scopes") or [])
+            undo_text = " (undo: {})".format("; ".join(undo)) if undo else ""
+            lines.append(
+                "- `{}` [{}]: {}{}".format(
+                    entry.get("node_id", ""),
+                    scopes,
+                    entry.get("reason", ""),
+                    undo_text,
+                )
+            )
+    else:
+        lines.append("None.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def cmd_export(args, state_path: Path, workspace: Path) -> int:
-    """Write deviations.md and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
+    """Write report.md, deviations.md, and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
     state = load_validated_state(state_path)
 
     if args.out:
@@ -3112,11 +3276,7 @@ def cmd_export(args, state_path: Path, workspace: Path) -> int:
     except OSError as exc:
         raise CliError("cannot create {}: {}".format(out, exc))
 
-    records = []
-    for node in state.get("nodes") or []:
-        for record in node.get("deviations") or []:
-            records.append((node, record))
-    records.sort(key=lambda pair: pair[1].get("recorded_at", ""))
+    records = _sorted_deviations(state)
 
     source_doc = state.get("source_doc") or ""
     source_text = None
@@ -3164,6 +3324,9 @@ def cmd_export(args, state_path: Path, workspace: Path) -> int:
         stale_path = out / "tutorial.corrected.md"
         if corrected is None and stale_path.exists():
             stale_path.unlink()
+        summary_path = out / "report.md"
+        summary_path.write_text(render_report(state, workspace, out), encoding="utf-8")
+        written.append(summary_path)
         report_path = out / "deviations.md"
         report_path.write_text("\n".join(lines), encoding="utf-8")
         written.append(report_path)
@@ -3339,7 +3502,9 @@ def build_parser() -> argparse.ArgumentParser:
     teardown = sub.add_parser("teardown", help="stop every recorded service")
     teardown.set_defaults(func=cmd_teardown)
 
-    export = sub.add_parser("export", help="write a corrected tutorial and deviation report")
+    export = sub.add_parser(
+        "export", help="write summary report, deviation report, and corrected tutorial"
+    )
     export.add_argument(
         "--out", default=None, metavar="DIR",
         help="output directory (default: {}/ under the workspace)".format(EXPORT_DIR_NAME),

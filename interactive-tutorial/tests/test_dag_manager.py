@@ -1381,6 +1381,187 @@ class DagManagerTest(unittest.TestCase):
         self.assertIn(".tutorial-export/", exclude.splitlines())
         self.assertNotIn(".tutorial-export", self.git("status", "--porcelain"))
 
+    def test_export_report_metadata_topological_nodes_and_empty_sections(self):
+        self.cli("init", "--title", "Report Demo", "--source", "guide.md",
+                 "--mode", "assisted", "--persistence", "file", check=0)
+        state = self.state()
+        state["nodes"] = [
+            {
+                "id": "2-second",
+                "title": "Second step",
+                "summary": "Depends on first.",
+                "dependencies": ["1-first"],
+                "action_type": "read-only",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": [],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "3-third",
+                "title": "Third step",
+                "summary": "Depends on second.",
+                "dependencies": ["2-second"],
+                "action_type": "read-only",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": [],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "1-first",
+                "title": "First step",
+                "summary": "Creates out.txt.",
+                "dependencies": [],
+                "action_type": "mutate",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["out.txt"],
+                "commands": ["touch out.txt"],
+                "verification": {"type": "file_exists", "path": "out.txt"},
+            },
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("next", "1-first", check=0)
+        (self.workspace / "out.txt").write_text("hi\n", encoding="utf-8")
+        self.cli("complete", "1-first", "--commit", check=0)
+        sha = self.node("1-first")["commit_sha"]
+        self.assertIsNotNone(sha)
+        self.cli("jump", "3-third", "--skip-ancestors", check=0)
+
+        code, output = self.cli("export")
+        self.assertEqual(code, 0, output)
+        self.assertIn("report.md", output)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+
+        self.assertIn("# Report Demo", report)
+        self.assertIn("source_doc: `guide.md`", report)
+        self.assertIn("mode: `assisted`", report)
+        self.assertIn("persistence: `file`", report)
+        self.assertIn("git.branch: `main`", report)
+        self.assertIn("1 completed / 1 skipped / 3 total", report)
+        self.assertNotIn("## Preflight", report)
+        self.assertNotIn("## Visual Artifacts", report)
+
+        nodes_section = report.split("## Nodes", 1)[1].split("## Deviations", 1)[0]
+        pos1 = nodes_section.index("| 1-first |")
+        pos2 = nodes_section.index("| 2-second |")
+        pos3 = nodes_section.index("| 3-third |")
+        self.assertLess(pos1, pos2)
+        self.assertLess(pos2, pos3)
+        self.assertIn(
+            "| 1-first | First step | COMPLETED | {} | out.txt | 0 |".format(sha[:7]),
+            nodes_section,
+        )
+        self.assertIn("| 2-second | Second step | SKIPPED | \u2014 | \u2014 | 0 |", nodes_section)
+        self.assertIn("| 3-third | Third step | ACTIVE | \u2014 | \u2014 | 0 |", nodes_section)
+
+        deviations_section = report.split("## Deviations", 1)[1].split("## Residue", 1)[0]
+        residue_section = report.split("## Residue", 1)[1]
+        self.assertIn("None.", deviations_section)
+        self.assertIn("None.", residue_section)
+
+    def test_export_report_visual_artifacts_relative_embeds(self):
+        self.cli("init", "--title", "Visuals", "--source", "v.md", check=0)
+        (self.workspace / "docs").mkdir()
+        (self.workspace / "notes").mkdir()
+        for rel in ("docs/arch.png", "docs/diagram.SVG", "notes/photo.jpg", "notes/pic.jpeg", "README.txt"):
+            (self.workspace / rel).write_bytes(b"data")
+        state = self.state()
+        state["nodes"] = [
+            {
+                "id": "1-draw",
+                "title": "Draw",
+                "summary": "Create images.",
+                "dependencies": [],
+                "action_type": "mutate",
+                "status": "completed",
+                "commit_sha": None,
+                "artifacts": ["docs/arch.png", "docs/diagram.SVG", "docs/missing.png", "README.txt"],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+            {
+                "id": "2-more",
+                "title": "More",
+                "summary": "Add photos.",
+                "dependencies": ["1-draw"],
+                "action_type": "mutate",
+                "status": "pending",
+                "commit_sha": None,
+                "artifacts": ["docs/arch.png", "notes/photo.jpg", "notes/pic.jpeg"],
+                "commands": [],
+                "verification": {"type": "confirm", "prompt": "ok?"},
+            },
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        self.cli("export", check=0)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## Visual Artifacts", report)
+        visual_section = report.split("## Visual Artifacts", 1)[1].split("## Deviations", 1)[0]
+        self.assertIn("![docs/arch.png](../docs/arch.png)", visual_section)
+        self.assertIn("![docs/diagram.SVG](../docs/diagram.SVG)", visual_section)
+        self.assertIn("![notes/photo.jpg](../notes/photo.jpg)", visual_section)
+        self.assertIn("![notes/pic.jpeg](../notes/pic.jpeg)", visual_section)
+        self.assertEqual(visual_section.count("docs/arch.png"), 2)  # alt + link once
+        self.assertNotIn("missing.png", visual_section)
+        self.assertNotIn("README.txt", visual_section)
+
+        self.cli("export", "--out", "custom/nested", check=0)
+        nested_report = (self.workspace / "custom" / "nested" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("![docs/arch.png](../../docs/arch.png)", nested_report)
+
+    def test_export_report_preflight_deviations_and_residue(self):
+        nid = self._export_node("https://example.invalid/t.md", commands=["echo old"])
+        state = self.state()
+        state["requires"] = {
+            "tools": {"python3": ">=3.0", "zz-missing-tool-9": "*"},
+            "os": ["linux", "darwin", "windows"],
+        }
+        state["residue"] = [
+            {
+                "node_id": nid,
+                "scopes": ["user"],
+                "undo": ["rm ~/.demo"],
+                "reason": "not-run",
+                "recorded_at": "2026-11-27T00:00:00Z",
+            }
+        ]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, _ = self.cli("doctor")
+        self.assertEqual(code, 1)
+        self.cli("deviate", nid, "--command", "0", "--to", "echo new", "--reason", "updated", check=0)
+
+        self.cli("export", check=0)
+        report = (self.workspace / ".tutorial-export" / "report.md").read_text(encoding="utf-8")
+
+        self.assertIn("## Preflight", report)
+        preflight_section = report.split("## Preflight", 1)[1].split("## Nodes", 1)[0]
+        self.assertIn("status: failed", preflight_section)
+        self.assertIn("missing: zz-missing-tool-9", preflight_section)
+        self.assertIn("| python3 | ok |", preflight_section)
+        self.assertIn("| zz-missing-tool-9 | missing |", preflight_section)
+        self.assertIn("| os | ok |", preflight_section)
+
+        nodes_section = report.split("## Nodes", 1)[1].split("## Deviations", 1)[0]
+        self.assertIn("| {} |".format(nid), nodes_section)
+        self.assertTrue(any(
+            line.startswith("| {} |".format(nid)) and line.endswith("| 1 |")
+            for line in nodes_section.splitlines()
+        ))
+
+        deviations_section = report.split("## Deviations", 1)[1].split("## Residue", 1)[0]
+        self.assertNotIn("None.", deviations_section)
+        self.assertIn("`{}` (`command:0`): `echo old` -> `echo new`".format(nid), deviations_section)
+        self.assertIn("updated", deviations_section)
+
+        residue_section = report.split("## Residue", 1)[1]
+        self.assertNotIn("None.", residue_section)
+        self.assertIn("`{}` [user]: not-run (undo: rm ~/.demo)".format(nid), residue_section)
+
     def test_hands_off_high_risk_active_node_needs_approval_to_complete(self):
         root = self._root_with("hands-off", commands=["sudo true"])
         state = self.state()
