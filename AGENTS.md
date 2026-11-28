@@ -1,7 +1,7 @@
-# AGENTS.md - interactive-tutorial
+# AGENTS.md - tutorial-anything
 
 ## Project Overview
-Container repository for the `interactive-tutorial` Agent Skill: a Python stdlib CLI plus agent instructions that turn a static coding tutorial into a verifiable DAG, tracked in `.tutorial-dag.json` and checkpointed with Git commits.
+Container repository [`tutorial-anything`](https://github.com/brownag/tutorial-anything) for the `interactive-tutorial` Agent Skill (the bundled skill name and directory remain `interactive-tutorial/`): a Python stdlib CLI plus agent instructions that turn a static coding tutorial into a verifiable DAG, tracked in `.tutorial-dag.json` and checkpointed with Git commits.
 
 ## Quick Start
 Run from the repo root. The root `Makefile` forwards every target to `interactive-tutorial/Makefile`.

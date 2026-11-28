@@ -1,10 +1,12 @@
-# interactive-tutorial
+# tutorial-anything
 
-An [Agent Skills](https://agentskills.io) package that turns a coding
-tutorial into an interactive graph. The agent breaks the document into
+Repository for the `interactive-tutorial` [Agent Skills](https://agentskills.io)
+package (`https://github.com/brownag/tutorial-anything`). It turns a coding
+tutorial into an interactive graph: the agent breaks the document into
 verifiable nodes, runs one node per turn, checks each step, and commits
 every file change to Git. You can pause, resume, jump ahead, or rewind
-to an earlier checkpoint.
+to an earlier checkpoint. The bundled Agent Skill name and directory
+remain `interactive-tutorial/`.
 
 State lives in `.tutorial-dag.json` in the target workspace. The tool
 adds this file to `.git/info/exclude`. Git will not track it, and
@@ -19,7 +21,7 @@ adds this file to `.git/info/exclude`. Git will not track it, and
 
 ## Repository layout
 
-This repository is a container for the skill. Source files live in `interactive-tutorial/`. The `.agents/skills/interactive-tutorial/` directory contains relative symlinks to them. The root `Makefile` forwards all commands to the skill directory.
+This `tutorial-anything` repository is a container for the `interactive-tutorial` Agent Skill (both the bundled skill name and directory remain `interactive-tutorial/`). Source files live in `interactive-tutorial/`. The `.agents/skills/interactive-tutorial/` directory contains relative symlinks to them. The root `Makefile` forwards all commands to the skill directory.
 
 ```text
 .
