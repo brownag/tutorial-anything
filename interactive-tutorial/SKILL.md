@@ -130,7 +130,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" verify
 python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 ```
 
-- Finish the node's work before `complete`. Run declared `commands` verbatim (or exact behavioral equivalents if shell quoting or environment paths require it) before `verify`; never silently substitute a different script. `complete` runs verification and blocks the update on failure.
+- Finish the node's work before `complete`. Run declared `commands` verbatim (or exact behavioral equivalents if shell quoting or environment paths require it) before `verify`; never silently substitute a different script. `complete` runs verification and blocks the update on failure. Pass `--json` to `verify` (`node_id`, `ok`, `message`, `verification`) or `complete` (`node_id`, `status`, `commit_sha`, `next_active`, `ready`) for structured output.
 - `complete` makes the next node active when exactly one is ready (or prints `branch point, pick one: …` when several are ready—choose with `next <id>`). Running `next` with no argument when a pending node is already active prints that active node and exits 0. Pass `--json` to `next` for the selected node with its resolved `os`, `variant`, `commands`, `verification`, `undo`, `risk`, and `ready` IDs.
 - Use `--commit` when the node changed workspace files. It commits as `tutorial(<node-id>): <title>`. On a clean workspace, `complete --commit` completes the node without a checkpoint: `nothing to commit; completed <id> without a checkpoint` (exit 0, `commit_sha` stays null). Rollback then targets the nearest completed ancestor checkpoint.
 - Complete `read-only` and `instruct` nodes without `--commit`.
