@@ -9,8 +9,10 @@ hooks, or ``~/.gitconfig``. Standard library only; run with::
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -2224,6 +2226,272 @@ class ScaffoldTest(unittest.TestCase):
                       out)
         self.assertFalse((self.dest / "demo").exists())
         self.assertEqual(self.leftovers(), [])
+
+
+class PlatformVariantsTest(unittest.TestCase):
+    """Per-OS node.variants validation and runtime resolution (C-G5)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dm = load_cli_module()
+        previous = sys.modules.get("dag_manager")
+        sys.modules["dag_manager"] = cls.dm
+        cls.addClassCleanup(
+            lambda: sys.modules.__setitem__("dag_manager", previous)
+            if previous is not None
+            else sys.modules.pop("dag_manager", None)
+        )
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="dag-variants-test-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.state_path = self.workspace / STATE_NAME
+
+    def _base_node(self, **overrides):
+        node = {
+            "id": "1-step",
+            "title": "Install step",
+            "summary": "Install dependency.",
+            "dependencies": [],
+            "action_type": "execute",
+            "status": "pending",
+            "commit_sha": None,
+            "artifacts": [],
+            "commands": ["echo base-cmd"],
+            "verification": {"type": "command", "command": "echo base-check"},
+            "undo": ["echo base-undo"],
+        }
+        node.update(overrides)
+        return node
+
+    def _write_state(self, nodes, active="1-step"):
+        state = {
+            "schema_version": "1.2",
+            "title": "Variants Demo",
+            "source_doc": "README.md",
+            "mode": "assisted",
+            "persistence": "file",
+            "active_node_id": active,
+            "created_at": "2026-11-27T00:00:00Z",
+            "updated_at": "2026-11-27T00:00:00Z",
+            "git": {
+                "branch": "main",
+                "initial_commit_sha": "",
+                "initial_dirty": False,
+                "exclude_configured": True,
+            },
+            "nodes": nodes,
+        }
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    def _run_main(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = self.dm.main(["--cwd", str(self.workspace)] + list(argv))
+        return code, buf.getvalue()
+
+    def test_linux_and_darwin_variant_selection_and_field_fallback(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["echo linux-cmd"],
+                    "verification": {"type": "command", "command": "echo linux-check"},
+                    "undo": ["echo linux-undo"],
+                },
+                "darwin": {
+                    "commands": ["echo darwin-cmd"],
+                },
+            }
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            self.assertEqual("linux", self.dm.current_os())
+            self.assertEqual(["echo linux-cmd"], self.dm.effective_commands(node))
+            self.assertEqual(
+                {"type": "command", "command": "echo linux-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo linux-undo"], self.dm.effective_undo(node))
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            self.assertEqual("darwin", self.dm.current_os())
+            self.assertEqual(["echo darwin-cmd"], self.dm.effective_commands(node))
+            # Verification and undo are absent from darwin variant -> fall back to base.
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo base-undo"], self.dm.effective_undo(node))
+
+    def test_fallback_to_base_when_os_absent_from_variants(self):
+        node = self._base_node(
+            variants={"linux": {"commands": ["echo linux-cmd"]}}
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            self.assertEqual("windows", self.dm.current_os())
+            self.assertEqual(["echo base-cmd"], self.dm.effective_commands(node))
+            self.assertEqual(
+                {"type": "command", "command": "echo base-check"},
+                self.dm.effective_verification(node),
+            )
+            self.assertEqual(["echo base-undo"], self.dm.effective_undo(node))
+
+    def test_windows_variant_schema_validation_passes(self):
+        node = self._base_node(
+            variants={
+                "windows": {
+                    "commands": ["winget install -e --id Git.Git"],
+                    "verification": {"type": "command", "command": "git --version"},
+                    "undo": ["winget uninstall --id Git.Git"],
+                }
+            }
+        )
+        self.assertEqual([], self.dm.validate_node(node, 0, {}))
+
+    def test_invalid_variants_rejected(self):
+        bad_cases = [
+            "linux",
+            {},
+            {"plan9": {"commands": ["echo hi"]}},
+            {"linux": {}},
+            {"linux": ["echo hi"]},
+            {"linux": {"artifacts": ["file.txt"]}},
+            {"linux": {"commands": [""]}},
+            {"linux": {"commands": "echo hi"}},
+            {"linux": {"undo": ["   "]}},
+            {"linux": {"verification": {"type": "bogus"}}},
+        ]
+        for bad in bad_cases:
+            node = self._base_node(variants=bad)
+            problems = self.dm.validate_node(node, 0, {})
+            self.assertTrue(problems, "expected rejection for {!r}".format(bad))
+
+    def test_risk_tier_and_interactive_hints_use_effective_variant(self):
+        node = self._base_node(
+            interactive={"answers": ["yes"]},
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get install -y jq"],
+                    "undo": ["echo undo-linux"],
+                },
+                "darwin": {
+                    "commands": ["brew install jq"],
+                },
+            },
+        )
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            tier, labels = self.dm.risk_tier(node)
+            self.assertEqual(("high", ["sudo"]), (tier, labels))
+            hints = self.dm.interactive_hints(node)
+            self.assertIn("sudo apt-get install -y jq", hints[0])
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            tier, labels = self.dm.risk_tier(node)
+            self.assertEqual(("low", []), (tier, labels))
+            hints = self.dm.interactive_hints(node)
+            self.assertIn("brew install jq", hints[0])
+
+    def test_status_verify_and_jump_undo_use_effective_variant(self):
+        marker = self.workspace / "undone.txt"
+        node = self._base_node(
+            status="completed",
+            side_effects=["user"],
+            commands=["echo base-cmd"],
+            verification={"type": "command", "command": "echo base-ok"},
+            undo=["echo base > undone.txt"],
+            variants={
+                "linux": {
+                    "commands": ["echo linux-only-cmd"],
+                    "verification": {"type": "command", "command": "echo linux-ok"},
+                    "undo": ["printf linux > undone.txt"],
+                }
+            },
+        )
+        root = self._base_node(
+            id="0-root",
+            dependencies=[],
+            status="completed",
+            side_effects=["repo"],
+            commands=["true"],
+            verification={"type": "confirm", "prompt": "ok"},
+        )
+        node["dependencies"] = ["0-root"]
+        self._write_state([root, node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("status")
+            self.assertEqual(0, code, out)
+            self.assertIn("$ echo linux-only-cmd", out)
+            self.assertIn("linux-ok", out)
+
+            live_node = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][1]
+            passed, lines = self.dm.run_verification(live_node, self.workspace, False)
+            self.assertTrue(passed, lines)
+            self.assertIn("linux-ok", "\n".join(lines))
+
+            code, out = self._run_main(
+                "jump", "0-root", "--reset-descendants", "--undo"
+            )
+            self.assertEqual(0, code, out)
+            self.assertEqual("linux", marker.read_text(encoding="utf-8"))
+
+    def test_deviate_mutates_active_variant_or_falls_back_to_base(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["apt-get install foo"],
+                    "verification": {"type": "command", "command": "which foo"},
+                },
+                "darwin": {
+                    "commands": ["brew install foo"],
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        # Linux overrides both commands and verification -> mutate linux variant only.
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "apt-get install bar",
+                "--reason", "renamed package",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "sudo which bar",
+                "--reason", "check renamed binary",
+            )
+            self.assertEqual(0, code, out)
+            self.assertIn("risk: high (sudo)", out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual(["apt-get install bar"], saved["variants"]["linux"]["commands"])
+        self.assertEqual("sudo which bar", saved["variants"]["linux"]["verification"]["command"])
+        self.assertEqual(["echo base-cmd"], saved["commands"])
+        self.assertEqual("echo base-check", saved["verification"]["command"])
+
+        # Darwin overrides commands only -> --check falls back to mutating base verification.
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "echo darwin-fallback-check",
+                "--reason", "fix base check",
+            )
+            self.assertEqual(0, code, out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual("echo darwin-fallback-check", saved["verification"]["command"])
+        self.assertEqual("sudo which bar", saved["variants"]["linux"]["verification"]["command"])
+
+        # Windows absent from variants -> mutates base commands.
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "echo windows-base-cmd",
+                "--reason", "fix base cmd",
+            )
+            self.assertEqual(0, code, out)
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))["nodes"][0]
+        self.assertEqual(["echo windows-base-cmd"], saved["commands"])
+        self.assertEqual(["brew install foo"], saved["variants"]["darwin"]["commands"])
 
 
 if __name__ == "__main__":

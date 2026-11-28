@@ -65,6 +65,7 @@ SERVICE_SIGNALS = {"TERM": "SIGTERM", "INT": "SIGINT", "KILL": "SIGKILL"}
 SERVICE_FIELDS = ("command", "ready", "ready_timeout", "stop_signal")
 INTERACTIVE_FIELDS = ("answers", "human")
 PREFLIGHT_OS = ("linux", "darwin", "windows")
+VARIANT_FIELDS = ("commands", "verification", "undo")
 REQUIRES_FIELDS = ("tools", "os")
 TOOL_SPEC_FIELDS = ("min", "version_command")
 VERSION_SPEC_RE = re.compile(r"^\d+(?:\.\d+){0,2}$")
@@ -484,7 +485,7 @@ def collect_warnings(state: dict) -> list:
     index = node_index(state)
     for nid in node_order(state):
         node = index[nid]
-        check = node.get("verification") or {}
+        check = effective_verification(node)
         if (
             check.get("type") == "confirm"
             and str(check.get("prompt", "")).startswith("DRAFT:")
@@ -500,19 +501,19 @@ def collect_warnings(state: dict) -> list:
             )
         block = node.get("interactive")
         if isinstance(block, dict) and block.get("human"):
-            if (node.get("verification") or {}).get("type") != "confirm":
+            if effective_verification(node).get("type") != "confirm":
                 warnings.append(
                     "node '{}' is human: true but its verification is not confirm".format(nid)
                 )
         if "interactive" not in node:
-            for command in node.get("commands") or []:
+            for command in effective_commands(node):
                 if any(pattern.search(command) for pattern in INTERACTIVE_PATTERNS):
                     warnings.append(
                         "node '{}' command looks interactive: {}".format(nid, command)
                     )
                     break
         scopes = [s for s in node.get("side_effects", []) if s != "repo"]
-        if isinstance(node.get("side_effects"), list) and scopes and not node.get("undo"):
+        if isinstance(node.get("side_effects"), list) and scopes and not effective_undo(node):
             warnings.append(
                 "node '{}' has {} side effects but no undo (rewinds cannot revert it)".format(
                     nid, ", ".join(scopes)
@@ -622,11 +623,7 @@ def validate_node(node, position: int, seen: dict) -> list:
             )
 
     for field in ("artifacts", "commands"):
-        value = node.get(field)
-        if field in node and (
-            not isinstance(value, list)
-            or any(not isinstance(item, str) or not item for item in value)
-        ):
+        if field in node and not is_nonempty_str_list(node.get(field)):
             problems.append(
                 "{} field {!r} must be an array of non-empty strings".format(label, field)
             )
@@ -650,14 +647,12 @@ def validate_node(node, position: int, seen: dict) -> list:
                     label, list(SIDE_EFFECT_SCOPES)
                 )
             )
-    if "undo" in node:
-        value = node.get("undo")
-        if not isinstance(value, list) or any(
-            not isinstance(cmd, str) or not cmd.strip() for cmd in value
-        ):
-            problems.append(
-                "{} field 'undo' must be an array of non-empty command strings".format(label)
-            )
+    if "undo" in node and not is_nonempty_str_list(node.get("undo"), require_nonblank=True):
+        problems.append(
+            "{} field 'undo' must be an array of non-empty command strings".format(label)
+        )
+    if "variants" in node:
+        problems.extend(validate_variants(node["variants"], label))
     if "service" in node:
         problems.extend(validate_service(node["service"], label))
     if "interactive" in node:
@@ -691,10 +686,58 @@ def validate_node(node, position: int, seen: dict) -> list:
     return problems
 
 
+def is_nonempty_str_list(value, require_nonblank: bool = False) -> bool:
+    """True when ``value`` is a list of non-empty (and optionally non-blank) strings."""
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, str) and (bool(item.strip()) if require_nonblank else bool(item))
+        for item in value
+    )
+
+
+def current_os() -> str:
+    """Normalized operating system name matching ``PREFLIGHT_OS`` (C-G5)."""
+    return platform.system().lower()
+
+
+def active_variant(node: dict) -> dict:
+    """Return the matching OS variant dict for ``node``, or ``{}`` if absent (C-G5)."""
+    variants = node.get("variants")
+    if not isinstance(variants, dict):
+        return {}
+    variant = variants.get(current_os())
+    return variant if isinstance(variant, dict) else {}
+
+
+def _effective_field(node: dict, field: str, expected_type: type, default):
+    """Resolve one field from the active OS variant with fallback to the base node."""
+    variant = active_variant(node)
+    if field in variant and isinstance(variant[field], expected_type):
+        return variant[field]
+    base = node.get(field)
+    return base if isinstance(base, expected_type) else default
+
+
+def effective_commands(node: dict) -> list:
+    """Return OS-resolved ``commands`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "commands", list, [])
+
+
+def effective_verification(node: dict) -> dict:
+    """Return OS-resolved ``verification`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "verification", dict, {})
+
+
+def effective_undo(node: dict) -> list:
+    """Return OS-resolved ``undo`` for ``node`` with field-by-field fallback (C-G5)."""
+    return _effective_field(node, "undo", list, [])
+
+
 def inspected_commands(node: dict) -> list:
     """Commands the risk classifier reads: commands, undo, and a command check (C-G6)."""
-    commands = list(node.get("commands") or []) + list(node.get("undo") or [])
-    verification = node.get("verification") or {}
+    commands = list(effective_commands(node)) + list(effective_undo(node))
+    verification = effective_verification(node)
     if verification.get("type") == "command" and isinstance(verification.get("command"), str):
         commands.append(verification["command"])
     service = node.get("service") or {}
@@ -896,7 +939,7 @@ def interactive_hints(node: dict) -> list:
     lines = []
     answers = block.get("answers") or []
     if answers:
-        command = (node.get("commands") or ["<command>"])[0]
+        command = (effective_commands(node) or ["<command>"])[0]
         lines.append(
             "feed answers: printf '%s\\n' {} | {}".format(
                 " ".join(shlex.quote(answer) for answer in answers), command
@@ -932,6 +975,41 @@ def validate_requires(requires) -> list:
             or any(item not in PREFLIGHT_OS for item in value)
         ):
             problems.append("requires.os must be a unique array of {}".format(list(PREFLIGHT_OS)))
+    return problems
+
+
+def validate_variants(variants, label: str) -> list:
+    """Validate a node's per-OS ``variants`` block (C-G5)."""
+    if not isinstance(variants, dict) or not variants:
+        return ["{} field 'variants' must be a non-empty object".format(label)]
+    problems = []
+    for os_key, variant in variants.items():
+        if os_key not in PREFLIGHT_OS:
+            problems.append(
+                "{} variants key {!r} must be one of {}".format(
+                    label, os_key, list(PREFLIGHT_OS)
+                )
+            )
+            continue
+        vlabel = "{} variants.{}".format(label, os_key)
+        if not isinstance(variant, dict) or not variant:
+            problems.append("{} must be a non-empty object".format(vlabel))
+            continue
+        for field in variant:
+            if field not in VARIANT_FIELDS:
+                problems.append("{} does not accept {!r}".format(vlabel, field))
+        if "commands" in variant and not is_nonempty_str_list(variant["commands"]):
+            problems.append(
+                "{} field 'commands' must be an array of non-empty strings".format(vlabel)
+            )
+        if "undo" in variant and not is_nonempty_str_list(
+            variant["undo"], require_nonblank=True
+        ):
+            problems.append(
+                "{} field 'undo' must be an array of non-empty command strings".format(vlabel)
+            )
+        if "verification" in variant:
+            problems.extend(validate_verification(variant["verification"], vlabel))
     return problems
 
 
@@ -1037,7 +1115,7 @@ def run_checks(requires: dict) -> tuple:
     missing = [row["name"] for row in rows if not row["ok"]]
     passed = not missing
     if "os" in requires:
-        current = platform.system().lower()
+        current = current_os()
         ok = current in requires["os"]
         rows.append({
             "name": "os",
@@ -1379,7 +1457,7 @@ def check_port(verification: dict) -> tuple:
 
 def run_verification(node: dict, workspace: Path, assume_yes: bool) -> tuple:
     """Execute a node's gate. Returns ``(passed, lines)``."""
-    verification = node.get("verification") or {}
+    verification = effective_verification(node)
     kind = verification.get("type")
     label = "node '{}'".format(node.get("id"))
 
@@ -2149,13 +2227,13 @@ def cmd_status(args, state_path: Path, workspace: Path) -> int:
         node = index[active]
         say("active  {}".format(summary(state, active)))
         say("  {} {}".format(">", node.get("summary", "")))
-        for command in node.get("commands") or []:
+        for command in effective_commands(node):
             say("  $ {}".format(command))
         for artifact in node.get("artifacts") or []:
             say("  * {}".format(artifact))
         for hint in interactive_hints(node):
             say("  {}".format(hint))
-        verification = node.get("verification") or {}
+        verification = effective_verification(node)
         if node.get("deviations"):
             say("  deviations: {}".format(len(node["deviations"])))
         say("  verify: {}".format(json.dumps(verification, ensure_ascii=False)))
@@ -2228,7 +2306,7 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
         raise CliError("--reason must be non-empty", EXIT_USAGE)
 
     if args.check:
-        verification = node.get("verification") or {}
+        verification = effective_verification(node)
         if verification.get("type") != "command":
             raise CliError(
                 "'{}' check is not a command check; --check needs a 'command' "
@@ -2238,7 +2316,7 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
         target = "check"
         original = verification.get("command")
     else:
-        commands = node.get("commands") or []
+        commands = effective_commands(node)
         if args.index < 0 or args.index >= len(commands):
             raise CliError(
                 "'{}' has {} command(s); --command {} is out of range".format(
@@ -2251,10 +2329,17 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     if original == args.to:
         raise CliError("--to is the same as the current text of {}".format(target), EXIT_USAGE)
 
+    variant = active_variant(node)
     if args.check:
-        node["verification"]["command"] = args.to
+        target_verification = (
+            variant["verification"] if "verification" in variant else node["verification"]
+        )
+        target_verification["command"] = args.to
     else:
-        node["commands"][args.index] = args.to
+        target_commands = (
+            variant["commands"] if "commands" in variant else node["commands"]
+        )
+        target_commands[args.index] = args.to
     node.setdefault("deviations", []).append(
         {
             "target": target,
@@ -2475,7 +2560,7 @@ def node_scopes(node: dict) -> list:
 
 def side_effect_line(node: dict) -> str:
     """One listing line for a rewound node with non-repo side effects (C-G2)."""
-    undo = node.get("undo") or []
+    undo = effective_undo(node)
     tail = "undo: {}".format("; ".join(undo)) if undo else "undo: (none) | irreversible"
     return "side effects: {} [{}] {}".format(
         node["id"], ", ".join(node_scopes(node)), tail
@@ -2487,7 +2572,7 @@ def residue_entry(node: dict, reason: str) -> dict:
     return {
         "node_id": node["id"],
         "scopes": node_scopes(node),
-        "undo": list(node.get("undo") or []),
+        "undo": list(effective_undo(node)),
         "reason": reason,
         "recorded_at": now_iso(),
     }
@@ -2502,7 +2587,7 @@ def record_residue(state: dict, entries: list) -> None:
 
 def run_undo(node: dict, workspace: Path) -> tuple:
     """Run a node's undo commands in order. Returns (ok, message)."""
-    for command in node.get("undo") or []:
+    for command in effective_undo(node):
         say("  undo {}: {}".format(node["id"], command))
         try:
             proc = subprocess.run(
@@ -2658,7 +2743,7 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             elif risk_blocked(state, node):
                 say("skipped undo of {} (hands-off: high risk, not approved)".format(nid))
                 record_residue(state, [residue_entry(node, "not-run")])
-            elif not node.get("undo"):
+            elif not effective_undo(node):
                 record_residue(state, [residue_entry(node, "irreversible")])
             else:
                 ok, message = run_undo(node, workspace)
