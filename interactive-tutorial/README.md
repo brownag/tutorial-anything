@@ -60,7 +60,7 @@ Place global flags before the command. `--file` specifies the state file (defaul
 | `approve <id>` | Record a person's approval of a node's current risk tier and its deviations; clears the `hands-off` gate for that node while its tier does not rise and no new deviation is recorded | 1 if the state is invalid |
 | `deviate [<id>] (--command N \| --check) --to CMD --reason TEXT` | Replace a stale check or command (default: active node) and record the original, replacement, and reason. Use only when the tutorial is wrong | 0 on success; 1 if the node is completed (`jump <id> --reset-descendants` first); 2 on bad target, same or empty text, or a non-command check |
 | `export [--out DIR]` | Write `report.md`, `deviations.md`, and, for a readable local `source_doc` with at least one deviation, `tutorial.corrected.md` to `<workspace>/.tutorial-export` (git-excluded) | 0 |
-| `draft <path> [--write]` | Print a skeleton DAG (JSON `{"title", "nodes"}`) from a Markdown tutorial: one node per H2/H3 heading (or numbered item), linear chain, `DRAFT:` placeholder checks. `--write` fills an empty `nodes` array, then validates | 1 with `--write` if `nodes` is not empty (`nodes already present`) |
+| `draft <path> [--write]` | Print a skeleton DAG (JSON `{"title", "nodes"}`, plus `requires.tools` when shell tools are detected) from a Markdown tutorial: one node per H2/H3 heading (or numbered item), linear chain, `DRAFT:` placeholder checks (with `; DRAFT: consider a service block` server hints), and per-OS `variants` from OS headings/labels or fence tags. `--write` fills an empty `nodes` array (and empty `requires`), then validates | 1 with `--write` if `nodes` is not empty (`nodes already present`) |
 | `service start [<id>]` | Start the node's `service` command detached, log to `.tutorial-logs/<id>.log`, and wait for its `ready` check (default: active node) | 1 if `ready` never passes or the process exits; 2 on non-POSIX systems |
 | `service stop [<id>]` | Stop a recorded service: `SIGTERM` to its process group, then `SIGKILL` after 5 s. A dead process is not an error | 0 |
 | `teardown` | Stop every recorded service | 0 |
@@ -116,13 +116,13 @@ Persistence modes:
 ## Development
 
 ```bash
-make lint               # compile checks
+make lint               # check-clean + byte-compile checks
 make validate-examples  # test sample DAG
 make test               # run test suite
 make test-corpus        # run corpus fixture tests
 ```
 
-Tests run in temporary Git repositories. They isolate global Git configurations.
+`make lint` runs `check-clean` first (failing if stray `.development/` or `planning/` directories exist inside `interactive-tutorial/`) before byte-compiling scripts and tests. Tests run in temporary Git repositories and isolate global Git configurations.
 
 Corpus: `make test-corpus` runs `tests/test_corpus.py` against the fixtures in `tests/corpus/`, one directory per tutorial scenario. `make test` excludes these tests (`test_dag*.py` only), and `make all` runs both.
 
