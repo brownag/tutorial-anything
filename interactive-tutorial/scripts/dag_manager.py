@@ -1926,11 +1926,41 @@ def cmd_init(args, state_path: Path, workspace: Path) -> int:
 # draft: skeleton nodes from a Markdown tutorial (C-G10)
 
 DRAFT_SHELL_INFO = ("sh", "bash", "shell", "console", "zsh")
+DRAFT_WINDOWS_SHELL_INFO = ("powershell", "pwsh", "cmd", "bat")
 DRAFT_SUMMARY_MAX = 200
 DRAFT_SLUG_MAX = 40
 DRAFT_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$")
 DRAFT_SECTION_RE = re.compile(r"^#{2,3}[ \t]+(.+?)\s*$")
 DRAFT_ITEM_RE = re.compile(r"^\d+\.\s+(.*?)\s*$")
+DRAFT_SUBSECTION_RE = re.compile(r"^#{4,6}[ \t]+(.+?)\s*$")
+DRAFT_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+DRAFT_TOOLS = frozenset(
+    {
+        "python3",
+        "git",
+        "docker",
+        "sqlite3",
+        "node",
+        "npm",
+        "curl",
+        "cargo",
+        "go",
+        "Rscript",
+        "make",
+    }
+)
+DRAFT_OS_LABEL_RE = re.compile(
+    r"^(?:(?:on|for|in)\s+)?(linux|macos|mac\s+os|darwin|windows)(?:\s*\([^)]*\))?\s*:?$",
+    re.IGNORECASE,
+)
+DRAFT_SERVER_PATTERNS = (
+    re.compile(r"\bhttp\.server\b"),
+    re.compile(r"\buvicorn\b"),
+    re.compile(r"\bflask\s+run\b"),
+    re.compile(r"\bnpm\s+run\s+dev\b"),
+    re.compile(r"\bvite\b"),
+    re.compile(r"\brails\s+server\b"),
+)
 
 
 def slugify(text: str) -> str:
@@ -1997,13 +2027,145 @@ def draft_sections(lines, kinds):
     return title_hint, (headed if headed else items)
 
 
+def normalize_draft_os(token: str):
+    """Map an OS label token to a ``PREFLIGHT_OS`` key, or ``None``."""
+    key = token.strip().lower().replace(" ", "")
+    if key == "linux":
+        return "linux"
+    if key in ("macos", "darwin"):
+        return "darwin"
+    if key == "windows":
+        return "windows"
+    return None
+
+
+def detect_os_label(line: str):
+    """Return ``(os_key, is_heading)`` if ``line`` is an explicit OS label."""
+    stripped = line.strip()
+    if not stripped:
+        return None, False
+    sub_match = DRAFT_SUBSECTION_RE.match(stripped)
+    is_heading = sub_match is not None
+    candidate = sub_match.group(1) if sub_match else stripped
+    if not is_heading:
+        candidate = re.sub(r"^(?:[-*]\s+)", "", candidate)
+    candidate = candidate.replace("`", "").replace("*", "").replace("_", "").strip()
+    match = DRAFT_OS_LABEL_RE.match(candidate)
+    if match:
+        return normalize_draft_os(match.group(1)), is_heading
+    return None, is_heading
+
+
+def detect_fence_os(info: str):
+    """Return a ``PREFLIGHT_OS`` key if a fenced-block info string carries an OS label."""
+    for token in re.split(r"[\s:,()\[\]]+", info.strip()):
+        if not token:
+            continue
+        os_key = normalize_draft_os(token)
+        if os_key is not None:
+            return os_key
+    return None
+
+
+def _tokenize_shell_line(line: str) -> list:
+    """Split one shell line into tokens while preserving ``; | &`` operators."""
+    try:
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";|&")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return line.split()
+
+
+def detect_draft_tools(commands) -> set:
+    """Detect known CLI tools in command positions across shell command strings."""
+    detected = set()
+    for command in commands:
+        for raw_line in command.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            at_cmd_pos = True
+            for token in _tokenize_shell_line(stripped):
+                if token in (";", "&&", "||", "|", "&", "|&"):
+                    at_cmd_pos = True
+                    continue
+                if not at_cmd_pos:
+                    continue
+                if DRAFT_ENV_ASSIGN_RE.match(token) or token in ("sudo", "env", "nohup", "command"):
+                    continue
+                cmd_name = token.rsplit("/", 1)[-1] if token.startswith("/") else token
+                if cmd_name in DRAFT_TOOLS:
+                    detected.add(cmd_name)
+                at_cmd_pos = False
+    return detected
+
+
+def detect_draft_server(commands, texts=()) -> bool:
+    """True when drafted commands or inline code mention a long-running server."""
+    candidates = list(commands)
+    for text in texts:
+        for match in re.finditer(r"`([^`]+)`", text):
+            candidates.append(match.group(1))
+    return any(
+        pattern.search(candidate)
+        for candidate in candidates
+        for pattern in DRAFT_SERVER_PATTERNS
+    )
+
+
 def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
     """Build one skeleton node from the body lines in ``[start, end)``."""
     summary = None
     commands = []
+    variants = {}
     kinds_seen = []
+    fence_by_open = {
+        fence["open"]: fence for fence in fences if start <= fence["open"] < end
+    }
+    active_os = None
+    active_os_is_heading = False
+    inline_texts = [title]
+
     for i in range(start, end):
-        if kinds[i] == "text" and lines[i].strip() and summary is None:
+        if i in fence_by_open:
+            fence = fence_by_open[i]
+            info_tokens = fence["info"].split()
+            info_word = info_tokens[0].lower() if info_tokens else ""
+            fence_os = detect_fence_os(fence["info"])
+            target_os = fence_os or active_os
+            close = fence["close"] if fence["close"] is not None else len(lines)
+            body = []
+            for line in lines[fence["open"] + 1 : close]:
+                cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
+                body.append(line[cut:])
+            is_prompt = any(row.startswith("$ ") for row in body)
+            is_shell = (
+                info_word in DRAFT_SHELL_INFO
+                or (not info_word and is_prompt)
+                or (target_os == "windows" and info_word in DRAFT_WINDOWS_SHELL_INFO)
+            )
+            if is_shell:
+                kinds_seen.append("execute")
+                cmd_text = "\n".join(
+                    row[2:] if row.startswith("$ ") else row for row in body
+                )
+                if target_os:
+                    if cmd_text:
+                        variants.setdefault(target_os, []).append(cmd_text)
+                else:
+                    commands.append(cmd_text)
+            else:
+                kinds_seen.append("mutate")
+            continue
+
+        if kinds[i] != "text":
+            continue
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        inline_texts.append(lines[i])
+        if summary is None:
             block = []
             j = i
             while j < end and kinds[j] == "text" and lines[j].strip():
@@ -2013,21 +2175,14 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
             if len(text) > DRAFT_SUMMARY_MAX:
                 text = text[: DRAFT_SUMMARY_MAX - 3] + "..."
             summary = text
-    for fence in fences:
-        if not start <= fence["open"] < end:
-            continue
-        info_word = fence["info"].split()[0] if fence["info"] else ""
-        close = fence["close"] if fence["close"] is not None else len(lines)
-        body = []
-        for line in lines[fence["open"] + 1 : close]:
-            cut = min(fence["indent"], len(line) - len(line.lstrip(" ")))
-            body.append(line[cut:])
-        is_prompt = any(row.startswith("$ ") for row in body)
-        if info_word in DRAFT_SHELL_INFO or (not info_word and is_prompt):
-            kinds_seen.append("execute")
-            commands.append("\n".join(row[2:] if row.startswith("$ ") else row for row in body))
-        else:
-            kinds_seen.append("mutate")
+        os_key, is_heading = detect_os_label(lines[i])
+        if os_key is not None:
+            active_os = os_key
+            active_os_is_heading = is_heading
+        elif is_heading or not active_os_is_heading:
+            active_os = None
+            active_os_is_heading = False
+
     if "execute" in kinds_seen:
         action = "execute"
     elif kinds_seen:
@@ -2037,7 +2192,13 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
     if summary is None:
         summary = title
     node_id = "{}-{}".format(n, slugify(title))
-    return {
+    all_commands = list(commands)
+    for os_cmds in variants.values():
+        all_commands.extend(os_cmds)
+    prompt = "DRAFT: replace with a real check for {}".format(title)
+    if detect_draft_server(all_commands, inline_texts):
+        prompt += "; DRAFT: consider a service block"
+    node = {
         "id": node_id,
         "title": title,
         "summary": summary,
@@ -2047,19 +2208,25 @@ def draft_node(lines, kinds, fences, start, end, n, previous, title, line_no):
         "artifacts": [],
         "verification": {
             "type": "confirm",
-            "prompt": "DRAFT: replace with a real check for {}".format(title),
+            "prompt": prompt,
         },
         "status": "pending",
         "commit_sha": None,
         "source_ref": {"line": line_no, "heading": title},
     }
+    if variants:
+        node["variants"] = {
+            os_key: {"commands": os_cmds} for os_key, os_cmds in variants.items()
+        }
+    return node
 
 
 def build_draft(lines, stem):
-    """Return the ``draft`` document ``{"title", "nodes"}`` for ``lines``."""
+    """Return the ``draft`` document ``{"title", "nodes"}`` (and optional ``requires``)."""
     kinds, fences = scan_fences(lines)
     title_hint, sections = draft_sections(lines, kinds)
     nodes = []
+    all_commands = []
     previous = None
     for index, (line_index, heading) in enumerate(sections):
         end = sections[index + 1][0] if index + 1 < len(sections) else len(lines)
@@ -2067,8 +2234,17 @@ def build_draft(lines, stem):
             lines, kinds, fences, line_index + 1, end, index + 1, previous, heading, line_index + 1
         )
         nodes.append(node)
+        all_commands.extend(node.get("commands", []))
+        for variant in (node.get("variants") or {}).values():
+            all_commands.extend(variant.get("commands", []))
         previous = node["id"]
-    return {"title": title_hint or stem, "nodes": nodes}
+    document = {"title": title_hint or stem, "nodes": nodes}
+    detected_tools = detect_draft_tools(all_commands)
+    if detected_tools:
+        document["requires"] = {
+            "tools": {tool: "*" for tool in sorted(detected_tools)}
+        }
+    return document
 
 
 def cmd_draft(args, state_path: Path, workspace: Path) -> int:
@@ -2092,6 +2268,8 @@ def cmd_draft(args, state_path: Path, workspace: Path) -> int:
             )
         )
     state["nodes"] = document["nodes"]
+    if document.get("requires") and not state.get("requires"):
+        state["requires"] = document["requires"]
     problems, warnings = validate_document(state)
     if problems:
         for problem in problems:

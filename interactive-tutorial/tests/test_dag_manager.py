@@ -2001,6 +2001,138 @@ class DraftTest(unittest.TestCase):
     def test_summary_falls_back_to_title_without_paragraph(self):
         self.assertEqual(self.draft("## Bare\n\n```sh\nls\n```\n")["nodes"][0]["summary"], "Bare")
 
+    def test_detects_tools_in_command_positions_only(self):
+        self.assertNotIn("requires", self.draft("## Plain\n\n```sh\nls -la\necho \"git docker\"\n# make test\n```\n"))
+        text = (
+            "## Build\n\n"
+            "```bash\n"
+            "FOO=bar /usr/bin/python3 -m venv .venv && npm install\n"
+            "curl -s https://example.invalid | sqlite3 app.db\n"
+            "sudo docker build . ; git status\n"
+            "node index.js\n"
+            "cargo check && go test ./...\n"
+            "Rscript analyze.R && make check\n"
+            "```\n"
+        )
+        doc = self.draft(text)
+        expected = {
+            "Rscript": "*",
+            "cargo": "*",
+            "curl": "*",
+            "docker": "*",
+            "git": "*",
+            "go": "*",
+            "make": "*",
+            "node": "*",
+            "npm": "*",
+            "python3": "*",
+            "sqlite3": "*",
+        }
+        self.assertEqual(doc["requires"], {"tools": expected})
+
+    def test_detects_os_variants_from_lines_subsections_and_fences(self):
+        lines_md = (
+            "## Install\n\n"
+            "Install the tool.\n\n"
+            "On Linux:\n\n"
+            "```sh\n"
+            "curl -fsSL https://example.invalid/linux.sh\n"
+            "```\n\n"
+            "On macOS (`darwin`):\n\n"
+            "```sh\n"
+            "git clone https://example.invalid/repo\n"
+            "```\n\n"
+            "**Windows**:\n\n"
+            "```powershell\n"
+            "winget install example\n"
+            "```\n"
+        )
+        doc = self.draft(lines_md)
+        node = doc["nodes"][0]
+        self.assertEqual(node["action_type"], "execute")
+        self.assertEqual(node["commands"], [])
+        self.assertEqual(
+            node["variants"],
+            {
+                "linux": {"commands": ["curl -fsSL https://example.invalid/linux.sh"]},
+                "darwin": {"commands": ["git clone https://example.invalid/repo"]},
+                "windows": {"commands": ["winget install example"]},
+            },
+        )
+        self.assertEqual(doc["requires"], {"tools": {"curl": "*", "git": "*"}})
+
+        sub_md = (
+            "## Setup\n\n"
+            "#### Linux\n\n"
+            "Linux instructions.\n\n"
+            "```bash\n"
+            "make linux\n"
+            "```\n\n"
+            "#### macOS (Darwin)\n\n"
+            "```bash\n"
+            "make darwin\n"
+            "```\n\n"
+            "#### Common check\n\n"
+            "```bash\n"
+            "echo ok\n"
+            "```\n"
+        )
+        sub_node = self.draft(sub_md)["nodes"][0]
+        self.assertEqual(sub_node["commands"], ["echo ok"])
+        self.assertEqual(
+            sub_node["variants"],
+            {
+                "linux": {"commands": ["make linux"]},
+                "darwin": {"commands": ["make darwin"]},
+            },
+        )
+
+        fence_md = (
+            "## Run\n\n"
+            "```bash linux\n"
+            "echo lin\n"
+            "```\n\n"
+            "```sh macOS\n"
+            "echo mac\n"
+            "```\n\n"
+            "```powershell windows\n"
+            "Write-Output win\n"
+            "```\n"
+        )
+        fence_node = self.draft(fence_md)["nodes"][0]
+        self.assertEqual(
+            fence_node["variants"],
+            {
+                "linux": {"commands": ["echo lin"]},
+                "darwin": {"commands": ["echo mac"]},
+                "windows": {"commands": ["Write-Output win"]},
+            },
+        )
+
+    def test_detects_server_commands_and_adds_service_hint(self):
+        server_cmds = (
+            "python3 -m http.server 8000",
+            "uvicorn app:main --reload",
+            "flask run --port 5000",
+            "npm run dev",
+            "npx vite --port 3000",
+            "rails server -p 3000",
+        )
+        for cmd in server_cmds:
+            with self.subTest(cmd=cmd):
+                node = self.draft("## Serve\n\n```sh\n{}\n```\n".format(cmd))["nodes"][0]
+                prompt = node["verification"]["prompt"]
+                self.assertTrue(prompt.startswith("DRAFT: replace with a real check for "))
+                self.assertIn("DRAFT: consider a service block", prompt)
+
+        inline_node = self.draft(
+            "1. Serve: start `python3 -m http.server 8000` in a terminal.\n"
+        )["nodes"][0]
+        self.assertIn("DRAFT: consider a service block", inline_node["verification"]["prompt"])
+
+        plain_node = self.draft("## Check\n\n```sh\necho ready\n```\n")["nodes"][0]
+        self.assertNotIn("DRAFT: consider a service block", plain_node["verification"]["prompt"])
+
 
 class DraftWriteTest(unittest.TestCase):
     """`draft <path> --write` fills an empty state; validate checks source_ref (C-G10)."""
@@ -2096,6 +2228,39 @@ class DraftWriteTest(unittest.TestCase):
         state["nodes"][0]["source_ref"] = good
         self.write_state(state)
         self.assertEqual(self.cli("validate")[0], 0)
+
+    def test_write_copies_requires_when_absent_and_validates(self):
+        (self.ws / "tutorial.md").write_text(
+            "# Web App\n\n"
+            "## Install\n\n"
+            "On Linux:\n\n```sh\ngit status\n```\n\n"
+            "On macOS:\n\n```sh\npython3 --version\n```\n\n"
+            "## Serve\n\n```sh\nuvicorn app:main\n```\n",
+            encoding="utf-8",
+        )
+        self.init()
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        state = self.state()
+        self.assertEqual(state["requires"], {"tools": {"git": "*", "python3": "*"}})
+        self.assertIn("variants", state["nodes"][0])
+        self.assertIn("DRAFT: consider a service block", state["nodes"][1]["verification"]["prompt"])
+        code, out, err = self.cli("validate")
+        self.assertEqual(code, 0, out + err)
+
+    def test_write_preserves_existing_requires(self):
+        (self.ws / "tutorial.md").write_text(
+            "# Build\n\n## Run\n\n```sh\npython3 -m unittest\n```\n",
+            encoding="utf-8",
+        )
+        self.init()
+        state = self.state()
+        existing_requires = {"os": ["linux"], "tools": {"python3": ">=3.9"}}
+        state["requires"] = existing_requires
+        self.write_state(state)
+        code, out, err = self.cli("draft", "tutorial.md", "--write")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.state()["requires"], existing_requires)
 
 
 def dm_id_re():
