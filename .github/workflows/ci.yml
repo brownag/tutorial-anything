@@ -11,12 +11,18 @@ permissions:
 
 jobs:
   test:
-    name: lint + examples + tests (python ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04  # python 3.9 has no setup-python build for ubuntu 26.04
+    name: lint + examples + tests (${{ matrix.os }}, python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        include:
+          - os: ubuntu-24.04  # python 3.9 has no setup-python build for ubuntu 26.04
+            python-version: "3.9"
+          - os: ubuntu-24.04
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
 
