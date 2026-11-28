@@ -23,7 +23,7 @@ SKILLS_DIR := $(CURDIR)/.agents/skills
 endif
 endif
 
-.PHONY: help all lint test test-corpus validate-examples install uninstall
+.PHONY: help all lint check-clean test test-corpus validate-examples install uninstall
 
 help: ## show available targets
 	@echo "targets:"
@@ -33,7 +33,17 @@ help: ## show available targets
 
 all: lint validate-examples test-corpus test ## lint, validate the examples, run the corpus and unit tests
 
-lint: ## byte-compile the CLI and tests (catches syntax errors only)
+check-clean: ## fail if stray scratch or planning paths exist inside the skill
+	@fail=0; \
+	for d in .development planning; do \
+		if [ -e "$(SKILL_DIR)/$$d" ]; then \
+			echo "ERROR: stray path inside skill directory: $(SKILL_DIR)/$$d (remove it to keep $(SKILL_NAME)/ self-contained)" >&2; \
+			fail=1; \
+		fi; \
+	done; \
+	exit $$fail
+
+lint: check-clean ## check cleanliness and byte-compile the CLI and tests
 	@cd "$(SKILL_DIR)" && $(PYTHON) -m py_compile scripts/dag_manager.py && \
 		$(PYTHON) -m compileall -q scripts tests && \
 		echo "lint OK ($(PYTHON))"
