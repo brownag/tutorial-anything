@@ -2265,6 +2265,14 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def _print_active_node(state: dict, index: dict, nid: str, workspace: Path) -> None:
+    """Print the active-node summary, interactive hints, and status header."""
+    say("active -> {}".format(summary(state, nid)))
+    for hint in interactive_hints(index[nid]):
+        say("  {}".format(hint))
+    say(header_line(state, workspace))
+
+
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
     state = load_state(state_path)
@@ -2301,19 +2309,15 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
         check_risk(state, args.node_id)
         state["active_node_id"] = args.node_id
         save_state(state_path, state)
-        say("active -> {}".format(summary(state, args.node_id)))
-        for hint in interactive_hints(index[args.node_id]):
-            say("  {}".format(hint))
-        say(header_line(state, workspace))
+        _print_active_node(state, index, args.node_id, workspace)
         return EXIT_OK
 
     active = state.get("active_node_id")
     index = node_index(state)
     if active and index.get(active, {}).get("status") == "pending":
-        raise CliError(
-            "'{}' is still in progress. Finish it with `complete` (or move the "
-            "pointer with `jump <other>`).".format(active)
-        )
+        check_risk(state, active)
+        _print_active_node(state, index, active, workspace)
+        return EXIT_OK
     ready = ready_nodes(state)
     if not ready:
         completed, skipped, total = counts(state)
@@ -2330,10 +2334,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
     check_risk(state, ready[0])
     state["active_node_id"] = ready[0]
     save_state(state_path, state)
-    say("active -> {}".format(summary(state, ready[0])))
-    for hint in interactive_hints(index[ready[0]]):
-        say("  {}".format(hint))
-    say(header_line(state, workspace))
+    _print_active_node(state, index, ready[0], workspace)
     return EXIT_OK
 
 
@@ -2405,10 +2406,16 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
         for line in lines:
             say("  {}".format(line))
         if not passed:
-            err(
-                "verification failed for {} - state unchanged. Fix the work, or "
-                "pass --no-verify to record it anyway.".format(nid)
-            )
+            if state.get("mode") == "hands-off":
+                err(
+                    "verification failed for {} - state unchanged. "
+                    "Fix the work and re-run.".format(nid)
+                )
+            else:
+                err(
+                    "verification failed for {} - state unchanged. Fix the work, or "
+                    "pass --no-verify to record it anyway.".format(nid)
+                )
             return EXIT_FAIL
     else:
         warn("--no-verify: skipping the verification gate for {}".format(nid))

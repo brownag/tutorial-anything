@@ -477,13 +477,31 @@ class DagManagerTest(unittest.TestCase):
             "a single unambiguous ready node should auto-advance",
         )
 
-    def test_next_refuses_an_in_progress_node(self):
+    def test_next_prints_already_active_pending_node(self):
         self.seed_repo()
         self.seed_state()
         self.cli("next", check=0)
+        before_state = self.state_path.read_text(encoding="utf-8")
         code, output = self.cli("next")
-        self.assertEqual(code, 1)
-        self.assertIn("1-design", output)
+        self.assertEqual(code, 0, output)
+        self.assertIn("active -> 1-design", output)
+        self.assertIn("active: 1-design", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
+
+    def test_next_after_complete_auto_activation_prints_active_with_hints(self):
+        self.seed_repo()
+        state = self.seed_state()
+        self.node("2-scaffold", state)["interactive"] = {"human": True}
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.cli("complete", "1-design", "--yes", check=0)
+        self.assertEqual(self.state()["active_node_id"], "2-scaffold")
+        before_state = self.state_path.read_text(encoding="utf-8")
+        code, output = self.cli("next")
+        self.assertEqual(code, 0, output)
+        self.assertIn("active -> 2-scaffold", output)
+        self.assertIn("a person must run this step (interactive)", output)
+        self.assertIn("active: 2-scaffold", output)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before_state)
 
     def test_next_refuses_a_branch_point_and_lists_both(self):
         self.seed_repo()
@@ -561,6 +579,29 @@ class DagManagerTest(unittest.TestCase):
         code, output = self.cli("complete", "2-scaffold", "--yes")
         self.assertEqual(code, 1)
         self.assertIn("1-design", output)
+
+    def test_complete_verification_failure_hint_depends_on_mode(self):
+        root = self._root_with(
+            "hands-off",
+            verification={"type": "command", "command": "exit 1", "expect_exit": 0},
+        )
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn(
+            "verification failed for {} - state unchanged. Fix the work and re-run.".format(root),
+            output,
+        )
+        self.assertNotIn("--no-verify", output)
+
+        state = self.state()
+        state["mode"] = "assisted"
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("complete", root)
+        self.assertEqual(code, 1, output)
+        self.assertIn(
+            "verification failed for {} - state unchanged. Fix the work, or pass --no-verify to record it anyway.".format(root),
+            output,
+        )
 
     # -- checkpoints ------------------------------------------------------
 
