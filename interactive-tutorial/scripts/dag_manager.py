@@ -208,6 +208,32 @@ def load_state(path: Path) -> dict:
     return state
 
 
+def load_validated_state(
+    path: Path, *, emit_warnings: bool = False, summary_err: str = ""
+) -> dict:
+    """Load state and validate it, raising CliError on validation failure."""
+    state = load_state(path)
+    problems, warnings = validate_document(state)
+    if problems:
+        if summary_err:
+            for problem in problems:
+                err(problem)
+            if emit_warnings:
+                for message in warnings:
+                    warn(message)
+            raise CliError(summary_err.format(len(problems)))
+        if emit_warnings:
+            for message in warnings:
+                warn(message)
+        for problem in problems[:-1]:
+            err(problem)
+        raise CliError(problems[-1])
+    if emit_warnings:
+        for message in warnings:
+            warn(message)
+    return state
+
+
 def save_state(path: Path, state: dict) -> None:
     """Atomically write the state document and refresh ``updated_at``."""
     state["updated_at"] = now_iso()
@@ -1030,12 +1056,7 @@ def format_check(row: dict) -> str:
 
 def cmd_doctor(args, state_path: Path, workspace: Path) -> int:
     """Check declared tools and OS; record the result as ``preflight`` (C-G4)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     if "requires" not in state:
         say("no requires block; nothing to check")
         return EXIT_OK
@@ -2079,15 +2100,11 @@ def cmd_validate(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_status(args, state_path: Path, workspace: Path) -> int:
     """Print the turn header, the graph, and (with --json) the raw document."""
-    state = load_state(state_path)
-    problems, warnings = validate_document(state)
-    for problem in problems:
-        err(problem)
-    for message in warnings:
-        warn(message)
-    if problems:
-        err("{} problem(s); run `validate` for detail".format(len(problems)))
-        return EXIT_FAIL
+    state = load_validated_state(
+        state_path,
+        emit_warnings=True,
+        summary_err="{} problem(s); run `validate` for detail",
+    )
 
     if args.json:
         say(json.dumps(state, indent=2, ensure_ascii=False))
@@ -2177,12 +2194,7 @@ def check_risk(state: dict, nid: str) -> None:
 
 def cmd_approve(args, state_path: Path, workspace: Path) -> int:
     """Record a person's approval of a node's current risk tier (C-G6)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     node = get_node(state, args.node_id)
     tier, labels = risk_tier(node)
     node["approved"] = {
@@ -2202,12 +2214,7 @@ def cmd_approve(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     """Replace a node's check or one of its commands and record why (C-G8)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
     if node.get("status") == "completed":
@@ -2275,12 +2282,7 @@ def _print_active_node(state: dict, index: dict, nid: str, workspace: Path) -> N
 
 def cmd_next(args, state_path: Path, workspace: Path) -> int:
     """Advance the active pointer, refusing to guess at branch points."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     preflight_gate(state, state_path, getattr(args, "skip_doctor", False))
 
     if args.node_id:
@@ -2340,12 +2342,7 @@ def cmd_next(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_verify(args, state_path: Path, workspace: Path) -> int:
     """Run a node's verification gate and report the outcome."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
     say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
@@ -2361,12 +2358,7 @@ def cmd_verify(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     """Verify, optionally checkpoint, mark completed, and recompute readiness."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
@@ -2539,12 +2531,7 @@ def cmd_jump(args, state_path: Path, workspace: Path) -> int:
             "with --reset-descendants",
             EXIT_USAGE,
         )
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     target = args.target_id
     get_node(state, target)
@@ -2764,12 +2751,7 @@ def drop_service(state: dict, nid: str) -> None:
 def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
     """Start a node's service detached and wait for its ``ready`` check (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     nid = args.node_id or require_active_node(state)
     node = get_node(state, nid)
@@ -2844,12 +2826,7 @@ def cmd_service_start(args, state_path: Path, workspace: Path) -> int:
 def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
     """Stop a recorded service; a process that already exited is not an error (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     nid = args.node_id or require_active_node(state)
     record = (state.get("services") or {}).get(nid)
     if not record:
@@ -2869,12 +2846,7 @@ def cmd_service_stop(args, state_path: Path, workspace: Path) -> int:
 def cmd_teardown(args, state_path: Path, workspace: Path) -> int:
     """Stop every recorded service (C-G3)."""
     require_posix()
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
     services = dict(state.get("services") or {})
     if not services:
         say("no services recorded")
@@ -2923,12 +2895,7 @@ def cmd_residue_clear(args, state_path: Path, workspace: Path) -> int:
 
 def cmd_export(args, state_path: Path, workspace: Path) -> int:
     """Write deviations.md and, when source_doc is readable, tutorial.corrected.md (C-G8)."""
-    state = load_state(state_path)
-    problems, _ = validate_document(state)
-    if problems:
-        for problem in problems:
-            err(problem)
-        return EXIT_FAIL
+    state = load_validated_state(state_path)
 
     if args.out:
         out = Path(args.out)
