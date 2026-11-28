@@ -451,22 +451,22 @@ class FeatureTest(unittest.TestCase):
         ws = seed_workspace(dag)
         self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
         env = isolated_env(ws.parent / "home")
-        proc = subprocess.Popen(
+        with subprocess.Popen(
             [sys.executable, str(CLI), "verify", "b-input-eof"], cwd=str(ws), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True,
-        )
-        started = time.monotonic()
-        try:
-            returncode = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            self.fail("verify hung for more than 10 s with stdin held open")
-        finally:
-            proc.stdin.close()
-        elapsed = time.monotonic() - started
-        output = proc.stdout.read() + proc.stderr.read()
+        ) as proc:
+            started = time.monotonic()
+            try:
+                returncode = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                self.fail("verify hung for more than 10 s with stdin held open")
+            finally:
+                proc.stdin.close()
+            elapsed = time.monotonic() - started
+            output = proc.stdout.read() + proc.stderr.read()
         self.assertLess(elapsed, 10)
         self.assertEqual(1, returncode, output)
         self.assertIn("EOF", output)
