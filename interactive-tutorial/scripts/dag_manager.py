@@ -2357,10 +2357,30 @@ def cmd_deviate(args, state_path: Path, workspace: Path) -> int:
     return EXIT_OK
 
 
+def _format_variant_verification(verification: dict) -> str:
+    """Format a variant's verification gate as ``<type> <target>``."""
+    kind = verification.get("type", "")
+    required = VERIFICATION_REQUIRED.get(kind, ())
+    target_key = required[0] if required else None
+    target = verification.get(target_key) if target_key else None
+    if target not in (None, ""):
+        return "{} {}".format(kind, target)
+    return kind
+
+
 def _print_active_node(state: dict, index: dict, nid: str, workspace: Path) -> None:
-    """Print the active-node summary, interactive hints, and status header."""
+    """Print the active-node summary, variant overrides, interactive hints, and status header."""
+    node = index[nid]
     say("active -> {}".format(summary(state, nid)))
-    for hint in interactive_hints(index[nid]):
+    variant = active_variant(node)
+    if variant:
+        say("  variant: {} (overrides: {})".format(current_os(), ", ".join(sorted(variant))))
+        if "commands" in variant:
+            commands = variant["commands"]
+            say("  commands: {}".format("; ".join(commands) if commands else "(none)"))
+        if "verification" in variant:
+            say("  verification: {}".format(_format_variant_verification(variant["verification"])))
+    for hint in interactive_hints(node):
         say("  {}".format(hint))
     say(header_line(state, workspace))
 

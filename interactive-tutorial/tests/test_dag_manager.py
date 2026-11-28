@@ -2493,6 +2493,100 @@ class PlatformVariantsTest(unittest.TestCase):
         self.assertEqual(["echo windows-base-cmd"], saved["commands"])
         self.assertEqual(["brew install foo"], saved["variants"]["darwin"]["commands"])
 
+    def test_next_prints_variant_lines_on_match_and_omits_on_fallback(self):
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["sudo apt-get update", "sudo apt-get install -y jq"],
+                    "verification": {"type": "command", "command": "jq --version"},
+                },
+                "darwin": {
+                    "commands": [],
+                    "verification": {"type": "port_listening", "port": 8080},
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("  variant: linux (overrides: commands, verification)", out)
+            self.assertIn("  commands: sudo apt-get update; sudo apt-get install -y jq", out)
+            self.assertIn("  verification: command jq --version", out)
+
+        with mock.patch("dag_manager.platform.system", return_value="Darwin"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("  variant: darwin (overrides: commands, verification)", out)
+            self.assertIn("  commands: (none)", out)
+            self.assertIn("  verification: port_listening 8080", out)
+
+        with mock.patch("dag_manager.platform.system", return_value="Windows"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("active -> 1-step (execute)", out)
+            self.assertNotIn("  variant:", out)
+            self.assertNotIn("  commands:", out)
+            self.assertNotIn("  verification:", out)
+
+        plain_node = self._base_node()
+        self._write_state([plain_node], active="1-step")
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main("next")
+            self.assertEqual(0, code, out)
+            self.assertIn("active -> 1-step (execute)", out)
+            self.assertNotIn("  variant:", out)
+
+    def test_deviate_and_export_with_active_variant(self):
+        tutorial = self.workspace / "README.md"
+        tutorial.write_text(
+            "Install foo:\n```sh\napt-get install foo\n```\nVerify:\n```sh\nwhich foo\n```\n",
+            encoding="utf-8",
+        )
+        node = self._base_node(
+            variants={
+                "linux": {
+                    "commands": ["apt-get install foo"],
+                    "verification": {"type": "command", "command": "which foo"},
+                },
+                "darwin": {
+                    "commands": ["brew install foo"],
+                },
+            }
+        )
+        self._write_state([node], active="1-step")
+
+        with mock.patch("dag_manager.platform.system", return_value="Linux"):
+            code, out = self._run_main(
+                "deviate", "1-step", "--command", "0", "--to", "apt-get install bar",
+                "--reason", "package renamed",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main(
+                "deviate", "1-step", "--check", "--to", "which bar",
+                "--reason", "binary renamed",
+            )
+            self.assertEqual(0, code, out)
+            code, out = self._run_main("export", "--out", "export-out")
+            self.assertEqual(0, code, out)
+
+        export_dir = self.workspace / "export-out"
+        deviations_md = (export_dir / "deviations.md").read_text(encoding="utf-8")
+        self.assertIn("- target: `command:0`", deviations_md)
+        self.assertIn("- original: `apt-get install foo`", deviations_md)
+        self.assertIn("- replacement: `apt-get install bar`", deviations_md)
+        self.assertIn("- target: `check`", deviations_md)
+        self.assertIn("- original: `which foo`", deviations_md)
+        self.assertIn("- replacement: `which bar`", deviations_md)
+        self.assertNotIn("## Not applied", deviations_md)
+
+        corrected_md = (export_dir / "tutorial.corrected.md").read_text(encoding="utf-8")
+        self.assertIn("apt-get install bar", corrected_md)
+        self.assertNotIn("apt-get install foo", corrected_md)
+        self.assertIn("which bar", corrected_md)
+        self.assertNotIn("which foo", corrected_md)
+
 
 if __name__ == "__main__":
     unittest.main()
