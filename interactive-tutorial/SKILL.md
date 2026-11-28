@@ -38,7 +38,7 @@ Commands read `./.tutorial-dag.json` by default. Override the path with `--file`
    ```
 
    The baseline commit sets `initial_commit_sha`, so checkpoints hold only tutorial changes. `--git-branch` works in a repository with no commits, but rollback needs the baseline commit. `init` appends `.tutorial-dag.json` and `.tutorial-logs/` to `.git/info/exclude`, so Git does not track progress records or service logs (do not add them to `.gitignore`).
-3. If the DAG declares `requires`, run `doctor` before the first `next`. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
+3. If the DAG declares `requires`, run `doctor` (or `doctor --json` for structured output) before the first `next`. `next` runs it too and stops on failure. Pass `--skip-doctor` only after the user accepts the missing tools.
 4. Select autonomy and persistence modes:
 
    | Mode | Command execution | `confirm` check handler |
@@ -131,7 +131,7 @@ python3 "$SKILL_DIR/scripts/dag_manager.py" complete --commit
 ```
 
 - Finish the node's work before `complete`. Run declared `commands` verbatim (or exact behavioral equivalents if shell quoting or environment paths require it) before `verify`; never silently substitute a different script. `complete` runs verification and blocks the update on failure.
-- `complete` makes the next node active when exactly one is ready (or prints `branch point, pick one: …` when several are ready—choose with `next <id>`). Running `next` with no argument when a pending node is already active prints that active node and exits 0.
+- `complete` makes the next node active when exactly one is ready (or prints `branch point, pick one: …` when several are ready—choose with `next <id>`). Running `next` with no argument when a pending node is already active prints that active node and exits 0. Pass `--json` to `next` for the selected node with its resolved `os`, `variant`, `commands`, `verification`, `undo`, `risk`, and `ready` IDs.
 - Use `--commit` when the node changed workspace files. It commits as `tutorial(<node-id>): <title>`. On a clean workspace, `complete --commit` completes the node without a checkpoint: `nothing to commit; completed <id> without a checkpoint` (exit 0, `commit_sha` stays null). Rollback then targets the nearest completed ancestor checkpoint.
 - Complete `read-only` and `instruct` nodes without `--commit`.
 - The `next:` header lists ready nodes other than the active one.
