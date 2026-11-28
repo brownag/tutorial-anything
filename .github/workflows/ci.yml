@@ -47,3 +47,33 @@ jobs:
 
       - name: Test
         run: make test
+
+  windows-test:
+    name: lint + examples + tests (windows-latest, python 3.12)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: interactive-tutorial
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tool versions
+        run: |
+          python --version
+          git --version
+
+      - name: Lint
+        run: python -m py_compile scripts/dag_manager.py tests/test_dag*.py
+
+      - name: Validate examples
+        run: |
+          python scripts/dag_manager.py --file examples/expected-dag.json validate
+          python scripts/dag_manager.py --file examples/expected-dag.json status >/dev/null
+
+      - name: Test
+        run: python -m unittest discover -s tests -p "test_dag*.py" -v
