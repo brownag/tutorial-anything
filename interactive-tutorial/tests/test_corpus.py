@@ -572,6 +572,72 @@ class FeatureTest(unittest.TestCase):
         proc = run_cli(ws, "complete", "3-run-greet")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
 
+    def test_export_report_e2e(self):
+        """export writes report.md with metadata, topological node table, deviations, and visual embeds."""
+        case, raw = load_case("stale-tutorial")
+        expected = copy.deepcopy(raw)
+        expected["source_doc"] = str(CORPUS / "stale-tutorial" / "tutorial.md")
+        for node in expected["nodes"]:
+            if node["id"] == "3-run-greet":
+                node["artifacts"] = ["plots/diagram.svg"]
+
+        ws = run_tutorial(case, expected, stop_before="3-run-greet")
+        self.addCleanup(shutil.rmtree, ws.parent, ignore_errors=True)
+        self.addCleanup(stop_services, ws)
+
+        svg_path = ws / "plots" / "diagram.svg"
+        svg_path.parent.mkdir(parents=True, exist_ok=True)
+        svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>\n', encoding="utf-8")
+
+        proc = run_cli(ws, "next", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(
+            ws, "deviate", "--check", "--to", "./greet --who Ada",
+            "--reason", "v2 renamed --name to --who",
+        )
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "verify", "3-run-greet")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        proc = run_cli(ws, "complete", "3-run-greet", "--commit")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        out_dir = ws / "docs" / "export"
+        proc = run_cli(ws, "export", "--out", "docs/export")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+
+        report_path = out_dir / "report.md"
+        self.assertTrue(report_path.is_file(), "missing report.md")
+        report = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("# {}".format(expected["title"]), report)
+        self.assertIn("- source_doc: `{}`".format(expected["source_doc"]), report)
+        self.assertIn("- mode: `assisted`", report)
+        self.assertIn("- persistence: `file`", report)
+        self.assertIn("- git.branch: `main`", report)
+        self.assertIn("- progress: 4 completed / 0 skipped / 5 total", report)
+
+        self.assertIn("## Nodes", report)
+        self.assertIn("| ID | Title | Status | Commit | Artifacts | Deviations |", report)
+        expected_order = ["1-read", "2-write-greet", "2b-env-note", "3-run-greet", "4-finish"]
+        row_positions = [report.index("| {} |".format(nid)) for nid in expected_order]
+        self.assertEqual(row_positions, sorted(row_positions))
+        self.assertRegex(
+            report,
+            r"\| 3-run-greet \| [^|]+ \| COMPLETED \| [0-9a-f]{7} \| plots/diagram\.svg \| 1 \|",
+        )
+
+        self.assertIn("## Deviations", report)
+        self.assertIn(
+            "- `3-run-greet` (`check`): `./greet --name Ada` -> `./greet --who Ada`"
+            " \u2014 v2 renamed --name to --who",
+            report,
+        )
+
+        self.assertIn("## Visual Artifacts", report)
+        expected_rel = "../../plots/diagram.svg"
+        self.assertIn("![plots/diagram.svg]({})".format(expected_rel), report)
+        self.assertEqual((out_dir / expected_rel).resolve(), svg_path.resolve())
+
     def test_cross_os_variants(self):
         """next prints active OS variant details and verify/complete pass end-to-end."""
         _, dag = load_case("cross-os")
