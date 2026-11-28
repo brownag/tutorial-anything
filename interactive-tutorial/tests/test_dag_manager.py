@@ -1684,6 +1684,95 @@ class DagManagerTest(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertIn("approve {}".format(root), output)
 
+    def test_verify_json_pass_fail_and_risk(self):
+        self.seed_repo()
+        state = self.seed_state()
+        first = state["nodes"][0]
+        second = state["nodes"][1]
+
+        code, output = self.cli("verify", first["id"], "--yes", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node_id"])
+        self.assertTrue(data["ok"])
+        self.assertIn("PASS", data["message"])
+        self.assertEqual(first["verification"], data["verification"])
+
+        code, output = self.cli("verify", second["id"], "--json")
+        self.assertEqual(code, 1, output)
+        data = json.loads(output)
+        self.assertEqual(second["id"], data["node_id"])
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["message"])
+        self.assertEqual(second["verification"], data["verification"])
+
+        self.materialize(second["id"])
+        code, output = self.cli("verify", second["id"], "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertTrue(data["ok"])
+
+        # Assisted high-risk node with --json suppresses stdout risk banner.
+        state = self.state()
+        state["nodes"][0]["commands"] = ["sudo true"]
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        code, output = self.cli("verify", first["id"], "--yes", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(first["id"], data["node_id"])
+        self.assertTrue(data["ok"])
+
+    def test_complete_json_commit_clean_and_branch_ready(self):
+        self.seed_repo()
+        self.seed_state()
+        self.cli("next", check=0)
+
+        # Clean tree with --commit yields commit_sha=None and next_active=2-scaffold.
+        code, output = self.cli("complete", "--yes", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "1-design",
+                "status": "completed",
+                "commit_sha": None,
+                "next_active": "2-scaffold",
+                "ready": [],
+            },
+            data,
+        )
+
+        # Dirty workspace with --commit creates a checkpoint and advances to 3-smoke.
+        self.materialize("2-scaffold")
+        code, output = self.cli("complete", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "2-scaffold",
+                "status": "completed",
+                "commit_sha": self.head(),
+                "next_active": "3-smoke",
+                "ready": [],
+            },
+            data,
+        )
+
+        # Completing 3-smoke reaches a branch point: next_active=None, ready=[4-store, 5-render].
+        code, output = self.cli("complete", "--commit", "--json")
+        self.assertEqual(code, 0, output)
+        data = json.loads(output)
+        self.assertEqual(
+            {
+                "node_id": "3-smoke",
+                "status": "completed",
+                "commit_sha": None,
+                "next_active": None,
+                "ready": ["4-store", "5-render"],
+            },
+            data,
+        )
+
 
 def load_cli_module():
     """Import scripts/dag_manager.py so pure helpers can be tested directly."""

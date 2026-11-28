@@ -2728,9 +2728,20 @@ def cmd_verify(args, state_path: Path, workspace: Path) -> int:
     state = load_validated_state(state_path)
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
-    check_risk(state, nid)
-    say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
+    as_json = getattr(args, "json", False)
+    check_risk(state, nid, quiet=as_json)
+    if not as_json:
+        say("verify {} - {}".format(summary(state, nid), node.get("title", "")))
     passed, lines = run_verification(node, workspace, args.yes)
+    if as_json:
+        payload = {
+            "node_id": node["id"],
+            "ok": passed,
+            "message": "\n".join(lines),
+            "verification": effective_verification(node),
+        }
+        say(json.dumps(payload, indent=2, ensure_ascii=False))
+        return EXIT_OK if passed else EXIT_FAIL
     for line in lines:
         say("  {}".format(line))
     if not passed:
@@ -2743,6 +2754,7 @@ def cmd_verify(args, state_path: Path, workspace: Path) -> int:
 def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     """Verify, optionally checkpoint, mark completed, and recompute readiness."""
     state = load_validated_state(state_path)
+    as_json = getattr(args, "json", False)
 
     nid = resolve_target(state, args.node_id, workspace)
     node = get_node(state, nid)
@@ -2770,7 +2782,7 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
 
     if state.get("mode") == "hands-off":
         if risk_blocked(state, node):
-            check_risk(state, nid)
+            check_risk(state, nid, quiet=as_json)
         if not deviations_covered(node):
             raise CliError(
                 "'{}' has deviated and hands-off mode needs a person to review it first. "
@@ -2779,8 +2791,9 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
 
     if not args.no_verify:
         passed, lines = run_verification(node, workspace, args.yes)
-        for line in lines:
-            say("  {}".format(line))
+        if not as_json:
+            for line in lines:
+                say("  {}".format(line))
         if not passed:
             if state.get("mode") == "hands-off":
                 err(
@@ -2800,12 +2813,14 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
     if args.commit:
         require_git(workspace)
         if not is_dirty(workspace):
-            say("nothing to commit; completed {} without a checkpoint".format(nid))
+            if not as_json:
+                say("nothing to commit; completed {} without a checkpoint".format(nid))
         else:
             message = args.message or "tutorial({}): {}".format(nid, node.get("title", ""))
             commit_sha = commit_all(workspace, message)
-            say("checkpoint {}".format(commit_sha))
-            say("  message {}".format(message))
+            if not as_json:
+                say("checkpoint {}".format(commit_sha))
+                say("  message {}".format(message))
 
     node["status"] = "completed"
     node["commit_sha"] = commit_sha
@@ -2815,6 +2830,17 @@ def cmd_complete(args, state_path: Path, workspace: Path) -> int:
         if len(ready) == 1:
             state["active_node_id"] = ready[0]
     save_state(state_path, state)
+
+    if as_json:
+        payload = {
+            "node_id": node["id"],
+            "status": "completed",
+            "commit_sha": node.get("commit_sha"),
+            "next_active": state.get("active_node_id"),
+            "ready": ready_nodes(state),
+        }
+        say(json.dumps(payload, indent=2, ensure_ascii=False))
+        return EXIT_OK
 
     say("completed {}".format(summary(state, nid)))
     say(header_line(state, workspace))
@@ -3666,6 +3692,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="human confirmed this node (required for type=confirm gates)",
     )
+    verify.add_argument("--json", action="store_true", help="print verification result as JSON")
     verify.set_defaults(func=cmd_verify)
 
     complete = sub.add_parser("complete", help="verify, checkpoint, and close a node")
@@ -3678,6 +3705,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--message", default=None, help="override the commit message")
     complete.add_argument("--no-verify", action="store_true", help="skip the verification gate")
     complete.add_argument("--yes", action="store_true", help="pass-through for confirm gates")
+    complete.add_argument("--json", action="store_true", help="print completion summary as JSON")
     complete.set_defaults(func=cmd_complete)
 
     jump = sub.add_parser("jump", help="move the pointer anywhere in the graph")
